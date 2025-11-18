@@ -19,6 +19,7 @@ class Storage:
         self.results: dict[str, AnalyzeResult] = {}
         self.notes: dict[str, str] = {}
         self.patients: dict[str, Patient] = {}
+        self.image_paths: dict[str, str] = {}  # case_id -> image_path
         self._seed_data()
 
     def create_case(
@@ -55,6 +56,17 @@ class Storage:
                 del self.results[case_id]
             if case_id in self.notes:
                 del self.notes[case_id]
+            # Delete associated image file if it exists
+            if case_id in self.image_paths:
+                image_path = self.image_paths[case_id]
+                try:
+                    from pathlib import Path
+                    path = Path(image_path)
+                    if path.exists():
+                        path.unlink()
+                except Exception:
+                    pass  # Ignore errors when deleting files
+                del self.image_paths[case_id]
             return True
         return False
 
@@ -160,6 +172,14 @@ class Storage:
         case.patient_id = patient_id
         case.updated_at = datetime.now(timezone.utc)
         return case
+
+    def save_image_path(self, case_id: str, image_path: str) -> None:
+        """Save the image path for a case."""
+        self.image_paths[case_id] = image_path
+
+    def get_image_path(self, case_id: str) -> str | None:
+        """Get the image path for a case."""
+        return self.image_paths.get(case_id)
 
     def _seed_data(self):
         """Seed the storage with sample data for development."""

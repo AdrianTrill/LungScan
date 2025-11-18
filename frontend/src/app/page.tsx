@@ -39,6 +39,17 @@ export default function HomePage() {
     }
   };
 
+  const handleAnalyze = async (caseId: string) => {
+    try {
+      await api.analyzeCase(caseId);
+      await loadCases(); // Refresh to update status
+      alert("Analysis completed successfully!");
+    } catch (error) {
+      console.error("Failed to analyze case", error);
+      alert("Failed to analyze case. Please try again.");
+    }
+  };
+
   const handleNewCase = () => {
     router.push("/cases/new");
   };
@@ -179,6 +190,7 @@ export default function HomePage() {
               cases={filteredCases}
               onDelete={handleDelete}
               onRefresh={loadCases}
+              onAnalyze={handleAnalyze}
             />
           </motion.div>
         )}

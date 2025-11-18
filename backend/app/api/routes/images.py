@@ -32,10 +32,39 @@ ALTERNATIVE_CT_SCAN_URL_2 = "https://upload.wikimedia.org/wikipedia/commons/a/a0
 async def get_case_image(case_id: str):
     """Get the CT scan image for a case.
     
-    For demo purposes, returns a sample CT scan image for Emily Brown's case.
-    In production, this would fetch the actual uploaded image from storage.
+    Returns the uploaded image if available, otherwise falls back to sample images.
     """
-    # For Emily Brown's case (case-004), return a sample CT scan
+    from app.services.storage import storage
+    
+    # First, try to get the uploaded image
+    image_path = storage.get_image_path(case_id)
+    if image_path and Path(image_path).exists():
+        try:
+            logger.info(f"Serving uploaded image for case {case_id}: {image_path}")
+            # Determine media type from file extension
+            ext = Path(image_path).suffix.lower()
+            media_type_map = {
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".png": "image/png",
+                ".dcm": "image/dicom",
+            }
+            media_type = media_type_map.get(ext, "image/jpeg")
+            
+            return FileResponse(
+                image_path,
+                media_type=media_type,
+                headers={
+                    "Cache-Control": "public, max-age=3600",
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, OPTIONS",
+                    "Access-Control-Allow-Headers": "*",
+                }
+            )
+        except Exception as e:
+            logger.warning(f"Failed to serve uploaded image: {str(e)}")
+    
+    # Fallback: For Emily Brown's case (case-004), return a sample CT scan
     if case_id == "case-004":
         # First, try to serve local file if it exists (try PNG first, then JPG)
         for local_file, media_type in [(LOCAL_CT_SCAN_PNG, "image/png"), (LOCAL_CT_SCAN_JPG, "image/jpeg")]:

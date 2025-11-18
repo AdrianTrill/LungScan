@@ -9,9 +9,10 @@ interface CaseListProps {
   cases: Case[];
   onDelete: (caseId: string) => void;
   onRefresh: () => void;
+  onAnalyze?: (caseId: string) => void;
 }
 
-export default function CaseList({ cases, onDelete, onRefresh }: CaseListProps) {
+export default function CaseList({ cases, onDelete, onRefresh, onAnalyze }: CaseListProps) {
   const router = useRouter();
 
   const handleView = (caseId: string) => {
@@ -51,6 +52,7 @@ export default function CaseList({ cases, onDelete, onRefresh }: CaseListProps) 
           case={caseData}
           onDelete={onDelete}
           onView={handleView}
+          onAnalyze={onAnalyze}
           index={index}
         />
       ))}

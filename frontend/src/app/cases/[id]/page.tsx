@@ -39,13 +39,10 @@ export default function CaseDetailPage() {
       setLoading(true);
       const data = await api.getCase(caseId);
       setCaseDetail(data);
-      // If case is analyzed, set the image URL from the API
-      if (data.case.status === "analyzed") {
-        // Use the API endpoint to get the image
-        const imageUrlPath = `${API_URL}/api/cases/${caseId}/image`;
-        console.log("Setting image URL for case:", caseId, "URL:", imageUrlPath);
-        setImageUrl(imageUrlPath);
-      }
+      // Always try to load the image URL (for both pending and analyzed cases)
+      const imageUrlPath = `${API_URL}/api/cases/${caseId}/image`;
+      // Set image URL - it will load when the image endpoint is called
+      setImageUrl(imageUrlPath);
     } catch (error) {
       console.error("Failed to load case:", error);
       alert("Failed to load case");
@@ -74,7 +71,11 @@ export default function CaseDetailPage() {
     try {
       setAnalyzing(true);
       await api.analyzeCase(caseDetail.case.id);
-      await loadCase(); // Refresh to get analysis results
+      // Reload case to get updated analysis results and status
+      await loadCase();
+      // Ensure image URL is set for analyzed cases
+      const imageUrlPath = `${API_URL}/api/cases/${caseDetail.case.id}/image`;
+      setImageUrl(imageUrlPath);
     } catch (error) {
       console.error("Analysis failed:", error);
       alert("Analysis failed. Please try again.");
@@ -176,8 +177,8 @@ export default function CaseDetailPage() {
   const getStepNumber = (section: "upload" | "analyze" | "viewer" | "report"): number => {
     const isAnalyzed = caseDetail.case.status === "analyzed";
     const showUpload = !imageUrl && !isAnalyzed;
-    const showAnalyze = imageUrl && !isAnalyzed;
-    const showViewer = imageUrl && nodules.length > 0;
+    const showAnalyze = (imageUrl && !isAnalyzed) || isAnalyzed; // Show for both pending and analyzed
+    const showViewer = isAnalyzed && imageUrl; // Show viewer for all analyzed cases
     const showReport = isAnalyzed;
     
     // Count which step this section is
@@ -270,8 +271,8 @@ export default function CaseDetailPage() {
           </motion.div>
         )}
 
-        {/* Analyze Section */}
-        {imageUrl && caseDetail.case.status === "pending" && (
+        {/* Analyze Section - Show for pending cases or allow re-analysis */}
+        {(caseDetail.case.status === "pending" || caseDetail.case.status === "analyzed") && (
           <motion.div
             initial={{ opacity: 0, scale: 0.95 }}
             animate={{ opacity: 1, scale: 1 }}
@@ -280,10 +281,19 @@ export default function CaseDetailPage() {
           >
             <div className="flex items-center gap-3 mb-6">
               <div className="w-10 h-10 rounded-full bg-primary-100 flex items-center justify-center">
-                <span className="text-primary-600 font-bold">{getStepNumber("analyze")}</span>
+                <span className="text-primary-600 font-bold">
+                  {caseDetail.case.status === "pending" ? getStepNumber("analyze") : "↻"}
+                </span>
               </div>
-              <h2 className="text-2xl font-bold text-slate-900">Analyze</h2>
+              <h2 className="text-2xl font-bold text-slate-900">
+                {caseDetail.case.status === "pending" ? "Analyze" : "Re-analyze"}
+              </h2>
             </div>
+            <p className="text-slate-600 mb-4">
+              {caseDetail.case.status === "pending"
+                ? "Run AI analysis to detect lung nodules and assess malignancy risk."
+                : "Re-run analysis to get updated results with the latest AI model."}
+            </p>
             <Button
               onClick={handleAnalyze}
               disabled={analyzing}
@@ -301,17 +311,17 @@ export default function CaseDetailPage() {
               ) : (
                 <>
                   <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
                   </svg>
-                  Analyze Scan
+                  {caseDetail.case.status === "pending" ? "Analyze Scan" : "Re-analyze Scan"}
                 </>
               )}
             </Button>
           </motion.div>
         )}
 
-        {/* Viewer Section */}
-        {imageUrl && nodules.length > 0 && (
+        {/* Viewer Section - Show for analyzed cases with image */}
+        {caseDetail.case.status === "analyzed" && imageUrl && (
           <motion.div
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
@@ -361,6 +371,13 @@ export default function CaseDetailPage() {
               <div className="mt-6 p-5 bg-slate-50 rounded-xl border border-slate-200">
                 <p className="text-sm text-slate-700 leading-relaxed">
                   {caseDetail.analysis_result.summary}
+                </p>
+              </div>
+            )}
+            {nodules.length === 0 && (
+              <div className="mt-6 p-5 bg-green-50 rounded-xl border border-green-200">
+                <p className="text-sm text-green-800 leading-relaxed">
+                  ✓ No suspicious nodules detected. The scan appears normal.
                 </p>
               </div>
             )}

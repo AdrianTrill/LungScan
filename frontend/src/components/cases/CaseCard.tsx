@@ -9,14 +9,22 @@ interface CaseCardProps {
   case: Case;
   onDelete: (caseId: string) => void;
   onView: (caseId: string) => void;
+  onAnalyze?: (caseId: string) => void;
   index?: number;
 }
 
-export default function CaseCard({ case: caseData, onDelete, onView, index = 0 }: CaseCardProps) {
+export default function CaseCard({ case: caseData, onDelete, onView, onAnalyze, index = 0 }: CaseCardProps) {
   const handleDelete = (e: React.MouseEvent) => {
     e.stopPropagation();
     if (confirm(`Are you sure you want to delete case "${caseData.filename}"?`)) {
       onDelete(caseData.id);
+    }
+  };
+
+  const handleAnalyze = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (onAnalyze) {
+      onAnalyze(caseData.id);
     }
   };
 
@@ -54,16 +62,30 @@ export default function CaseCard({ case: caseData, onDelete, onView, index = 0 }
             <span>Updated {new Date(caseData.updated_at).toLocaleDateString()} at {new Date(caseData.updated_at).toLocaleTimeString()}</span>
           </div>
         </div>
-        <Button
-          variant="danger"
-          onClick={handleDelete}
-          className="ml-4 flex-shrink-0"
-        >
-          <svg className="w-4 h-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-          </svg>
-          Delete
-        </Button>
+        <div className="flex items-center gap-2 flex-shrink-0">
+          {onAnalyze && (
+            <Button
+              variant="primary"
+              onClick={handleAnalyze}
+              className="ml-4"
+            >
+              <svg className="w-4 h-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
+              </svg>
+              {caseData.status === "pending" ? "Analyze" : "Re-analyze"}
+            </Button>
+          )}
+          <Button
+            variant="danger"
+            onClick={handleDelete}
+            className="ml-4"
+          >
+            <svg className="w-4 h-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+            </svg>
+            Delete
+          </Button>
+        </div>
       </div>
     </motion.div>
   );
