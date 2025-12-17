@@ -6,7 +6,7 @@ A production-ready web application for AI-powered lung nodule detection and anal
 
 This is a **monorepo** containing:
 
-- **Backend**: FastAPI (Python 3.11+) with mocked AI analysis
+- **Backend**: FastAPI (Python 3.11+) with integrated AI model from Hugging Face
 - **Frontend**: Next.js 14 (App Router) + TypeScript + Tailwind CSS
 
 ## 🚀 Quick Start
@@ -201,18 +201,17 @@ npm run format
 ## 🎯 Features (MVP)
 
 ✅ **File Upload**: Accept CT scan images (JPEG, PNG, DICOM)  
-✅ **Mock Analysis**: Deterministic fake nodule detections with malignancy scores  
+✅ **AI Analysis**: Real lung cancer detection using ResNet-50 model from Hugging Face  
 ✅ **Interactive Viewer**: Visualize scans with nodule overlays  
 ✅ **Report Generation**: Export text reports with notes  
 ✅ **Case Management**: List, view, and delete cases (in-memory storage)
 
 ## 🔄 Development Workflow
 
-1. **Upload a scan** → Creates a case with "pending" status
-2. **Click "Analyze"** → Runs mock analysis, updates status to "analyzed"
-3. **View nodules** → See overlays on the scan image with clickable markers
-4. **Add notes** → Write clinical observations
-5. **Export report** → Download a formatted text report
+1. **Upload a scan** → Creates a case and automatically runs AI analysis
+2. **View results** → See AI-detected nodules with malignancy scores on the scan image
+3. **Add notes** → Write clinical observations
+4. **Export report** → Download a formatted text report with AI findings
 
 ## 📝 Environment Variables
 
@@ -232,7 +231,6 @@ NEXT_PUBLIC_API_URL=http://localhost:8000
 
 ## 🚧 Future Enhancements
 
-- Replace mock analysis with real AI model inference
 - Persistent storage (database instead of in-memory)
 - User authentication and authorization
 - PDF report generation
@@ -247,13 +245,12 @@ This project is part of a medical imaging research initiative.
 ## 🤝 Contributing
 
 This is an MVP prototype. For production deployment:
-1. Replace mock analysis with actual AI model
-2. Implement persistent database storage
+1. Implement persistent database storage
 3. Add authentication/authorization
 4. Set up proper error handling and logging
 5. Configure production-ready deployment (Docker, cloud, etc.)
 
 ---
 
-**Note**: This MVP uses mocked AI analysis. In production, the `/api/analyze` endpoint will connect to a trained AI model for real nodule detection.
+**Note**: This MVP uses a real AI model (ResNet-50 based lung cancer detection model from Hugging Face) for nodule detection and classification. See `MODEL_DEPLOYMENT.md` for details on model integration and usage.
 
