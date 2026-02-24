@@ -1,0 +1,33 @@
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath}
+\usepackage{geometry}
+\geometry{a4paper, margin=1in}
+
+\begin{document}
+
+\section*{Multimodal Radiomics and Deep Learning Fusion}
+
+Zhang Y, \textit{et al.} Frontiers in Oncology. 2024. (PET/CT Radiomics Meta-Analysis)
+
+\vspace{1em} % Adds a little vertical space
+
+Focusing specifically on the utility of FDG PET/CT, this meta-analysis synthesizes data from 17 studies involving 3,763 patients to evaluate the prediction of EGFR status.\textsuperscript{5} The results confirm the strong predictive value of this combined imaging modality, reporting a pooled AUC of 0.84 in the training cohorts and a robust 0.82 in the validation cohorts. The review also notes a trend where studies employing deep learning methods tended to achieve superior performance compared to those using traditional machine learning algorithms with radiomics.\textsuperscript{5}
+
+\vspace{1em}
+
+\textbf{Significance:} This paper provides rigorous, large-scale evidence supporting the project's decision to incorporate both PET and CT imaging. The fusion of anatomical detail from CT with metabolic information (tumor activity) from PET creates a richer, more informative input for the AI model, which is shown to translate into strong predictive performance.
+
+\section*{Predicting Immunotherapy Biomarkers and Response}
+
+Paper 4: Lin Y, \textit{et al.} 2025. (Predicting PD-L1 from PET/CT)
+
+\vspace{1em}
+
+This research extends the virtual biopsy concept to the domain of immunotherapy, tackling the prediction of PD-L1 status, a critical biomarker for patient selection.\textsuperscript{20} Using a dataset of 101 patients with PET/CT scans, the study employed a 3D DenseNet121 deep learning model. The model achieved a high AUC of 0.90 using only the fused PET/CT images. Performance was further enhanced to an outstanding AUC of 0.96 when clinical features were integrated into the model.\textsuperscript{20}
+
+\vspace{1em}
+
+\textbf{Significance:} This study demonstrates that the application's scope can and should extend beyond common driver mutations like EGFR to include key immunotherapy biomarkers. It reinforces the consistent theme of performance gains from fusing imaging with clinical data and showcases the efficacy of modern 3D CNN architectures for this task.
+
+\end{document}

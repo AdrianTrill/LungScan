@@ -1,0 +1,1 @@
+Training takes about 30 minutes per epoch -> batch size of 7 on an h100

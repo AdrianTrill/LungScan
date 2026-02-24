@@ -1,0 +1,24 @@
+dice: 0.2746
+
+TARGET_SPACING = (0.7, 0.7, 0.7) 
+INTENSITY_RANGE = (-1000, 1000) 
+ROI_SIZE = (96, 96, 96)
+BATCH_SIZE = 32
+NUM_WORKERS = 24
+MAX_EPOCHS = 150
+VAL_INTERVAL = 2
+LR = 1e-5
+
+MAX_POINT = 5
+MAX_PROMPT = 32
+MAX_BACKPROMPT = 4
+DROP_POINT_PROB = 0.7 
+DROP_LABEL_PROB = 0.1
+
+pos=2
+neg=1
+num_samples=4
+
+lambda_dice=1.0
+lambda_focal=1.0
+squared_pred=True

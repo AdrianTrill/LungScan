@@ -1,0 +1,28 @@
+Base training dar cu DiceFocalLoss si Post Processing cu remove (mai prost cu acest post processing)
+
+dice : 0.5126
+
+TARGET_SPACING = (1.5, 1.5, 1.5) 
+INTENSITY_RANGE = (-1000, 1000) 
+ROI_SIZE = (96, 96, 96)
+BATCH_SIZE = 4
+NUM_WORKERS = 8
+MAX_EPOCHS = 150
+VAL_INTERVAL = 1
+LR = 1e-5
+
+MAX_POINT = 5
+MAX_PROMPT = 32
+MAX_BACKPROMPT = 4
+DROP_POINT_PROB = 0.7 
+DROP_LABEL_PROB = 0.1
+
+pos=1
+neg=1
+num_samples=2
+
+lambda_dice=1.0
+lambda_focal=1.0
+squared_pred=True
+
++ post processing

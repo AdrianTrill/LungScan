@@ -128,6 +128,26 @@ export const api = {
       method: "POST",
     }),
 
+  /** Replace the scan image for an existing case. */
+  replaceCaseScan: async (caseId: string, file: File): Promise<UploadResult> => {
+    const formData = new FormData();
+    formData.append("scan", file);
+
+    const response = await fetch(`${API_URL}/api/cases/${caseId}/replace-scan`, {
+      method: "PUT",
+      body: formData,
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({
+        detail: `HTTP ${response.status}: ${response.statusText}`,
+      }));
+      throw new Error(error.detail || "Failed to replace scan");
+    }
+
+    return response.json();
+  },
+
   /** Generate and download a report. */
   generateReport: async (caseId: string, notes: string): Promise<void> => {
     const request: ReportRequest = { notes };

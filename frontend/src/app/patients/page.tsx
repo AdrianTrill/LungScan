@@ -1,9 +1,11 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import toast from "react-hot-toast";
 import { useRouter } from "next/navigation";
 import { api } from "@/lib/api";
 import { Patient } from "@/lib/types";
+import { calculateAge } from "@/lib/utils";
 
 export default function PatientsPage() {
   const router = useRouter();
@@ -21,6 +23,7 @@ export default function PatientsPage() {
       setPatients(data);
     } catch (error) {
       console.error("Failed to load patients:", error);
+      toast.error("Failed to load patients");
     } finally {
       setLoading(false);
     }
@@ -30,21 +33,11 @@ export default function PatientsPage() {
     try {
       await api.deletePatient(patientId);
       await loadPatients();
+      toast.success("Patient deleted successfully");
     } catch (error) {
       console.error("Failed to delete patient:", error);
-      alert("Failed to delete patient. They may have associated cases.");
+      toast.error("Failed to delete patient. They may have associated cases.");
     }
-  };
-
-  const calculateAge = (dateOfBirth: string): number => {
-    const today = new Date();
-    const birth = new Date(dateOfBirth);
-    let age = today.getFullYear() - birth.getFullYear();
-    const monthDiff = today.getMonth() - birth.getMonth();
-    if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birth.getDate())) {
-      age--;
-    }
-    return age;
   };
 
   return (

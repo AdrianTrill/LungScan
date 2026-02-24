@@ -1,0 +1,1259 @@
+Activating venv: /home/dem7clj/repos/mirpr/mirpr/bin/activate
+======================================================
+          Project Root: /home/dem7clj/repos/mirpr
+          Job ID: 21725448
+          Python Path: /home/dem7clj/repos/mirpr/mirpr/bin/python
+======================================================
+
+======================================================
+          Configuration (config.py)
+======================================================
+import os
+
+# --- PATHS ---
+PROJECT_ROOT = "/home/dem7clj/repos/mirpr"
+# Path to LIDC-IDRI DICOM files (the folder containing patient folders)
+RAW_DICOM_DIR = "/shares/CC_v_Val_FV_Gen3_all/VIDT_DL/data/cnn_training/projects/smart_data_selection/town_signs/mirprfull/LIDC-IDRI"
+
+# Output for Preprocessed NIfTI files
+DATA_ROOT ="/shares/CC_v_Val_FV_Gen3_all/VIDT_DL/data/cnn_training/projects/smart_data_selection/town_signs/preprocessed_output_sota/"
+JSON_PATH = os.path.join(DATA_ROOT, "dataset.json")
+
+# Model Paths
+PRETRAINED_MODEL_PATH = os.path.join(PROJECT_ROOT, "models/model.pt")
+LOG_DIR = os.path.join(PROJECT_ROOT, "runs/vista3d_lidc_finetune")
+
+# --- VISTA SPECIFICATIONS (DO NOT CHANGE) ---
+# These match the Foundation Model's pre-training settings
+TARGET_SPACING = (1.5, 1.5, 1.5) 
+INTENSITY_RANGE = (-1000, 1000) 
+
+# --- CLASS MAPPING ---
+# LIDC Nodule (1) -> VISTA Lung Tumor (23)
+LABEL_MAPPINGS = {"default": [[1, 23]]}
+LABEL_SET = [0, 23] 
+
+TARGET_VISTA_CLASS = 23
+
+# --- HYPERPARAMETERS ---
+ROI_SIZE = (96, 96, 96)
+BATCH_SIZE = 4
+NUM_WORKERS = 8
+MAX_EPOCHS = 150
+VAL_INTERVAL = 1
+LR = 1e-5
+
+# --- SAMPLING CONFIG ---
+# --- SAMPLING CONFIG ---
+MAX_POINT = 5
+MAX_PROMPT = 32
+MAX_BACKPROMPT = 4
+# CHANGE THIS: Force model to use Auto-Seg mode 70% of the time (was 0.2 / 20%)
+DROP_POINT_PROB = 0.7 
+# KEEP THIS LOW: We want it to use Class Prompts (Lung Tumor)
+DROP_LABEL_PROB = 0.1======================================================
+
+======================================================
+          Model (model.py)
+======================================================
+import torch
+import os
+import config as cfg
+
+# Import strictly from standard MONAI paths or fallback
+try:
+    from monai.networks.nets import vista3d132
+except ImportError:
+    from scripts.modeling.vista3d import vista3d132
+
+def get_vista_model(load_weights=True):
+    """
+    Returns the full VISTA-3D architecture (132 classes).
+    """
+    print(f"[Model] Initializing VISTA-3D (132 Classes)...")
+    model = vista3d132(encoder_embed_dim=48, in_channels=1)
+    
+    if load_weights:
+        if not os.path.exists(cfg.PRETRAINED_MODEL_PATH):
+            print(f"[WARNING] Checkpoint not found at {cfg.PRETRAINED_MODEL_PATH}")
+        else:
+            print(f"[Model] Loading weights from {cfg.PRETRAINED_MODEL_PATH}...")
+            try:
+                # Security warning fix: weights_only=True
+                state_dict = torch.load(cfg.PRETRAINED_MODEL_PATH, map_location="cpu", weights_only=True)
+                model.load_state_dict(state_dict, strict=True)
+                print("[Model] Weights loaded successfully.")
+            except Exception as e:
+                print(f"[ERROR] Weight load failed: {e}")
+                
+    return model======================================================
+
+======================================================
+          Train Script (train.py)
+======================================================
+import os
+import torch
+import numpy as np
+from monai.data import DataLoader, CacheDataset, load_decathlon_datalist, list_data_collate
+from monai.losses import DiceFocalLoss
+from monai.metrics import compute_dice
+from monai.inferers import sliding_window_inference
+from monai.utils import set_determinism
+from monai.apps.vista3d.sampler import sample_prompt_pairs
+from monai.transforms import Activations, AsDiscrete
+from torch.optim.lr_scheduler import CosineAnnealingLR # <--- Added Scheduler
+import config as cfg
+from dataset import get_transforms
+from model import get_vista_model
+
+def flatten_collate(batch):
+    flattened_data = [item for sublist in batch for item in sublist]
+    return list_data_collate(flattened_data)
+
+def main():
+    set_determinism(seed=0)
+    os.makedirs(cfg.LOG_DIR, exist_ok=True)
+    device = torch.device("cuda:0")
+    print(f"VISTA-3D Finetuning on {device}")
+
+    # 1. Load Data
+    train_files = load_decathlon_datalist(cfg.JSON_PATH, True, "training")
+    val_files = load_decathlon_datalist(cfg.JSON_PATH, True, "validation")
+
+    train_ds = CacheDataset(
+        data=train_files, 
+        transform=get_transforms("train"), 
+        cache_rate=1.0, 
+        num_workers=cfg.NUM_WORKERS
+    )
+    
+    train_loader = DataLoader(
+        train_ds, 
+        batch_size=cfg.BATCH_SIZE, 
+        shuffle=True, 
+        num_workers=cfg.NUM_WORKERS, 
+        collate_fn=flatten_collate, 
+        pin_memory=True
+    )
+
+    val_ds = CacheDataset(
+        data=val_files, 
+        transform=get_transforms("val"), 
+        cache_rate=1.0, 
+        num_workers=cfg.NUM_WORKERS
+    )
+    val_loader = DataLoader(val_ds, batch_size=1, num_workers=cfg.NUM_WORKERS)
+
+    # 2. Initialize Model
+    model = get_vista_model(load_weights=True).to(device)
+    
+    # 3. Optimization
+    # SOTA Loss for small objects
+    loss_function = DiceFocalLoss(
+        to_onehot_y=False, 
+        sigmoid=True, 
+        lambda_dice=1.0, 
+        lambda_focal=1.0,
+        squared_pred=True
+    )
+    optimizer = torch.optim.Adam(model.parameters(), cfg.LR)
+    
+    # SOTA Scheduler: Smoothly decay LR to 0 over MAX_EPOCHS
+    scheduler = CosineAnnealingLR(optimizer, T_max=cfg.MAX_EPOCHS)
+    
+    scaler = torch.amp.GradScaler('cuda') 
+
+    # 4. Training Loop
+    best_metric = -1
+    best_metric_epoch = -1
+
+    for epoch in range(cfg.MAX_EPOCHS):
+        model.train()
+        epoch_loss = 0
+        step = 0
+        
+        for batch_data in train_loader:
+            step += 1
+            inputs = batch_data["image"].to(device)
+            labels = batch_data["label"].to(device)
+            
+            optimizer.zero_grad()
+            batch_loss_accum = 0.0
+            
+            for i in range(inputs.shape[0]):
+                curr_img = inputs[[i]]
+                curr_lbl = labels[[i]]
+                
+                label_prompt, point, point_label, prompt_class = sample_prompt_pairs(
+                    curr_lbl,
+                    cfg.LABEL_SET,
+                    max_point=cfg.MAX_POINT,
+                    max_prompt=cfg.MAX_PROMPT,
+                    max_backprompt=cfg.MAX_BACKPROMPT,
+                    max_foreprompt=None,
+                    drop_label_prob=cfg.DROP_LABEL_PROB,
+                    drop_point_prob=cfg.DROP_POINT_PROB,
+                )
+
+                if prompt_class is None: continue
+
+                with torch.amp.autocast('cuda'):
+                    outputs = model(
+                        input_images=curr_img,
+                        point_coords=point,
+                        point_labels=point_label,
+                        class_vector=label_prompt
+                    )
+                    
+                    loss = torch.tensor(0.0, device=device)
+                    loss_n = torch.tensor(0.0, device=device)
+                    
+                    for idx in range(len(prompt_class)):
+                        # Create binary target (0 or 1) and cast to Float
+                        target_binary = (curr_lbl == prompt_class[idx]).float()
+                        
+                        loss += loss_function(
+                            outputs[[idx]].float(), 
+                            target_binary
+                        )
+                        loss_n += 1.0
+                    
+                    loss = loss / torch.max(loss_n, torch.tensor(1.0, device=device))
+                    batch_loss_accum += loss
+
+            if isinstance(batch_loss_accum, torch.Tensor):
+                batch_loss_accum = batch_loss_accum / inputs.shape[0]
+                scaler.scale(batch_loss_accum).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                epoch_loss += batch_loss_accum.item()
+            
+            if step % 10 == 0:
+                print(f"Epoch {epoch+1}/{cfg.MAX_EPOCHS} Step {step} Loss: {batch_loss_accum:.4f}", end="\r")
+
+        print(f"\nEpoch {epoch+1} Avg Loss: {epoch_loss/step:.4f}")
+
+        # 5. Validation
+        if (epoch + 1) % cfg.VAL_INTERVAL == 0:
+            model.eval()
+            dice_scores = []
+            val_prompt = torch.tensor([23], device=device)
+
+            post_sigmoid = Activations(sigmoid=True)
+            post_pred = AsDiscrete(threshold=0.5)
+            # Removed Post-Processing for Training Validation to see RAW performance
+            # post_clean = RemoveSmallObjects(min_size=10) 
+
+            with torch.no_grad():
+                for i, val_data in enumerate(val_loader):
+                    val_img = val_data["image"].to(device)
+                    val_lbl = val_data["label"].to(device)
+                    
+                    with torch.amp.autocast('cuda'):
+                        val_out = sliding_window_inference(
+                            val_img, cfg.ROI_SIZE, 4, model, 
+                            overlap=0.5, transpose=True, class_vector=val_prompt
+                        )
+                    
+                    val_pred = post_sigmoid(val_out)
+                    val_mask = post_pred(val_pred)
+                    
+                    # Compute Dice on Raw Predictions
+                    target_binary = (val_lbl == 23).float()
+                    
+                    # Debug Print (First batch only)
+                    if i == 0:
+                        print(f"[DEBUG Ep{epoch+1}] Max Pred: {val_pred.max():.4f}, Max GT: {target_binary.max()}")
+                        print(f"[DEBUG Ep{epoch+1}] Pred Shape: {val_mask.shape}, GT Shape: {target_binary.shape}")
+
+                    dice = compute_dice(
+                        y_pred=val_mask,
+                        y=target_binary,
+                        include_background=False
+                    )
+                    
+                    if target_binary.sum() == 0:
+                        dice_scores.append(1.0 if val_mask.sum() == 0 else 0.0)
+                    else:
+                        dice_scores.append(dice.item())
+
+            mean_dice = np.mean(dice_scores)
+            current_lr = scheduler.get_last_lr()[0]
+            print(f"Validation Dice (Lung Tumor): {mean_dice:.4f} | LR: {current_lr:.8f}")
+            
+            if mean_dice > best_metric:
+                best_metric = mean_dice
+                best_metric_epoch = epoch + 1
+                torch.save(model.state_dict(), os.path.join(cfg.LOG_DIR, "best_model_.pth"))
+                print(">>> New Best Model Saved!")
+        
+        # Step Scheduler at end of epoch
+        scheduler.step()
+
+if __name__ == "__main__":
+    main()======================================================
+
+
+import os
+import torch
+import numpy as np
+from tqdm import tqdm
+from monai.inferers import sliding_window_inference
+from monai.apps.vista3d.transforms import VistaPostTransformd
+from monai.metrics import DiceMetric, HausdorffDistanceMetric
+
+import config as cfg
+from dataset import get_dataloaders
+from model import get_model
+
+def evaluate():
+    device = torch.device("cuda")
+    print("--- Starting Evaluation ---")
+    
+    _, val_loader = get_dataloaders()
+    model = get_model(load_weights=False)
+    
+    best_model_path = os.path.join(cfg.CHECKPOINT_DIR, "best_metric_model.pth")
+    if not os.path.exists(best_model_path):
+        print(f"ERROR: Model not found at {best_model_path}")
+        return
+
+    model.load_state_dict(torch.load(best_model_path, weights_only=True))
+    model.to(device)
+    model.eval()
+    
+    dice_metric_calc = DiceMetric(include_background=False, reduction="mean")
+    hd95_metric_calc = HausdorffDistanceMetric(include_background=False, percentile=95, reduction="mean")
+    
+    dice_scores = []
+    hd95_scores = []
+
+    with torch.no_grad():
+        for val_data in tqdm(val_loader, desc="Evaluating"):
+            val_images = val_data["image"].to(device)
+            val_labels = val_data["label"].to(device)
+            
+            val_outputs = sliding_window_inference(
+                val_images,
+                cfg.INPUT_SHAPE,
+                4, 
+                model,
+                transpose=True,
+                class_vector=torch.tensor(cfg.LABEL_SET[1:], device=device),
+                overlap=0.5
+            )
+            
+            # --- CRITICAL FIX ---
+            # Use val_outputs[0]
+            post_pred_single = VistaPostTransformd(keys="pred")(
+                {"pred": val_outputs[0], "label_prompt": torch.tensor(cfg.LABEL_SET[1:], device=device)}
+            )["pred"]
+            
+            # Expand dims back to (1, D, H, W) for metrics
+            pred_binary = (post_pred_single == cfg.TARGET_VISTA_CLASS).float().unsqueeze(0)
+            gt_binary = (val_labels == cfg.TARGET_VISTA_CLASS).float()
+            
+            if gt_binary.sum() > 0:
+                dice = dice_metric_calc(y_pred=pred_binary, y=gt_binary)
+                hd95 = hd95_metric_calc(y_pred=pred_binary, y=gt_binary)
+                
+                dice_scores.append(dice.item())
+                hd95_scores.append(hd95.item())
+            
+            dice_metric_calc.reset()
+            hd95_metric_calc.reset()
+
+    print("=======================================")
+    print(f"FINAL RESULTS (Lung Tumor / Class 23)")
+    print("=======================================")
+    print(f"Mean Dice: {np.nanmean(dice_scores):.4f}")
+    print(f"Mean HD95: {np.nanmean(hd95_scores):.4f} mm")
+    print("=======================================")
+
+if __name__ == "__main__":
+    evaluate()import torch
+import numpy as np
+from monai.transforms import (
+    Compose,
+    LoadImaged,
+    EnsureChannelFirstd,
+    Orientationd,
+    Spacingd,
+    ScaleIntensityRanged,
+    RandCropByPosNegLabeld,
+    RandAffined,
+    RandGaussianNoised,
+    RandFlipd,
+    RandRotate90d,
+    EnsureTyped
+)
+from monai.apps.vista3d.transforms import Relabeld
+import config as cfg
+
+def get_transforms(mode="train"):
+    transforms = [
+        LoadImaged(keys=["image", "label"]),
+        EnsureChannelFirstd(keys=["image", "label"]),
+        Orientationd(keys=["image", "label"], axcodes="RAS"),
+        # Official VISTA spacing
+        Spacingd(
+            keys=["image", "label"], 
+            pixdim=cfg.TARGET_SPACING, 
+            mode=("bilinear", "nearest")
+        ),
+        # Official VISTA Intensity Range (Foundation Model Alignment)
+        ScaleIntensityRanged(
+            keys=["image"],
+            a_min=cfg.INTENSITY_RANGE[0],
+            a_max=cfg.INTENSITY_RANGE[1],
+            b_min=0.0,
+            b_max=1.0,
+            clip=True,
+        ),
+        # Map LIDC(1) -> VISTA(23)
+        Relabeld(keys="label", label_mappings=cfg.LABEL_MAPPINGS, dtype=torch.uint8),
+    ]
+
+    if mode == "train":
+        transforms += [
+            # Dynamic Cropping for Small Nodules
+            RandCropByPosNegLabeld(
+                keys=["image", "label"],
+                label_key="label",
+                spatial_size=cfg.ROI_SIZE,
+                pos=2,
+                neg=1,
+                num_samples=2,
+                image_key="image",
+                image_threshold=0,
+            ),
+            RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
+            RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
+            RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=2),
+            RandRotate90d(keys=["image", "label"], prob=0.5, max_k=3),
+            RandGaussianNoised(keys=["image"], prob=0.1, mean=0.0, std=0.1),
+            RandAffined(
+                keys=['image', 'label'],
+                mode=('bilinear', 'nearest'),
+                prob=0.3,
+                spatial_size=cfg.ROI_SIZE,
+                rotate_range=(0, 0, np.pi/15),
+                scale_range=(0.1, 0.1, 0.1)
+            )
+        ]
+
+    return Compose(transforms + [EnsureTyped(keys=["image", "label"])])import os
+import json
+import numpy as np
+import pylidc as pl
+import nibabel as nib
+from tqdm import tqdm
+from pylidc.utils import consensus  # <--- FIXED IMPORT
+import config as cfg
+
+# --- CRITICAL: PYLIDC MONKEY PATCH ---
+import numpy
+if not hasattr(numpy, 'int'): numpy.int = int
+if not hasattr(numpy, 'float'): numpy.float = float
+if not hasattr(numpy, 'bool'): numpy.bool = bool
+
+def get_affine_from_scan(scan):
+    """
+    Constructs a valid affine matrix preserving Spacing AND Origin.
+    """
+    try:
+        first_slice = scan.images[0]
+        spacings = [scan.pixel_spacing, scan.pixel_spacing, scan.slice_spacing]
+        origin = first_slice.ImagePositionPatient
+        
+        affine = np.eye(4)
+        affine[0, 0] = spacings[0]
+        affine[1, 1] = spacings[1]
+        affine[2, 2] = spacings[2]
+        
+        affine[0, 3] = origin[0]
+        affine[1, 3] = origin[1]
+        affine[2, 3] = origin[2]
+        
+        return affine
+    except Exception as e:
+        # Fallback if DICOM header is missing info
+        spacing = np.array([scan.pixel_spacing, scan.pixel_spacing, scan.slice_spacing]).flatten()
+        affine = np.eye(4)
+        affine[0, 0] = spacing[0]
+        affine[1, 1] = spacing[1]
+        affine[2, 2] = spacing[2]
+        return affine
+
+def preprocess_lidc_sota():
+    os.makedirs(os.path.join(cfg.DATA_ROOT, "images"), exist_ok=True)
+    os.makedirs(os.path.join(cfg.DATA_ROOT, "labels"), exist_ok=True)
+
+    print("Querying LIDC-IDRI database...")
+    scans = pl.query(pl.Scan).all()
+    print(f"Found {len(scans)} scans.")
+
+    valid_entries = []
+
+    # Iterate with index to catch problematic files easily
+    for scan in tqdm(scans, desc="Processing LIDC"):
+        try:
+            # 1. Check for Annotations
+            cluster_annotations = scan.cluster_annotations()
+            
+            if not cluster_annotations:
+                continue
+
+            # 2. Reconstruct Volume (HU)
+            vol = scan.to_volume(verbose=False)
+            mask = np.zeros(vol.shape, dtype=np.uint8)
+            v_shape = vol.shape
+            
+            has_valid_nodule = False
+
+            for cluster in cluster_annotations:
+                # 50% Consensus level
+                # Fixed: Calling consensus from pylidc.utils
+                # Pad is [(before, after), ...] tuples. 0 padding ensures we stick to the bbox.
+                cmask, cbbox, _ = consensus(cluster, clevel=0.5, pad=[(0,0), (0,0), (0,0)])
+                
+                # --- BOUNDARY LOGIC ---
+                b_start = [cbbox[0].start, cbbox[1].start, cbbox[2].start]
+                b_stop  = [cbbox[0].stop,  cbbox[1].stop,  cbbox[2].stop]
+
+                # Volume Slices (Clamp to volume limits)
+                vol_slice = tuple(
+                    slice(max(0, s), min(d, e)) 
+                    for s, e, d in zip(b_start, b_stop, v_shape)
+                )
+
+                # Mask Slices (Handle cases where bbox starts before 0)
+                mask_slice = tuple(
+                    slice(max(0, -s), max(0, -s) + (min(d, e) - max(0, s)))
+                    for s, e, d in zip(b_start, b_stop, v_shape)
+                )
+                
+                try:
+                    # Merge Logic
+                    if mask[vol_slice].shape == cmask[mask_slice].shape:
+                        combined = np.logical_or(mask[vol_slice], cmask[mask_slice])
+                        mask[vol_slice] = combined.astype(np.uint8)
+                        has_valid_nodule = True
+                except Exception:
+                    continue
+
+            if not has_valid_nodule:
+                continue
+
+            # 3. Construct Affine
+            affine = get_affine_from_scan(scan)
+
+            # 4. Save NIfTI
+            series_uid = scan.series_instance_uid.replace('.', '')[-10:]
+            file_id = f"{scan.patient_id}_{series_uid}"
+            
+            img_path = os.path.join(cfg.DATA_ROOT, "images", f"{file_id}_image.nii.gz")
+            lbl_path = os.path.join(cfg.DATA_ROOT, "labels", f"{file_id}_label.nii.gz")
+
+            nib.save(nib.Nifti1Image(vol.astype(np.float32), affine), img_path)
+            nib.save(nib.Nifti1Image(mask.astype(np.uint8), affine), lbl_path)
+
+            valid_entries.append({
+                "image": img_path,
+                "label": lbl_path,
+                "patient_id": scan.patient_id
+            })
+
+        except Exception as e:
+            print(f"!!! ERROR on scan {scan.patient_id}: {e}")
+            continue
+
+    # 5. Patient-Level Splitting
+    unique_patients = sorted(list(set(d['patient_id'] for d in valid_entries)))
+    rng = np.random.RandomState(42)
+    rng.shuffle(unique_patients)
+    
+    split_idx = int(len(unique_patients) * 0.8)
+    train_patients = set(unique_patients[:split_idx])
+    val_patients = set(unique_patients[split_idx:])
+    
+    final_train = [d for d in valid_entries if d['patient_id'] in train_patients]
+    final_val = [d for d in valid_entries if d['patient_id'] in val_patients]
+    
+    # Remove metadata before saving JSON
+    for d in final_train: del d['patient_id']
+    for d in final_val: del d['patient_id']
+
+    json_output = {
+        "training": final_train,
+        "validation": final_val
+    }
+
+    with open(cfg.JSON_PATH, "w") as f:
+        json.dump(json_output, f, indent=4)
+
+    print(f"Done. Train: {len(final_train)}, Val: {len(final_val)}")
+
+if __name__ == "__main__":
+    preprocess_lidc_sota()We used this for preprocessing:
+Starting Python training script... Log files are in the 'logs' directory.
+VISTA-3D Finetuning on cuda:0
+[Model] Initializing VISTA-3D (132 Classes)...
+[Model] Loading weights from /home/dem7clj/repos/mirpr/models/model.pt...
+[Model] Weights loaded successfully.
+Epoch 1/150 Step 10 Loss: 5.7463Epoch 1/150 Step 20 Loss: 3.7646Epoch 1/150 Step 30 Loss: 1.5013Epoch 1/150 Step 40 Loss: 0.5688Epoch 1/150 Step 50 Loss: 0.4383Epoch 1/150 Step 60 Loss: 0.5818Epoch 1/150 Step 70 Loss: 0.4319Epoch 1/150 Step 80 Loss: 0.4134Epoch 1/150 Step 90 Loss: 0.4169Epoch 1/150 Step 100 Loss: 0.5047Epoch 1/150 Step 110 Loss: 0.3999Epoch 1/150 Step 120 Loss: 0.3677Epoch 1/150 Step 130 Loss: 0.2958Epoch 1/150 Step 140 Loss: 0.4299Epoch 1/150 Step 150 Loss: 0.4970Epoch 1/150 Step 160 Loss: 0.4399Epoch 1/150 Step 170 Loss: 0.4819
+Epoch 1 Avg Loss: 1.2839
+[DEBUG Ep1] Max Pred: 0.4884, Max GT: 1.0
+[DEBUG Ep1] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.0000 | LR: 0.00001000
+>>> New Best Model Saved!
+Epoch 2/150 Step 10 Loss: 0.5191Epoch 2/150 Step 20 Loss: 0.2854Epoch 2/150 Step 30 Loss: 0.4629Epoch 2/150 Step 40 Loss: 0.4760Epoch 2/150 Step 50 Loss: 0.4087Epoch 2/150 Step 60 Loss: 0.4037Epoch 2/150 Step 70 Loss: 0.4355Epoch 2/150 Step 80 Loss: 0.3699Epoch 2/150 Step 90 Loss: 0.3694Epoch 2/150 Step 100 Loss: 0.3833Epoch 2/150 Step 110 Loss: 0.4287Epoch 2/150 Step 120 Loss: 0.4055Epoch 2/150 Step 130 Loss: 0.2555Epoch 2/150 Step 140 Loss: 0.4331Epoch 2/150 Step 150 Loss: 0.3477Epoch 2/150 Step 160 Loss: 0.3217Epoch 2/150 Step 170 Loss: 0.3060
+Epoch 2 Avg Loss: 0.3761
+[DEBUG Ep2] Max Pred: 0.5362, Max GT: 1.0
+[DEBUG Ep2] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.0775 | LR: 0.00001000
+>>> New Best Model Saved!
+Epoch 3/150 Step 10 Loss: 0.3341Epoch 3/150 Step 20 Loss: 0.3411Epoch 3/150 Step 30 Loss: 0.3198Epoch 3/150 Step 40 Loss: 0.3200Epoch 3/150 Step 50 Loss: 0.2846Epoch 3/150 Step 60 Loss: 0.3214Epoch 3/150 Step 70 Loss: 0.3185Epoch 3/150 Step 80 Loss: 0.3415Epoch 3/150 Step 90 Loss: 0.4187Epoch 3/150 Step 100 Loss: 0.1581Epoch 3/150 Step 110 Loss: 0.3123Epoch 3/150 Step 120 Loss: 0.2352Epoch 3/150 Step 130 Loss: 0.3203Epoch 3/150 Step 140 Loss: 0.3068Epoch 3/150 Step 150 Loss: 0.3511Epoch 3/150 Step 160 Loss: 0.2375Epoch 3/150 Step 170 Loss: 0.2679
+Epoch 3 Avg Loss: 0.3149
+[DEBUG Ep3] Max Pred: 0.7389, Max GT: 1.0
+[DEBUG Ep3] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.1483 | LR: 0.00001000
+>>> New Best Model Saved!
+Epoch 4/150 Step 10 Loss: 0.3135Epoch 4/150 Step 20 Loss: 0.2864Epoch 4/150 Step 30 Loss: 0.3234Epoch 4/150 Step 40 Loss: 0.3638Epoch 4/150 Step 50 Loss: 0.3477Epoch 4/150 Step 60 Loss: 0.2912Epoch 4/150 Step 70 Loss: 0.3817Epoch 4/150 Step 80 Loss: 0.3066Epoch 4/150 Step 90 Loss: 0.3268Epoch 4/150 Step 100 Loss: 0.2535Epoch 4/150 Step 110 Loss: 0.3417Epoch 4/150 Step 120 Loss: 0.3265Epoch 4/150 Step 130 Loss: 0.4125Epoch 4/150 Step 140 Loss: 0.3327Epoch 4/150 Step 150 Loss: 0.2035Epoch 4/150 Step 160 Loss: 0.1675Epoch 4/150 Step 170 Loss: 0.2456
+Epoch 4 Avg Loss: 0.2993
+[DEBUG Ep4] Max Pred: 0.9395, Max GT: 1.0
+[DEBUG Ep4] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.2236 | LR: 0.00000999
+>>> New Best Model Saved!
+Epoch 5/150 Step 10 Loss: 0.3635Epoch 5/150 Step 20 Loss: 0.3310Epoch 5/150 Step 30 Loss: 0.3498Epoch 5/150 Step 40 Loss: 0.1943Epoch 5/150 Step 50 Loss: 0.2185Epoch 5/150 Step 60 Loss: 0.2168Epoch 5/150 Step 70 Loss: 0.2900Epoch 5/150 Step 80 Loss: 0.2117Epoch 5/150 Step 90 Loss: 0.2439Epoch 5/150 Step 100 Loss: 0.2306Epoch 5/150 Step 110 Loss: 0.2573Epoch 5/150 Step 120 Loss: 0.2972Epoch 5/150 Step 130 Loss: 0.2336Epoch 5/150 Step 140 Loss: 0.2602Epoch 5/150 Step 150 Loss: 0.3115Epoch 5/150 Step 160 Loss: 0.3431Epoch 5/150 Step 170 Loss: 0.3426
+Epoch 5 Avg Loss: 0.2813
+[DEBUG Ep5] Max Pred: 0.9072, Max GT: 1.0
+[DEBUG Ep5] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.2396 | LR: 0.00000998
+>>> New Best Model Saved!
+Epoch 6/150 Step 10 Loss: 0.1883Epoch 6/150 Step 20 Loss: 0.2811Epoch 6/150 Step 30 Loss: 0.3357Epoch 6/150 Step 40 Loss: 0.3433Epoch 6/150 Step 50 Loss: 0.3212Epoch 6/150 Step 60 Loss: 0.3818Epoch 6/150 Step 70 Loss: 0.2255Epoch 6/150 Step 80 Loss: 0.2174Epoch 6/150 Step 90 Loss: 0.2178Epoch 6/150 Step 100 Loss: 0.2086Epoch 6/150 Step 110 Loss: 0.2839Epoch 6/150 Step 120 Loss: 0.3644Epoch 6/150 Step 130 Loss: 0.2556Epoch 6/150 Step 140 Loss: 0.3165Epoch 6/150 Step 150 Loss: 0.3036Epoch 6/150 Step 160 Loss: 0.2872Epoch 6/150 Step 170 Loss: 0.3307
+Epoch 6 Avg Loss: 0.2764
+[DEBUG Ep6] Max Pred: 0.6776, Max GT: 1.0
+[DEBUG Ep6] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.2400 | LR: 0.00000997
+>>> New Best Model Saved!
+Epoch 7/150 Step 10 Loss: 0.2571Epoch 7/150 Step 20 Loss: 0.2818Epoch 7/150 Step 30 Loss: 0.2029Epoch 7/150 Step 40 Loss: 0.2535Epoch 7/150 Step 50 Loss: 0.3039Epoch 7/150 Step 60 Loss: 0.3479Epoch 7/150 Step 70 Loss: 0.2797Epoch 7/150 Step 80 Loss: 0.2462Epoch 7/150 Step 90 Loss: 0.2997Epoch 7/150 Step 100 Loss: 0.3150Epoch 7/150 Step 110 Loss: 0.3081Epoch 7/150 Step 120 Loss: 0.3160Epoch 7/150 Step 130 Loss: 0.2858Epoch 7/150 Step 140 Loss: 0.2733Epoch 7/150 Step 150 Loss: 0.2519Epoch 7/150 Step 160 Loss: 0.2520Epoch 7/150 Step 170 Loss: 0.3035
+Epoch 7 Avg Loss: 0.2825
+[DEBUG Ep7] Max Pred: 0.8214, Max GT: 1.0
+[DEBUG Ep7] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.3168 | LR: 0.00000996
+>>> New Best Model Saved!
+Epoch 8/150 Step 10 Loss: 0.2640Epoch 8/150 Step 20 Loss: 0.2034Epoch 8/150 Step 30 Loss: 0.3983Epoch 8/150 Step 40 Loss: 0.2895Epoch 8/150 Step 50 Loss: 0.1626Epoch 8/150 Step 60 Loss: 0.2948Epoch 8/150 Step 70 Loss: 0.1514Epoch 8/150 Step 80 Loss: 0.3701Epoch 8/150 Step 90 Loss: 0.2746Epoch 8/150 Step 100 Loss: 0.1500Epoch 8/150 Step 110 Loss: 0.3326Epoch 8/150 Step 120 Loss: 0.3177Epoch 8/150 Step 130 Loss: 0.1987Epoch 8/150 Step 140 Loss: 0.0960Epoch 8/150 Step 150 Loss: 0.2628Epoch 8/150 Step 160 Loss: 0.3818Epoch 8/150 Step 170 Loss: 0.2785
+Epoch 8 Avg Loss: 0.2658
+[DEBUG Ep8] Max Pred: 0.8886, Max GT: 1.0
+[DEBUG Ep8] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.3354 | LR: 0.00000995
+>>> New Best Model Saved!
+Epoch 9/150 Step 10 Loss: 0.1929Epoch 9/150 Step 20 Loss: 0.3381Epoch 9/150 Step 30 Loss: 0.1867Epoch 9/150 Step 40 Loss: 0.2434Epoch 9/150 Step 50 Loss: 0.1947Epoch 9/150 Step 60 Loss: 0.2703Epoch 9/150 Step 70 Loss: 0.2904Epoch 9/150 Step 80 Loss: 0.3410Epoch 9/150 Step 90 Loss: 0.2551Epoch 9/150 Step 100 Loss: 0.2219Epoch 9/150 Step 110 Loss: 0.2723Epoch 9/150 Step 120 Loss: 0.2744Epoch 9/150 Step 130 Loss: 0.1634Epoch 9/150 Step 140 Loss: 0.2182Epoch 9/150 Step 150 Loss: 0.2801Epoch 9/150 Step 160 Loss: 0.2398Epoch 9/150 Step 170 Loss: 0.1986
+Epoch 9 Avg Loss: 0.2635
+[DEBUG Ep9] Max Pred: 0.6744, Max GT: 1.0
+[DEBUG Ep9] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.3473 | LR: 0.00000993
+>>> New Best Model Saved!
+Epoch 10/150 Step 10 Loss: 0.3085Epoch 10/150 Step 20 Loss: 0.1952Epoch 10/150 Step 30 Loss: 0.1723Epoch 10/150 Step 40 Loss: 0.2576Epoch 10/150 Step 50 Loss: 0.1988Epoch 10/150 Step 60 Loss: 0.2910Epoch 10/150 Step 70 Loss: 0.2798Epoch 10/150 Step 80 Loss: 0.2686Epoch 10/150 Step 90 Loss: 0.2397Epoch 10/150 Step 100 Loss: 0.3716Epoch 10/150 Step 110 Loss: 0.1718Epoch 10/150 Step 120 Loss: 0.1783Epoch 10/150 Step 130 Loss: 0.3090Epoch 10/150 Step 140 Loss: 0.2006Epoch 10/150 Step 150 Loss: 0.2614Epoch 10/150 Step 160 Loss: 0.2243Epoch 10/150 Step 170 Loss: 0.3713
+Epoch 10 Avg Loss: 0.2551
+[DEBUG Ep10] Max Pred: 0.4775, Max GT: 1.0
+[DEBUG Ep10] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.3333 | LR: 0.00000991
+Epoch 11/150 Step 10 Loss: 0.2334Epoch 11/150 Step 20 Loss: 0.2643Epoch 11/150 Step 30 Loss: 0.2505Epoch 11/150 Step 40 Loss: 0.1803Epoch 11/150 Step 50 Loss: 0.3543Epoch 11/150 Step 60 Loss: 0.3855Epoch 11/150 Step 70 Loss: 0.3884Epoch 11/150 Step 80 Loss: 0.2416Epoch 11/150 Step 90 Loss: 0.1585Epoch 11/150 Step 100 Loss: 0.1466Epoch 11/150 Step 110 Loss: 0.2492Epoch 11/150 Step 120 Loss: 0.3057Epoch 11/150 Step 130 Loss: 0.2251Epoch 11/150 Step 140 Loss: 0.2932Epoch 11/150 Step 150 Loss: 0.3205Epoch 11/150 Step 160 Loss: 0.3349Epoch 11/150 Step 170 Loss: 0.1942
+Epoch 11 Avg Loss: 0.2651
+[DEBUG Ep11] Max Pred: 0.7785, Max GT: 1.0
+[DEBUG Ep11] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.3714 | LR: 0.00000989
+>>> New Best Model Saved!
+Epoch 12/150 Step 10 Loss: 0.4193Epoch 12/150 Step 20 Loss: 0.1972Epoch 12/150 Step 30 Loss: 0.3032Epoch 12/150 Step 40 Loss: 0.3278Epoch 12/150 Step 50 Loss: 0.3136Epoch 12/150 Step 60 Loss: 0.2466Epoch 12/150 Step 70 Loss: 0.2250Epoch 12/150 Step 80 Loss: 0.2054Epoch 12/150 Step 90 Loss: 0.2929Epoch 12/150 Step 100 Loss: 0.2890Epoch 12/150 Step 110 Loss: 0.2207Epoch 12/150 Step 120 Loss: 0.2891Epoch 12/150 Step 130 Loss: 0.3249Epoch 12/150 Step 140 Loss: 0.1789Epoch 12/150 Step 150 Loss: 0.3901Epoch 12/150 Step 160 Loss: 0.2190Epoch 12/150 Step 170 Loss: 0.1970
+Epoch 12 Avg Loss: 0.2559
+[DEBUG Ep12] Max Pred: 0.7412, Max GT: 1.0
+[DEBUG Ep12] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.3862 | LR: 0.00000987
+>>> New Best Model Saved!
+Epoch 13/150 Step 10 Loss: 0.1508Epoch 13/150 Step 20 Loss: 0.1475Epoch 13/150 Step 30 Loss: 0.1878Epoch 13/150 Step 40 Loss: 0.3576Epoch 13/150 Step 50 Loss: 0.2630Epoch 13/150 Step 60 Loss: 0.3012Epoch 13/150 Step 70 Loss: 0.2112Epoch 13/150 Step 80 Loss: 0.3678Epoch 13/150 Step 90 Loss: 0.2100Epoch 13/150 Step 100 Loss: 0.2928Epoch 13/150 Step 110 Loss: 0.2079Epoch 13/150 Step 120 Loss: 0.2453Epoch 13/150 Step 130 Loss: 0.1408Epoch 13/150 Step 140 Loss: 0.2420Epoch 13/150 Step 150 Loss: 0.1798Epoch 13/150 Step 160 Loss: 0.3590Epoch 13/150 Step 170 Loss: 0.2960
+Epoch 13 Avg Loss: 0.2465
+[DEBUG Ep13] Max Pred: 0.2210, Max GT: 1.0
+[DEBUG Ep13] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.3916 | LR: 0.00000984
+>>> New Best Model Saved!
+Epoch 14/150 Step 10 Loss: 0.1489Epoch 14/150 Step 20 Loss: 0.1301Epoch 14/150 Step 30 Loss: 0.2992Epoch 14/150 Step 40 Loss: 0.2229Epoch 14/150 Step 50 Loss: 0.2845Epoch 14/150 Step 60 Loss: 0.1786Epoch 14/150 Step 70 Loss: 0.1958Epoch 14/150 Step 80 Loss: 0.2156Epoch 14/150 Step 90 Loss: 0.3203Epoch 14/150 Step 100 Loss: 0.2846Epoch 14/150 Step 110 Loss: 0.3102Epoch 14/150 Step 120 Loss: 0.1398Epoch 14/150 Step 130 Loss: 0.3306Epoch 14/150 Step 140 Loss: 0.3645Epoch 14/150 Step 150 Loss: 0.2714Epoch 14/150 Step 160 Loss: 0.1354Epoch 14/150 Step 170 Loss: 0.1697
+Epoch 14 Avg Loss: 0.2519
+[DEBUG Ep14] Max Pred: 0.3635, Max GT: 1.0
+[DEBUG Ep14] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.3854 | LR: 0.00000982
+Epoch 15/150 Step 10 Loss: 0.2079Epoch 15/150 Step 20 Loss: 0.3111Epoch 15/150 Step 30 Loss: 0.2472Epoch 15/150 Step 40 Loss: 0.1560Epoch 15/150 Step 50 Loss: 0.3754Epoch 15/150 Step 60 Loss: 0.2951Epoch 15/150 Step 70 Loss: 0.2966Epoch 15/150 Step 80 Loss: 0.3997Epoch 15/150 Step 90 Loss: 0.2908Epoch 15/150 Step 100 Loss: 0.1281Epoch 15/150 Step 110 Loss: 0.4049Epoch 15/150 Step 120 Loss: 0.3243Epoch 15/150 Step 130 Loss: 0.2534Epoch 15/150 Step 140 Loss: 0.3275Epoch 15/150 Step 150 Loss: 0.2430Epoch 15/150 Step 160 Loss: 0.1752Epoch 15/150 Step 170 Loss: 0.3029
+Epoch 15 Avg Loss: 0.2477
+[DEBUG Ep15] Max Pred: 0.4079, Max GT: 1.0
+[DEBUG Ep15] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4072 | LR: 0.00000979
+>>> New Best Model Saved!
+Epoch 16/150 Step 10 Loss: 0.2072Epoch 16/150 Step 20 Loss: 0.2224Epoch 16/150 Step 30 Loss: 0.3170Epoch 16/150 Step 40 Loss: 0.2849Epoch 16/150 Step 50 Loss: 0.2233Epoch 16/150 Step 60 Loss: 0.1884Epoch 16/150 Step 70 Loss: 0.1406Epoch 16/150 Step 80 Loss: 0.2107Epoch 16/150 Step 90 Loss: 0.2197Epoch 16/150 Step 100 Loss: 0.2931Epoch 16/150 Step 110 Loss: 0.1888Epoch 16/150 Step 120 Loss: 0.1964Epoch 16/150 Step 130 Loss: 0.1581Epoch 16/150 Step 140 Loss: 0.2551Epoch 16/150 Step 150 Loss: 0.3780Epoch 16/150 Step 160 Loss: 0.2168Epoch 16/150 Step 170 Loss: 0.2397
+Epoch 16 Avg Loss: 0.2502
+[DEBUG Ep16] Max Pred: 0.5116, Max GT: 1.0
+[DEBUG Ep16] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4049 | LR: 0.00000976
+Epoch 17/150 Step 10 Loss: 0.2485Epoch 17/150 Step 20 Loss: 0.1504Epoch 17/150 Step 30 Loss: 0.2087Epoch 17/150 Step 40 Loss: 0.1760Epoch 17/150 Step 50 Loss: 0.2334Epoch 17/150 Step 60 Loss: 0.2550Epoch 17/150 Step 70 Loss: 0.2265Epoch 17/150 Step 80 Loss: 0.2143Epoch 17/150 Step 90 Loss: 0.1525Epoch 17/150 Step 100 Loss: 0.2424Epoch 17/150 Step 110 Loss: 0.2839Epoch 17/150 Step 120 Loss: 0.1831Epoch 17/150 Step 130 Loss: 0.0850Epoch 17/150 Step 140 Loss: 0.3348Epoch 17/150 Step 150 Loss: 0.2662Epoch 17/150 Step 160 Loss: 0.4063Epoch 17/150 Step 170 Loss: 0.3161
+Epoch 17 Avg Loss: 0.2442
+[DEBUG Ep17] Max Pred: 0.9198, Max GT: 1.0
+[DEBUG Ep17] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4000 | LR: 0.00000972
+Epoch 18/150 Step 10 Loss: 0.1309Epoch 18/150 Step 20 Loss: 0.2147Epoch 18/150 Step 30 Loss: 0.1868Epoch 18/150 Step 40 Loss: 0.2591Epoch 18/150 Step 50 Loss: 0.1308Epoch 18/150 Step 60 Loss: 0.2934Epoch 18/150 Step 70 Loss: 0.3165Epoch 18/150 Step 80 Loss: 0.2042Epoch 18/150 Step 90 Loss: 0.1655Epoch 18/150 Step 100 Loss: 0.3102Epoch 18/150 Step 110 Loss: 0.1748Epoch 18/150 Step 120 Loss: 0.1719Epoch 18/150 Step 130 Loss: 0.2542Epoch 18/150 Step 140 Loss: 0.2178Epoch 18/150 Step 150 Loss: 0.1861Epoch 18/150 Step 160 Loss: 0.2154Epoch 18/150 Step 170 Loss: 0.1782
+Epoch 18 Avg Loss: 0.2440
+[DEBUG Ep18] Max Pred: 0.5573, Max GT: 1.0
+[DEBUG Ep18] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4157 | LR: 0.00000969
+>>> New Best Model Saved!
+Epoch 19/150 Step 10 Loss: 0.1338Epoch 19/150 Step 20 Loss: 0.2984Epoch 19/150 Step 30 Loss: 0.1909Epoch 19/150 Step 40 Loss: 0.1620Epoch 19/150 Step 50 Loss: 0.1887Epoch 19/150 Step 60 Loss: 0.1061Epoch 19/150 Step 70 Loss: 0.2200Epoch 19/150 Step 80 Loss: 0.3411Epoch 19/150 Step 90 Loss: 0.3825Epoch 19/150 Step 100 Loss: 0.1690Epoch 19/150 Step 110 Loss: 0.2164Epoch 19/150 Step 120 Loss: 0.1996Epoch 19/150 Step 130 Loss: 0.3110Epoch 19/150 Step 140 Loss: 0.2103Epoch 19/150 Step 150 Loss: 0.1269Epoch 19/150 Step 160 Loss: 0.4012Epoch 19/150 Step 170 Loss: 0.3027
+Epoch 19 Avg Loss: 0.2435
+[DEBUG Ep19] Max Pred: 0.3822, Max GT: 1.0
+[DEBUG Ep19] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4075 | LR: 0.00000965
+Epoch 20/150 Step 10 Loss: 0.1526Epoch 20/150 Step 20 Loss: 0.1622Epoch 20/150 Step 30 Loss: 0.1743Epoch 20/150 Step 40 Loss: 0.2407Epoch 20/150 Step 50 Loss: 0.2851Epoch 20/150 Step 60 Loss: 0.1792Epoch 20/150 Step 70 Loss: 0.2903Epoch 20/150 Step 80 Loss: 0.2287Epoch 20/150 Step 90 Loss: 0.2637Epoch 20/150 Step 100 Loss: 0.1984Epoch 20/150 Step 110 Loss: 0.3086Epoch 20/150 Step 120 Loss: 0.2175Epoch 20/150 Step 130 Loss: 0.2347Epoch 20/150 Step 140 Loss: 0.2575Epoch 20/150 Step 150 Loss: 0.1738Epoch 20/150 Step 160 Loss: 0.2484Epoch 20/150 Step 170 Loss: 0.3165
+Epoch 20 Avg Loss: 0.2477
+[DEBUG Ep20] Max Pred: 0.5278, Max GT: 1.0
+[DEBUG Ep20] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4279 | LR: 0.00000961
+>>> New Best Model Saved!
+Epoch 21/150 Step 10 Loss: 0.1987Epoch 21/150 Step 20 Loss: 0.3518Epoch 21/150 Step 30 Loss: 0.2219Epoch 21/150 Step 40 Loss: 0.3564Epoch 21/150 Step 50 Loss: 0.2055Epoch 21/150 Step 60 Loss: 0.2198Epoch 21/150 Step 70 Loss: 0.2708Epoch 21/150 Step 80 Loss: 0.3040Epoch 21/150 Step 90 Loss: 0.2910Epoch 21/150 Step 100 Loss: 0.1888Epoch 21/150 Step 110 Loss: 0.1498Epoch 21/150 Step 120 Loss: 0.1961Epoch 21/150 Step 130 Loss: 0.3684Epoch 21/150 Step 140 Loss: 0.3941Epoch 21/150 Step 150 Loss: 0.2405Epoch 21/150 Step 160 Loss: 0.2907Epoch 21/150 Step 170 Loss: 0.2989
+Epoch 21 Avg Loss: 0.2443
+[DEBUG Ep21] Max Pred: 0.5367, Max GT: 1.0
+[DEBUG Ep21] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4236 | LR: 0.00000957
+Epoch 22/150 Step 10 Loss: 0.2201Epoch 22/150 Step 20 Loss: 0.3215Epoch 22/150 Step 30 Loss: 0.2527Epoch 22/150 Step 40 Loss: 0.3340Epoch 22/150 Step 50 Loss: 0.1452Epoch 22/150 Step 60 Loss: 0.2006Epoch 22/150 Step 70 Loss: 0.2634Epoch 22/150 Step 80 Loss: 0.2171Epoch 22/150 Step 90 Loss: 0.2324Epoch 22/150 Step 100 Loss: 0.2373Epoch 22/150 Step 110 Loss: 0.2680Epoch 22/150 Step 120 Loss: 0.3022Epoch 22/150 Step 130 Loss: 0.1784Epoch 22/150 Step 140 Loss: 0.1451Epoch 22/150 Step 150 Loss: 0.2594Epoch 22/150 Step 160 Loss: 0.1492Epoch 22/150 Step 170 Loss: 0.2341
+Epoch 22 Avg Loss: 0.2410
+[DEBUG Ep22] Max Pred: 0.6035, Max GT: 1.0
+[DEBUG Ep22] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4484 | LR: 0.00000952
+>>> New Best Model Saved!
+Epoch 23/150 Step 10 Loss: 0.1660Epoch 23/150 Step 20 Loss: 0.2327Epoch 23/150 Step 30 Loss: 0.2528Epoch 23/150 Step 40 Loss: 0.3065Epoch 23/150 Step 50 Loss: 0.1199Epoch 23/150 Step 60 Loss: 0.2532Epoch 23/150 Step 70 Loss: 0.2261Epoch 23/150 Step 80 Loss: 0.1910Epoch 23/150 Step 90 Loss: 0.1468Epoch 23/150 Step 100 Loss: 0.2072Epoch 23/150 Step 110 Loss: 0.1665Epoch 23/150 Step 120 Loss: 0.1850Epoch 23/150 Step 130 Loss: 0.3059Epoch 23/150 Step 140 Loss: 0.3581Epoch 23/150 Step 150 Loss: 0.2476Epoch 23/150 Step 160 Loss: 0.3326Epoch 23/150 Step 170 Loss: 0.1653
+Epoch 23 Avg Loss: 0.2386
+[DEBUG Ep23] Max Pred: 0.6459, Max GT: 1.0
+[DEBUG Ep23] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4596 | LR: 0.00000948
+>>> New Best Model Saved!
+Epoch 24/150 Step 10 Loss: 0.1392Epoch 24/150 Step 20 Loss: 0.2879Epoch 24/150 Step 30 Loss: 0.2016Epoch 24/150 Step 40 Loss: 0.2046Epoch 24/150 Step 50 Loss: 0.1389Epoch 24/150 Step 60 Loss: 0.2182Epoch 24/150 Step 70 Loss: 0.1767Epoch 24/150 Step 80 Loss: 0.1777Epoch 24/150 Step 90 Loss: 0.3320Epoch 24/150 Step 100 Loss: 0.4048Epoch 24/150 Step 110 Loss: 0.1810Epoch 24/150 Step 120 Loss: 0.3049Epoch 24/150 Step 130 Loss: 0.1901Epoch 24/150 Step 140 Loss: 0.3375Epoch 24/150 Step 150 Loss: 0.1724Epoch 24/150 Step 160 Loss: 0.2229Epoch 24/150 Step 170 Loss: 0.2547
+Epoch 24 Avg Loss: 0.2332
+[DEBUG Ep24] Max Pred: 0.4309, Max GT: 1.0
+[DEBUG Ep24] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4452 | LR: 0.00000943
+Epoch 25/150 Step 10 Loss: 0.2026Epoch 25/150 Step 20 Loss: 0.2544Epoch 25/150 Step 30 Loss: 0.2220Epoch 25/150 Step 40 Loss: 0.1956Epoch 25/150 Step 50 Loss: 0.3014Epoch 25/150 Step 60 Loss: 0.1424Epoch 25/150 Step 70 Loss: 0.1294Epoch 25/150 Step 80 Loss: 0.2573Epoch 25/150 Step 90 Loss: 0.2233Epoch 25/150 Step 100 Loss: 0.2870Epoch 25/150 Step 110 Loss: 0.2562Epoch 25/150 Step 120 Loss: 0.2345Epoch 25/150 Step 130 Loss: 0.1686Epoch 25/150 Step 140 Loss: 0.2994Epoch 25/150 Step 150 Loss: 0.2767Epoch 25/150 Step 160 Loss: 0.2157Epoch 25/150 Step 170 Loss: 0.2489
+Epoch 25 Avg Loss: 0.2386
+[DEBUG Ep25] Max Pred: 0.8232, Max GT: 1.0
+[DEBUG Ep25] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4553 | LR: 0.00000938
+Epoch 26/150 Step 10 Loss: 0.2275Epoch 26/150 Step 20 Loss: 0.2596Epoch 26/150 Step 30 Loss: 0.2428Epoch 26/150 Step 40 Loss: 0.1439Epoch 26/150 Step 50 Loss: 0.2947Epoch 26/150 Step 60 Loss: 0.3748Epoch 26/150 Step 70 Loss: 0.1738Epoch 26/150 Step 80 Loss: 0.2873Epoch 26/150 Step 90 Loss: 0.2148Epoch 26/150 Step 100 Loss: 0.0947Epoch 26/150 Step 110 Loss: 0.1803Epoch 26/150 Step 120 Loss: 0.1278Epoch 26/150 Step 130 Loss: 0.2941Epoch 26/150 Step 140 Loss: 0.2014Epoch 26/150 Step 150 Loss: 0.2767Epoch 26/150 Step 160 Loss: 0.1264Epoch 26/150 Step 170 Loss: 0.1496
+Epoch 26 Avg Loss: 0.2420
+[DEBUG Ep26] Max Pred: 0.6762, Max GT: 1.0
+[DEBUG Ep26] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4575 | LR: 0.00000933
+Epoch 27/150 Step 10 Loss: 0.3370Epoch 27/150 Step 20 Loss: 0.2331Epoch 27/150 Step 30 Loss: 0.2270Epoch 27/150 Step 40 Loss: 0.2160Epoch 27/150 Step 50 Loss: 0.2898Epoch 27/150 Step 60 Loss: 0.2730Epoch 27/150 Step 70 Loss: 0.1302Epoch 27/150 Step 80 Loss: 0.3822Epoch 27/150 Step 90 Loss: 0.2510Epoch 27/150 Step 100 Loss: 0.3202Epoch 27/150 Step 110 Loss: 0.0676Epoch 27/150 Step 120 Loss: 0.1972Epoch 27/150 Step 130 Loss: 0.2140Epoch 27/150 Step 140 Loss: 0.2631Epoch 27/150 Step 150 Loss: 0.2419Epoch 27/150 Step 160 Loss: 0.1144Epoch 27/150 Step 170 Loss: 0.3075
+Epoch 27 Avg Loss: 0.2389
+[DEBUG Ep27] Max Pred: 0.5173, Max GT: 1.0
+[DEBUG Ep27] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4686 | LR: 0.00000928
+>>> New Best Model Saved!
+Epoch 28/150 Step 10 Loss: 0.3035Epoch 28/150 Step 20 Loss: 0.1317Epoch 28/150 Step 30 Loss: 0.1828Epoch 28/150 Step 40 Loss: 0.2722Epoch 28/150 Step 50 Loss: 0.2720Epoch 28/150 Step 60 Loss: 0.1640Epoch 28/150 Step 70 Loss: 0.2822Epoch 28/150 Step 80 Loss: 0.3168Epoch 28/150 Step 90 Loss: 0.1703Epoch 28/150 Step 100 Loss: 0.2819Epoch 28/150 Step 110 Loss: 0.1333Epoch 28/150 Step 120 Loss: 0.2474Epoch 28/150 Step 130 Loss: 0.2355Epoch 28/150 Step 140 Loss: 0.2079Epoch 28/150 Step 150 Loss: 0.1611Epoch 28/150 Step 160 Loss: 0.2924Epoch 28/150 Step 170 Loss: 0.1312
+Epoch 28 Avg Loss: 0.2386
+[DEBUG Ep28] Max Pred: 0.5773, Max GT: 1.0
+[DEBUG Ep28] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4726 | LR: 0.00000922
+>>> New Best Model Saved!
+Epoch 29/150 Step 10 Loss: 0.2935Epoch 29/150 Step 20 Loss: 0.2784Epoch 29/150 Step 30 Loss: 0.2312Epoch 29/150 Step 40 Loss: 0.1466Epoch 29/150 Step 50 Loss: 0.2297Epoch 29/150 Step 60 Loss: 0.2729Epoch 29/150 Step 70 Loss: 0.2406Epoch 29/150 Step 80 Loss: 0.3144Epoch 29/150 Step 90 Loss: 0.2575Epoch 29/150 Step 100 Loss: 0.2700Epoch 29/150 Step 110 Loss: 0.2861Epoch 29/150 Step 120 Loss: 0.2333Epoch 29/150 Step 130 Loss: 0.1407Epoch 29/150 Step 140 Loss: 0.2569Epoch 29/150 Step 150 Loss: 0.1644Epoch 29/150 Step 160 Loss: 0.2742Epoch 29/150 Step 170 Loss: 0.3379
+Epoch 29 Avg Loss: 0.2408
+[DEBUG Ep29] Max Pred: 0.6563, Max GT: 1.0
+[DEBUG Ep29] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4633 | LR: 0.00000916
+Epoch 30/150 Step 10 Loss: 0.2326Epoch 30/150 Step 20 Loss: 0.1916Epoch 30/150 Step 30 Loss: 0.1231Epoch 30/150 Step 40 Loss: 0.3222Epoch 30/150 Step 50 Loss: 0.2233Epoch 30/150 Step 60 Loss: 0.1802Epoch 30/150 Step 70 Loss: 0.3246Epoch 30/150 Step 80 Loss: 0.0830Epoch 30/150 Step 90 Loss: 0.2034Epoch 30/150 Step 100 Loss: 0.1346Epoch 30/150 Step 110 Loss: 0.2139Epoch 30/150 Step 120 Loss: 0.2382Epoch 30/150 Step 130 Loss: 0.3339Epoch 30/150 Step 140 Loss: 0.1034Epoch 30/150 Step 150 Loss: 0.1406Epoch 30/150 Step 160 Loss: 0.3951Epoch 30/150 Step 170 Loss: 0.2706
+Epoch 30 Avg Loss: 0.2347
+[DEBUG Ep30] Max Pred: 0.8653, Max GT: 1.0
+[DEBUG Ep30] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4568 | LR: 0.00000911
+Epoch 31/150 Step 10 Loss: 0.2412Epoch 31/150 Step 20 Loss: 0.2082Epoch 31/150 Step 30 Loss: 0.1591Epoch 31/150 Step 40 Loss: 0.1384Epoch 31/150 Step 50 Loss: 0.2335Epoch 31/150 Step 60 Loss: 0.2089Epoch 31/150 Step 70 Loss: 0.2234Epoch 31/150 Step 80 Loss: 0.3243Epoch 31/150 Step 90 Loss: 0.2165Epoch 31/150 Step 100 Loss: 0.2855Epoch 31/150 Step 110 Loss: 0.2542Epoch 31/150 Step 120 Loss: 0.3345Epoch 31/150 Step 130 Loss: 0.3169Epoch 31/150 Step 140 Loss: 0.3028Epoch 31/150 Step 150 Loss: 0.2711Epoch 31/150 Step 160 Loss: 0.3624Epoch 31/150 Step 170 Loss: 0.2556
+Epoch 31 Avg Loss: 0.2340
+[DEBUG Ep31] Max Pred: 0.9273, Max GT: 1.0
+[DEBUG Ep31] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4641 | LR: 0.00000905
+Epoch 32/150 Step 10 Loss: 0.2750Epoch 32/150 Step 20 Loss: 0.1397Epoch 32/150 Step 30 Loss: 0.3124Epoch 32/150 Step 40 Loss: 0.1345Epoch 32/150 Step 50 Loss: 0.2204Epoch 32/150 Step 60 Loss: 0.2461Epoch 32/150 Step 70 Loss: 0.1986Epoch 32/150 Step 80 Loss: 0.1787Epoch 32/150 Step 90 Loss: 0.2666Epoch 32/150 Step 100 Loss: 0.2195Epoch 32/150 Step 110 Loss: 0.1628Epoch 32/150 Step 120 Loss: 0.1802Epoch 32/150 Step 130 Loss: 0.2826Epoch 32/150 Step 140 Loss: 0.1481Epoch 32/150 Step 150 Loss: 0.2855Epoch 32/150 Step 160 Loss: 0.1197Epoch 32/150 Step 170 Loss: 0.2095
+Epoch 32 Avg Loss: 0.2332
+[DEBUG Ep32] Max Pred: 0.5274, Max GT: 1.0
+[DEBUG Ep32] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4512 | LR: 0.00000898
+Epoch 33/150 Step 10 Loss: 0.2221Epoch 33/150 Step 20 Loss: 0.2725Epoch 33/150 Step 30 Loss: 0.1048Epoch 33/150 Step 40 Loss: 0.2247Epoch 33/150 Step 50 Loss: 0.2257Epoch 33/150 Step 60 Loss: 0.1393Epoch 33/150 Step 70 Loss: 0.1927Epoch 33/150 Step 80 Loss: 0.0947Epoch 33/150 Step 90 Loss: 0.3076Epoch 33/150 Step 100 Loss: 0.2543Epoch 33/150 Step 110 Loss: 0.3210Epoch 33/150 Step 120 Loss: 0.2749Epoch 33/150 Step 130 Loss: 0.1224Epoch 33/150 Step 140 Loss: 0.2000Epoch 33/150 Step 150 Loss: 0.1668Epoch 33/150 Step 160 Loss: 0.2321Epoch 33/150 Step 170 Loss: 0.1904
+Epoch 33 Avg Loss: 0.2309
+[DEBUG Ep33] Max Pred: 0.7639, Max GT: 1.0
+[DEBUG Ep33] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4706 | LR: 0.00000892
+Epoch 34/150 Step 10 Loss: 0.1754Epoch 34/150 Step 20 Loss: 0.3058Epoch 34/150 Step 30 Loss: 0.2280Epoch 34/150 Step 40 Loss: 0.3132Epoch 34/150 Step 50 Loss: 0.1843Epoch 34/150 Step 60 Loss: 0.2385Epoch 34/150 Step 70 Loss: 0.2538Epoch 34/150 Step 80 Loss: 0.2462Epoch 34/150 Step 90 Loss: 0.2005Epoch 34/150 Step 100 Loss: 0.1977Epoch 34/150 Step 110 Loss: 0.1756Epoch 34/150 Step 120 Loss: 0.1943Epoch 34/150 Step 130 Loss: 0.3615Epoch 34/150 Step 140 Loss: 0.2481Epoch 34/150 Step 150 Loss: 0.1726Epoch 34/150 Step 160 Loss: 0.1582Epoch 34/150 Step 170 Loss: 0.2662
+Epoch 34 Avg Loss: 0.2296
+[DEBUG Ep34] Max Pred: 0.5863, Max GT: 1.0
+[DEBUG Ep34] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4729 | LR: 0.00000885
+>>> New Best Model Saved!
+Epoch 35/150 Step 10 Loss: 0.1104Epoch 35/150 Step 20 Loss: 0.2892Epoch 35/150 Step 30 Loss: 0.2320Epoch 35/150 Step 40 Loss: 0.1884Epoch 35/150 Step 50 Loss: 0.3533Epoch 35/150 Step 60 Loss: 0.1784Epoch 35/150 Step 70 Loss: 0.1373Epoch 35/150 Step 80 Loss: 0.3346Epoch 35/150 Step 90 Loss: 0.3233Epoch 35/150 Step 100 Loss: 0.1624Epoch 35/150 Step 110 Loss: 0.2013Epoch 35/150 Step 120 Loss: 0.3546Epoch 35/150 Step 130 Loss: 0.1244Epoch 35/150 Step 140 Loss: 0.1914Epoch 35/150 Step 150 Loss: 0.2759Epoch 35/150 Step 160 Loss: 0.2014Epoch 35/150 Step 170 Loss: 0.2502
+Epoch 35 Avg Loss: 0.2374
+[DEBUG Ep35] Max Pred: 0.8247, Max GT: 1.0
+[DEBUG Ep35] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4685 | LR: 0.00000878
+Epoch 36/150 Step 10 Loss: 0.1742Epoch 36/150 Step 20 Loss: 0.2921Epoch 36/150 Step 30 Loss: 0.3259Epoch 36/150 Step 40 Loss: 0.2332Epoch 36/150 Step 50 Loss: 0.1856Epoch 36/150 Step 60 Loss: 0.1978Epoch 36/150 Step 70 Loss: 0.3055Epoch 36/150 Step 80 Loss: 0.4140Epoch 36/150 Step 90 Loss: 0.1062Epoch 36/150 Step 100 Loss: 0.2049Epoch 36/150 Step 110 Loss: 0.2335Epoch 36/150 Step 120 Loss: 0.3055Epoch 36/150 Step 130 Loss: 0.2882Epoch 36/150 Step 140 Loss: 0.3004Epoch 36/150 Step 150 Loss: 0.1526Epoch 36/150 Step 160 Loss: 0.3127Epoch 36/150 Step 170 Loss: 0.2735
+Epoch 36 Avg Loss: 0.2350
+[DEBUG Ep36] Max Pred: 0.4034, Max GT: 1.0
+[DEBUG Ep36] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4769 | LR: 0.00000872
+>>> New Best Model Saved!
+Epoch 37/150 Step 10 Loss: 0.1905Epoch 37/150 Step 20 Loss: 0.2408Epoch 37/150 Step 30 Loss: 0.1880Epoch 37/150 Step 40 Loss: 0.2875Epoch 37/150 Step 50 Loss: 0.1683Epoch 37/150 Step 60 Loss: 0.1195Epoch 37/150 Step 70 Loss: 0.2772Epoch 37/150 Step 80 Loss: 0.1722Epoch 37/150 Step 90 Loss: 0.3097Epoch 37/150 Step 100 Loss: 0.1111Epoch 37/150 Step 110 Loss: 0.1996Epoch 37/150 Step 120 Loss: 0.1413Epoch 37/150 Step 130 Loss: 0.2438Epoch 37/150 Step 140 Loss: 0.1920Epoch 37/150 Step 150 Loss: 0.1973Epoch 37/150 Step 160 Loss: 0.2344Epoch 37/150 Step 170 Loss: 0.3585
+Epoch 37 Avg Loss: 0.2331
+[DEBUG Ep37] Max Pred: 0.7695, Max GT: 1.0
+[DEBUG Ep37] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4783 | LR: 0.00000864
+>>> New Best Model Saved!
+Epoch 38/150 Step 10 Loss: 0.2436Epoch 38/150 Step 20 Loss: 0.2787Epoch 38/150 Step 30 Loss: 0.2817Epoch 38/150 Step 40 Loss: 0.2867Epoch 38/150 Step 50 Loss: 0.3452Epoch 38/150 Step 60 Loss: 0.1797Epoch 38/150 Step 70 Loss: 0.0736Epoch 38/150 Step 80 Loss: 0.2219Epoch 38/150 Step 90 Loss: 0.1975Epoch 38/150 Step 100 Loss: 0.2256Epoch 38/150 Step 110 Loss: 0.2171Epoch 38/150 Step 120 Loss: 0.2090Epoch 38/150 Step 130 Loss: 0.2324Epoch 38/150 Step 140 Loss: 0.1137Epoch 38/150 Step 150 Loss: 0.2093Epoch 38/150 Step 160 Loss: 0.3244Epoch 38/150 Step 170 Loss: 0.2676
+Epoch 38 Avg Loss: 0.2290
+[DEBUG Ep38] Max Pred: 0.8475, Max GT: 1.0
+[DEBUG Ep38] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4685 | LR: 0.00000857
+Epoch 39/150 Step 10 Loss: 0.2037Epoch 39/150 Step 20 Loss: 0.1997Epoch 39/150 Step 30 Loss: 0.1942Epoch 39/150 Step 40 Loss: 0.2004Epoch 39/150 Step 50 Loss: 0.1434Epoch 39/150 Step 60 Loss: 0.1986Epoch 39/150 Step 70 Loss: 0.3399Epoch 39/150 Step 80 Loss: 0.2443Epoch 39/150 Step 90 Loss: 0.2179Epoch 39/150 Step 100 Loss: 0.0941Epoch 39/150 Step 110 Loss: 0.1253Epoch 39/150 Step 120 Loss: 0.2535Epoch 39/150 Step 130 Loss: 0.2274Epoch 39/150 Step 140 Loss: 0.1617Epoch 39/150 Step 150 Loss: 0.1096Epoch 39/150 Step 160 Loss: 0.2037Epoch 39/150 Step 170 Loss: 0.2538
+Epoch 39 Avg Loss: 0.2242
+[DEBUG Ep39] Max Pred: 0.6935, Max GT: 1.0
+[DEBUG Ep39] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4666 | LR: 0.00000850
+Epoch 40/150 Step 10 Loss: 0.2354Epoch 40/150 Step 20 Loss: 0.2116Epoch 40/150 Step 30 Loss: 0.2510Epoch 40/150 Step 40 Loss: 0.2546Epoch 40/150 Step 50 Loss: 0.3287Epoch 40/150 Step 60 Loss: 0.1466Epoch 40/150 Step 70 Loss: 0.3585Epoch 40/150 Step 80 Loss: 0.2887Epoch 40/150 Step 90 Loss: 0.1366Epoch 40/150 Step 100 Loss: 0.3222Epoch 40/150 Step 110 Loss: 0.2317Epoch 40/150 Step 120 Loss: 0.0890Epoch 40/150 Step 130 Loss: 0.2688Epoch 40/150 Step 140 Loss: 0.2752Epoch 40/150 Step 150 Loss: 0.1776Epoch 40/150 Step 160 Loss: 0.2515Epoch 40/150 Step 170 Loss: 0.1378
+Epoch 40 Avg Loss: 0.2308
+[DEBUG Ep40] Max Pred: 0.8570, Max GT: 1.0
+[DEBUG Ep40] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4694 | LR: 0.00000842
+Epoch 41/150 Step 10 Loss: 0.2422Epoch 41/150 Step 20 Loss: 0.2050Epoch 41/150 Step 30 Loss: 0.1610Epoch 41/150 Step 40 Loss: 0.2431Epoch 41/150 Step 50 Loss: 0.1233Epoch 41/150 Step 60 Loss: 0.3104Epoch 41/150 Step 70 Loss: 0.2337Epoch 41/150 Step 80 Loss: 0.2900Epoch 41/150 Step 90 Loss: 0.1526Epoch 41/150 Step 100 Loss: 0.1328Epoch 41/150 Step 110 Loss: 0.2397Epoch 41/150 Step 120 Loss: 0.2583Epoch 41/150 Step 130 Loss: 0.3103Epoch 41/150 Step 140 Loss: 0.2436Epoch 41/150 Step 150 Loss: 0.2211Epoch 41/150 Step 160 Loss: 0.1469Epoch 41/150 Step 170 Loss: 0.3359
+Epoch 41 Avg Loss: 0.2246
+[DEBUG Ep41] Max Pred: 0.7111, Max GT: 1.0
+[DEBUG Ep41] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4849 | LR: 0.00000835
+>>> New Best Model Saved!
+Epoch 42/150 Step 10 Loss: 0.1684Epoch 42/150 Step 20 Loss: 0.2488Epoch 42/150 Step 30 Loss: 0.1865Epoch 42/150 Step 40 Loss: 0.2070Epoch 42/150 Step 50 Loss: 0.2825Epoch 42/150 Step 60 Loss: 0.2378Epoch 42/150 Step 70 Loss: 0.2984Epoch 42/150 Step 80 Loss: 0.0912Epoch 42/150 Step 90 Loss: 0.3316Epoch 42/150 Step 100 Loss: 0.3081Epoch 42/150 Step 110 Loss: 0.2145Epoch 42/150 Step 120 Loss: 0.2338Epoch 42/150 Step 130 Loss: 0.2963Epoch 42/150 Step 140 Loss: 0.1958Epoch 42/150 Step 150 Loss: 0.2805Epoch 42/150 Step 160 Loss: 0.2454Epoch 42/150 Step 170 Loss: 0.2970
+Epoch 42 Avg Loss: 0.2254
+[DEBUG Ep42] Max Pred: 0.3825, Max GT: 1.0
+[DEBUG Ep42] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4717 | LR: 0.00000827
+Epoch 43/150 Step 10 Loss: 0.2877Epoch 43/150 Step 20 Loss: 0.2641Epoch 43/150 Step 30 Loss: 0.1227Epoch 43/150 Step 40 Loss: 0.2638Epoch 43/150 Step 50 Loss: 0.2036Epoch 43/150 Step 60 Loss: 0.2470Epoch 43/150 Step 70 Loss: 0.2433Epoch 43/150 Step 80 Loss: 0.1809Epoch 43/150 Step 90 Loss: 0.2781Epoch 43/150 Step 100 Loss: 0.3102Epoch 43/150 Step 110 Loss: 0.0876Epoch 43/150 Step 120 Loss: 0.2348Epoch 43/150 Step 130 Loss: 0.2017Epoch 43/150 Step 140 Loss: 0.2597Epoch 43/150 Step 150 Loss: 0.1957Epoch 43/150 Step 160 Loss: 0.3001Epoch 43/150 Step 170 Loss: 0.2957
+Epoch 43 Avg Loss: 0.2237
+[DEBUG Ep43] Max Pred: 0.5462, Max GT: 1.0
+[DEBUG Ep43] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4725 | LR: 0.00000819
+Epoch 44/150 Step 10 Loss: 0.1919Epoch 44/150 Step 20 Loss: 0.1950Epoch 44/150 Step 30 Loss: 0.2607Epoch 44/150 Step 40 Loss: 0.2289Epoch 44/150 Step 50 Loss: 0.2246Epoch 44/150 Step 60 Loss: 0.2791Epoch 44/150 Step 70 Loss: 0.1714Epoch 44/150 Step 80 Loss: 0.2915Epoch 44/150 Step 90 Loss: 0.2816Epoch 44/150 Step 100 Loss: 0.2935Epoch 44/150 Step 110 Loss: 0.1831Epoch 44/150 Step 120 Loss: 0.2510Epoch 44/150 Step 130 Loss: 0.1576Epoch 44/150 Step 140 Loss: 0.2929Epoch 44/150 Step 150 Loss: 0.2786Epoch 44/150 Step 160 Loss: 0.2248Epoch 44/150 Step 170 Loss: 0.2389
+Epoch 44 Avg Loss: 0.2303
+[DEBUG Ep44] Max Pred: 0.7391, Max GT: 1.0
+[DEBUG Ep44] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4917 | LR: 0.00000811
+>>> New Best Model Saved!
+Epoch 45/150 Step 10 Loss: 0.2691Epoch 45/150 Step 20 Loss: 0.2440Epoch 45/150 Step 30 Loss: 0.2715Epoch 45/150 Step 40 Loss: 0.2467Epoch 45/150 Step 50 Loss: 0.2565Epoch 45/150 Step 60 Loss: 0.1882Epoch 45/150 Step 70 Loss: 0.2678Epoch 45/150 Step 80 Loss: 0.1435Epoch 45/150 Step 90 Loss: 0.1481Epoch 45/150 Step 100 Loss: 0.2490Epoch 45/150 Step 110 Loss: 0.1937Epoch 45/150 Step 120 Loss: 0.3013Epoch 45/150 Step 130 Loss: 0.2217Epoch 45/150 Step 140 Loss: 0.1527Epoch 45/150 Step 150 Loss: 0.1340Epoch 45/150 Step 160 Loss: 0.1833Epoch 45/150 Step 170 Loss: 0.1717
+Epoch 45 Avg Loss: 0.2277
+[DEBUG Ep45] Max Pred: 0.9654, Max GT: 1.0
+[DEBUG Ep45] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4845 | LR: 0.00000802
+Epoch 46/150 Step 10 Loss: 0.1870Epoch 46/150 Step 20 Loss: 0.1352Epoch 46/150 Step 30 Loss: 0.2785Epoch 46/150 Step 40 Loss: 0.1906Epoch 46/150 Step 50 Loss: 0.1971Epoch 46/150 Step 60 Loss: 0.1427Epoch 46/150 Step 70 Loss: 0.2683Epoch 46/150 Step 80 Loss: 0.3044Epoch 46/150 Step 90 Loss: 0.2155Epoch 46/150 Step 100 Loss: 0.3057Epoch 46/150 Step 110 Loss: 0.2225Epoch 46/150 Step 120 Loss: 0.1518Epoch 46/150 Step 130 Loss: 0.1828Epoch 46/150 Step 140 Loss: 0.1242Epoch 46/150 Step 150 Loss: 0.1517Epoch 46/150 Step 160 Loss: 0.3103Epoch 46/150 Step 170 Loss: 0.3501
+Epoch 46 Avg Loss: 0.2262
+[DEBUG Ep46] Max Pred: 0.7732, Max GT: 1.0
+[DEBUG Ep46] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4878 | LR: 0.00000794
+Epoch 47/150 Step 10 Loss: 0.2269Epoch 47/150 Step 20 Loss: 0.1863Epoch 47/150 Step 30 Loss: 0.1659Epoch 47/150 Step 40 Loss: 0.3602Epoch 47/150 Step 50 Loss: 0.2297Epoch 47/150 Step 60 Loss: 0.2283Epoch 47/150 Step 70 Loss: 0.3116Epoch 47/150 Step 80 Loss: 0.1903Epoch 47/150 Step 90 Loss: 0.2025Epoch 47/150 Step 100 Loss: 0.1870Epoch 47/150 Step 110 Loss: 0.1157Epoch 47/150 Step 120 Loss: 0.1976Epoch 47/150 Step 130 Loss: 0.2377Epoch 47/150 Step 140 Loss: 0.1993Epoch 47/150 Step 150 Loss: 0.2624Epoch 47/150 Step 160 Loss: 0.2826Epoch 47/150 Step 170 Loss: 0.3345
+Epoch 47 Avg Loss: 0.2295
+[DEBUG Ep47] Max Pred: 0.6330, Max GT: 1.0
+[DEBUG Ep47] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4838 | LR: 0.00000785
+Epoch 48/150 Step 10 Loss: 0.1928Epoch 48/150 Step 20 Loss: 0.2661Epoch 48/150 Step 30 Loss: 0.1921Epoch 48/150 Step 40 Loss: 0.1403Epoch 48/150 Step 50 Loss: 0.2294Epoch 48/150 Step 60 Loss: 0.2281Epoch 48/150 Step 70 Loss: 0.1989Epoch 48/150 Step 80 Loss: 0.3938Epoch 48/150 Step 90 Loss: 0.1631Epoch 48/150 Step 100 Loss: 0.2277Epoch 48/150 Step 110 Loss: 0.2411Epoch 48/150 Step 120 Loss: 0.1757Epoch 48/150 Step 130 Loss: 0.2867Epoch 48/150 Step 140 Loss: 0.1899Epoch 48/150 Step 150 Loss: 0.2440Epoch 48/150 Step 160 Loss: 0.2078Epoch 48/150 Step 170 Loss: 0.2302
+Epoch 48 Avg Loss: 0.2303
+[DEBUG Ep48] Max Pred: 0.7762, Max GT: 1.0
+[DEBUG Ep48] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4928 | LR: 0.00000777
+>>> New Best Model Saved!
+Epoch 49/150 Step 10 Loss: 0.1668Epoch 49/150 Step 20 Loss: 0.2216Epoch 49/150 Step 30 Loss: 0.2372Epoch 49/150 Step 40 Loss: 0.1910Epoch 49/150 Step 50 Loss: 0.1120Epoch 49/150 Step 60 Loss: 0.3588Epoch 49/150 Step 70 Loss: 0.2757Epoch 49/150 Step 80 Loss: 0.2761Epoch 49/150 Step 90 Loss: 0.3059Epoch 49/150 Step 100 Loss: 0.2305Epoch 49/150 Step 110 Loss: 0.3215Epoch 49/150 Step 120 Loss: 0.4959Epoch 49/150 Step 130 Loss: 0.2116Epoch 49/150 Step 140 Loss: 0.2386Epoch 49/150 Step 150 Loss: 0.2950Epoch 49/150 Step 160 Loss: 0.0706Epoch 49/150 Step 170 Loss: 0.3028
+Epoch 49 Avg Loss: 0.2293
+[DEBUG Ep49] Max Pred: 0.7900, Max GT: 1.0
+[DEBUG Ep49] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4822 | LR: 0.00000768
+Epoch 50/150 Step 10 Loss: 0.3721Epoch 50/150 Step 20 Loss: 0.3257Epoch 50/150 Step 30 Loss: 0.2760Epoch 50/150 Step 40 Loss: 0.2628Epoch 50/150 Step 50 Loss: 0.2229Epoch 50/150 Step 60 Loss: 0.2013Epoch 50/150 Step 70 Loss: 0.2524Epoch 50/150 Step 80 Loss: 0.2212Epoch 50/150 Step 90 Loss: 0.2108Epoch 50/150 Step 100 Loss: 0.2320Epoch 50/150 Step 110 Loss: 0.2167Epoch 50/150 Step 120 Loss: 0.2617Epoch 50/150 Step 130 Loss: 0.1422Epoch 50/150 Step 140 Loss: 0.1532Epoch 50/150 Step 150 Loss: 0.1876Epoch 50/150 Step 160 Loss: 0.1709Epoch 50/150 Step 170 Loss: 0.3072
+Epoch 50 Avg Loss: 0.2265
+[DEBUG Ep50] Max Pred: 0.6441, Max GT: 1.0
+[DEBUG Ep50] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4840 | LR: 0.00000759
+Epoch 51/150 Step 10 Loss: 0.2313Epoch 51/150 Step 20 Loss: 0.1584Epoch 51/150 Step 30 Loss: 0.0887Epoch 51/150 Step 40 Loss: 0.2340Epoch 51/150 Step 50 Loss: 0.2633Epoch 51/150 Step 60 Loss: 0.1570Epoch 51/150 Step 70 Loss: 0.2959Epoch 51/150 Step 80 Loss: 0.0875Epoch 51/150 Step 90 Loss: 0.2011Epoch 51/150 Step 100 Loss: 0.1879Epoch 51/150 Step 110 Loss: 0.3570Epoch 51/150 Step 120 Loss: 0.1596Epoch 51/150 Step 130 Loss: 0.2701Epoch 51/150 Step 140 Loss: 0.1294Epoch 51/150 Step 150 Loss: 0.3367Epoch 51/150 Step 160 Loss: 0.1812Epoch 51/150 Step 170 Loss: 0.1173
+Epoch 51 Avg Loss: 0.2273
+[DEBUG Ep51] Max Pred: 0.6856, Max GT: 1.0
+[DEBUG Ep51] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4785 | LR: 0.00000750
+Epoch 52/150 Step 10 Loss: 0.1931Epoch 52/150 Step 20 Loss: 0.1338Epoch 52/150 Step 30 Loss: 0.2574Epoch 52/150 Step 40 Loss: 0.3031Epoch 52/150 Step 50 Loss: 0.2924Epoch 52/150 Step 60 Loss: 0.2616Epoch 52/150 Step 70 Loss: 0.2399Epoch 52/150 Step 80 Loss: 0.1963Epoch 52/150 Step 90 Loss: 0.2394Epoch 52/150 Step 100 Loss: 0.3365Epoch 52/150 Step 110 Loss: 0.1439Epoch 52/150 Step 120 Loss: 0.1948Epoch 52/150 Step 130 Loss: 0.1594Epoch 52/150 Step 140 Loss: 0.1903Epoch 52/150 Step 150 Loss: 0.2784Epoch 52/150 Step 160 Loss: 0.2843Epoch 52/150 Step 170 Loss: 0.1581
+Epoch 52 Avg Loss: 0.2181
+[DEBUG Ep52] Max Pred: 0.8979, Max GT: 1.0
+[DEBUG Ep52] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4944 | LR: 0.00000741
+>>> New Best Model Saved!
+Epoch 53/150 Step 10 Loss: 0.3040Epoch 53/150 Step 20 Loss: 0.2137Epoch 53/150 Step 30 Loss: 0.2450Epoch 53/150 Step 40 Loss: 0.2628Epoch 53/150 Step 50 Loss: 0.2410Epoch 53/150 Step 60 Loss: 0.1857Epoch 53/150 Step 70 Loss: 0.2001Epoch 53/150 Step 80 Loss: 0.2427Epoch 53/150 Step 90 Loss: 0.2451Epoch 53/150 Step 100 Loss: 0.0948Epoch 53/150 Step 110 Loss: 0.2422Epoch 53/150 Step 120 Loss: 0.0787Epoch 53/150 Step 130 Loss: 0.2431Epoch 53/150 Step 140 Loss: 0.2765Epoch 53/150 Step 150 Loss: 0.2370Epoch 53/150 Step 160 Loss: 0.2210Epoch 53/150 Step 170 Loss: 0.2000
+Epoch 53 Avg Loss: 0.2268
+[DEBUG Ep53] Max Pred: 0.8293, Max GT: 1.0
+[DEBUG Ep53] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4960 | LR: 0.00000732
+>>> New Best Model Saved!
+Epoch 54/150 Step 10 Loss: 0.2910Epoch 54/150 Step 20 Loss: 0.2637Epoch 54/150 Step 30 Loss: 0.2528Epoch 54/150 Step 40 Loss: 0.2299Epoch 54/150 Step 50 Loss: 0.1617Epoch 54/150 Step 60 Loss: 0.1538Epoch 54/150 Step 70 Loss: 0.1516Epoch 54/150 Step 80 Loss: 0.2518Epoch 54/150 Step 90 Loss: 0.2511Epoch 54/150 Step 100 Loss: 0.2550Epoch 54/150 Step 110 Loss: 0.1915Epoch 54/150 Step 120 Loss: 0.2657Epoch 54/150 Step 130 Loss: 0.1778Epoch 54/150 Step 140 Loss: 0.1801Epoch 54/150 Step 150 Loss: 0.1364Epoch 54/150 Step 160 Loss: 0.2674Epoch 54/150 Step 170 Loss: 0.1985
+Epoch 54 Avg Loss: 0.2307
+[DEBUG Ep54] Max Pred: 0.7352, Max GT: 1.0
+[DEBUG Ep54] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4764 | LR: 0.00000722
+Epoch 55/150 Step 10 Loss: 0.2410Epoch 55/150 Step 20 Loss: 0.2300Epoch 55/150 Step 30 Loss: 0.2305Epoch 55/150 Step 40 Loss: 0.2872Epoch 55/150 Step 50 Loss: 0.2301Epoch 55/150 Step 60 Loss: 0.2101Epoch 55/150 Step 70 Loss: 0.1571Epoch 55/150 Step 80 Loss: 0.1588Epoch 55/150 Step 90 Loss: 0.2457Epoch 55/150 Step 100 Loss: 0.2460Epoch 55/150 Step 110 Loss: 0.3613Epoch 55/150 Step 120 Loss: 0.1873Epoch 55/150 Step 130 Loss: 0.2947Epoch 55/150 Step 140 Loss: 0.2917Epoch 55/150 Step 150 Loss: 0.3188Epoch 55/150 Step 160 Loss: 0.2478Epoch 55/150 Step 170 Loss: 0.1877
+Epoch 55 Avg Loss: 0.2316
+[DEBUG Ep55] Max Pred: 0.7644, Max GT: 1.0
+[DEBUG Ep55] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4867 | LR: 0.00000713
+Epoch 56/150 Step 10 Loss: 0.2518Epoch 56/150 Step 20 Loss: 0.2042Epoch 56/150 Step 30 Loss: 0.1864Epoch 56/150 Step 40 Loss: 0.2413Epoch 56/150 Step 50 Loss: 0.3490Epoch 56/150 Step 60 Loss: 0.3247Epoch 56/150 Step 70 Loss: 0.2549Epoch 56/150 Step 80 Loss: 0.3530Epoch 56/150 Step 90 Loss: 0.1773Epoch 56/150 Step 100 Loss: 0.1968Epoch 56/150 Step 110 Loss: 0.1581Epoch 56/150 Step 120 Loss: 0.3041Epoch 56/150 Step 130 Loss: 0.2411Epoch 56/150 Step 140 Loss: 0.1781Epoch 56/150 Step 150 Loss: 0.2481Epoch 56/150 Step 160 Loss: 0.1450Epoch 56/150 Step 170 Loss: 0.3367
+Epoch 56 Avg Loss: 0.2311
+[DEBUG Ep56] Max Pred: 0.3339, Max GT: 1.0
+[DEBUG Ep56] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4770 | LR: 0.00000703
+Epoch 57/150 Step 10 Loss: 0.2794Epoch 57/150 Step 20 Loss: 0.2372Epoch 57/150 Step 30 Loss: 0.1828Epoch 57/150 Step 40 Loss: 0.1294Epoch 57/150 Step 50 Loss: 0.3079Epoch 57/150 Step 60 Loss: 0.1856Epoch 57/150 Step 70 Loss: 0.1381Epoch 57/150 Step 80 Loss: 0.1812Epoch 57/150 Step 90 Loss: 0.2914Epoch 57/150 Step 100 Loss: 0.1858Epoch 57/150 Step 110 Loss: 0.2538Epoch 57/150 Step 120 Loss: 0.1898Epoch 57/150 Step 130 Loss: 0.1464Epoch 57/150 Step 140 Loss: 0.2069Epoch 57/150 Step 150 Loss: 0.1756Epoch 57/150 Step 160 Loss: 0.2255Epoch 57/150 Step 170 Loss: 0.2876
+Epoch 57 Avg Loss: 0.2237
+[DEBUG Ep57] Max Pred: 0.5688, Max GT: 1.0
+[DEBUG Ep57] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4965 | LR: 0.00000694
+>>> New Best Model Saved!
+Epoch 58/150 Step 10 Loss: 0.1309Epoch 58/150 Step 20 Loss: 0.2089Epoch 58/150 Step 30 Loss: 0.2119Epoch 58/150 Step 40 Loss: 0.2318Epoch 58/150 Step 50 Loss: 0.2366Epoch 58/150 Step 60 Loss: 0.2568Epoch 58/150 Step 70 Loss: 0.3091Epoch 58/150 Step 80 Loss: 0.1557Epoch 58/150 Step 90 Loss: 0.2483Epoch 58/150 Step 100 Loss: 0.2576Epoch 58/150 Step 110 Loss: 0.1999Epoch 58/150 Step 120 Loss: 0.2561Epoch 58/150 Step 130 Loss: 0.1883Epoch 58/150 Step 140 Loss: 0.3223Epoch 58/150 Step 150 Loss: 0.2729Epoch 58/150 Step 160 Loss: 0.2376Epoch 58/150 Step 170 Loss: 0.1993
+Epoch 58 Avg Loss: 0.2309
+[DEBUG Ep58] Max Pred: 0.8995, Max GT: 1.0
+[DEBUG Ep58] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5010 | LR: 0.00000684
+>>> New Best Model Saved!
+Epoch 59/150 Step 10 Loss: 0.1877Epoch 59/150 Step 20 Loss: 0.1938Epoch 59/150 Step 30 Loss: 0.3350Epoch 59/150 Step 40 Loss: 0.2305Epoch 59/150 Step 50 Loss: 0.3300Epoch 59/150 Step 60 Loss: 0.0738Epoch 59/150 Step 70 Loss: 0.2083Epoch 59/150 Step 80 Loss: 0.1791Epoch 59/150 Step 90 Loss: 0.2749Epoch 59/150 Step 100 Loss: 0.2378Epoch 59/150 Step 110 Loss: 0.2780Epoch 59/150 Step 120 Loss: 0.2961Epoch 59/150 Step 130 Loss: 0.3489Epoch 59/150 Step 140 Loss: 0.3304Epoch 59/150 Step 150 Loss: 0.1866Epoch 59/150 Step 160 Loss: 0.2028Epoch 59/150 Step 170 Loss: 0.2982
+Epoch 59 Avg Loss: 0.2221
+[DEBUG Ep59] Max Pred: 0.9280, Max GT: 1.0
+[DEBUG Ep59] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5015 | LR: 0.00000674
+>>> New Best Model Saved!
+Epoch 60/150 Step 10 Loss: 0.2848Epoch 60/150 Step 20 Loss: 0.2254Epoch 60/150 Step 30 Loss: 0.1543Epoch 60/150 Step 40 Loss: 0.2598Epoch 60/150 Step 50 Loss: 0.2477Epoch 60/150 Step 60 Loss: 0.2094Epoch 60/150 Step 70 Loss: 0.1782Epoch 60/150 Step 80 Loss: 0.1485Epoch 60/150 Step 90 Loss: 0.1048Epoch 60/150 Step 100 Loss: 0.1971Epoch 60/150 Step 110 Loss: 0.2796Epoch 60/150 Step 120 Loss: 0.1928Epoch 60/150 Step 130 Loss: 0.2402Epoch 60/150 Step 140 Loss: 0.2723Epoch 60/150 Step 150 Loss: 0.2938Epoch 60/150 Step 160 Loss: 0.3191Epoch 60/150 Step 170 Loss: 0.1833
+Epoch 60 Avg Loss: 0.2215
+[DEBUG Ep60] Max Pred: 0.8648, Max GT: 1.0
+[DEBUG Ep60] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4973 | LR: 0.00000664
+Epoch 61/150 Step 10 Loss: 0.2047Epoch 61/150 Step 20 Loss: 0.1518Epoch 61/150 Step 30 Loss: 0.2236Epoch 61/150 Step 40 Loss: 0.0796Epoch 61/150 Step 50 Loss: 0.2413Epoch 61/150 Step 60 Loss: 0.2433Epoch 61/150 Step 70 Loss: 0.3079Epoch 61/150 Step 80 Loss: 0.1504Epoch 61/150 Step 90 Loss: 0.1910Epoch 61/150 Step 100 Loss: 0.1803Epoch 61/150 Step 110 Loss: 0.2539Epoch 61/150 Step 120 Loss: 0.2663Epoch 61/150 Step 130 Loss: 0.1868Epoch 61/150 Step 140 Loss: 0.2731Epoch 61/150 Step 150 Loss: 0.1636Epoch 61/150 Step 160 Loss: 0.1988Epoch 61/150 Step 170 Loss: 0.2599
+Epoch 61 Avg Loss: 0.2234
+[DEBUG Ep61] Max Pred: 0.9251, Max GT: 1.0
+[DEBUG Ep61] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4984 | LR: 0.00000655
+Epoch 62/150 Step 10 Loss: 0.1854Epoch 62/150 Step 20 Loss: 0.1202Epoch 62/150 Step 30 Loss: 0.1486Epoch 62/150 Step 40 Loss: 0.1578Epoch 62/150 Step 50 Loss: 0.2313Epoch 62/150 Step 60 Loss: 0.3210Epoch 62/150 Step 70 Loss: 0.3109Epoch 62/150 Step 80 Loss: 0.2872Epoch 62/150 Step 90 Loss: 0.3261Epoch 62/150 Step 100 Loss: 0.2989Epoch 62/150 Step 110 Loss: 0.2709Epoch 62/150 Step 120 Loss: 0.1840Epoch 62/150 Step 130 Loss: 0.1435Epoch 62/150 Step 140 Loss: 0.1894Epoch 62/150 Step 150 Loss: 0.2078Epoch 62/150 Step 160 Loss: 0.3344Epoch 62/150 Step 170 Loss: 0.3154
+Epoch 62 Avg Loss: 0.2262
+[DEBUG Ep62] Max Pred: 0.9336, Max GT: 1.0
+[DEBUG Ep62] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4977 | LR: 0.00000645
+Epoch 63/150 Step 10 Loss: 0.2206Epoch 63/150 Step 20 Loss: 0.1819Epoch 63/150 Step 30 Loss: 0.2365Epoch 63/150 Step 40 Loss: 0.2544Epoch 63/150 Step 50 Loss: 0.2878Epoch 63/150 Step 60 Loss: 0.2736Epoch 63/150 Step 70 Loss: 0.1633Epoch 63/150 Step 80 Loss: 0.2280Epoch 63/150 Step 90 Loss: 0.2451Epoch 63/150 Step 100 Loss: 0.3527Epoch 63/150 Step 110 Loss: 0.2126Epoch 63/150 Step 120 Loss: 0.2644Epoch 63/150 Step 130 Loss: 0.1718Epoch 63/150 Step 140 Loss: 0.2151Epoch 63/150 Step 150 Loss: 0.1008Epoch 63/150 Step 160 Loss: 0.2249Epoch 63/150 Step 170 Loss: 0.1816
+Epoch 63 Avg Loss: 0.2236
+[DEBUG Ep63] Max Pred: 0.7355, Max GT: 1.0
+[DEBUG Ep63] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4975 | LR: 0.00000634
+Epoch 64/150 Step 10 Loss: 0.3015Epoch 64/150 Step 20 Loss: 0.1897Epoch 64/150 Step 30 Loss: 0.1757Epoch 64/150 Step 40 Loss: 0.1868Epoch 64/150 Step 50 Loss: 0.2058Epoch 64/150 Step 60 Loss: 0.1365Epoch 64/150 Step 70 Loss: 0.2049Epoch 64/150 Step 80 Loss: 0.1865Epoch 64/150 Step 90 Loss: 0.3091Epoch 64/150 Step 100 Loss: 0.3936Epoch 64/150 Step 110 Loss: 0.2442Epoch 64/150 Step 120 Loss: 0.2640Epoch 64/150 Step 130 Loss: 0.2392Epoch 64/150 Step 140 Loss: 0.2196Epoch 64/150 Step 150 Loss: 0.2738Epoch 64/150 Step 160 Loss: 0.3081Epoch 64/150 Step 170 Loss: 0.2545
+Epoch 64 Avg Loss: 0.2240
+[DEBUG Ep64] Max Pred: 0.7973, Max GT: 1.0
+[DEBUG Ep64] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4947 | LR: 0.00000624
+Epoch 65/150 Step 10 Loss: 0.2221Epoch 65/150 Step 20 Loss: 0.2241Epoch 65/150 Step 30 Loss: 0.2399Epoch 65/150 Step 40 Loss: 0.1030Epoch 65/150 Step 50 Loss: 0.1764Epoch 65/150 Step 60 Loss: 0.2210Epoch 65/150 Step 70 Loss: 0.1795Epoch 65/150 Step 80 Loss: 0.1767Epoch 65/150 Step 90 Loss: 0.2986Epoch 65/150 Step 100 Loss: 0.1752Epoch 65/150 Step 110 Loss: 0.2418Epoch 65/150 Step 120 Loss: 0.2206Epoch 65/150 Step 130 Loss: 0.1941Epoch 65/150 Step 140 Loss: 0.2785Epoch 65/150 Step 150 Loss: 0.1430Epoch 65/150 Step 160 Loss: 0.1904Epoch 65/150 Step 170 Loss: 0.2456
+Epoch 65 Avg Loss: 0.2226
+[DEBUG Ep65] Max Pred: 0.9051, Max GT: 1.0
+[DEBUG Ep65] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5023 | LR: 0.00000614
+>>> New Best Model Saved!
+Epoch 66/150 Step 10 Loss: 0.2706Epoch 66/150 Step 20 Loss: 0.2173Epoch 66/150 Step 30 Loss: 0.1632Epoch 66/150 Step 40 Loss: 0.0904Epoch 66/150 Step 50 Loss: 0.2986Epoch 66/150 Step 60 Loss: 0.2353Epoch 66/150 Step 70 Loss: 0.1373Epoch 66/150 Step 80 Loss: 0.2326Epoch 66/150 Step 90 Loss: 0.0804Epoch 66/150 Step 100 Loss: 0.2860Epoch 66/150 Step 110 Loss: 0.1948Epoch 66/150 Step 120 Loss: 0.2394Epoch 66/150 Step 130 Loss: 0.2786Epoch 66/150 Step 140 Loss: 0.1323Epoch 66/150 Step 150 Loss: 0.1753Epoch 66/150 Step 160 Loss: 0.2151Epoch 66/150 Step 170 Loss: 0.1732
+Epoch 66 Avg Loss: 0.2214
+[DEBUG Ep66] Max Pred: 0.9228, Max GT: 1.0
+[DEBUG Ep66] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5019 | LR: 0.00000604
+Epoch 67/150 Step 10 Loss: 0.2856Epoch 67/150 Step 20 Loss: 0.1568Epoch 67/150 Step 30 Loss: 0.1705Epoch 67/150 Step 40 Loss: 0.2004Epoch 67/150 Step 50 Loss: 0.1728Epoch 67/150 Step 60 Loss: 0.1506Epoch 67/150 Step 70 Loss: 0.2146Epoch 67/150 Step 80 Loss: 0.3208Epoch 67/150 Step 90 Loss: 0.2347Epoch 67/150 Step 100 Loss: 0.3411Epoch 67/150 Step 110 Loss: 0.2772Epoch 67/150 Step 120 Loss: 0.1406Epoch 67/150 Step 130 Loss: 0.2495Epoch 67/150 Step 140 Loss: 0.2004Epoch 67/150 Step 150 Loss: 0.1656Epoch 67/150 Step 160 Loss: 0.2143Epoch 67/150 Step 170 Loss: 0.2954
+Epoch 67 Avg Loss: 0.2242
+[DEBUG Ep67] Max Pred: 0.8241, Max GT: 1.0
+[DEBUG Ep67] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5049 | LR: 0.00000594
+>>> New Best Model Saved!
+Epoch 68/150 Step 10 Loss: 0.2170Epoch 68/150 Step 20 Loss: 0.1382Epoch 68/150 Step 30 Loss: 0.3411Epoch 68/150 Step 40 Loss: 0.1609Epoch 68/150 Step 50 Loss: 0.2490Epoch 68/150 Step 60 Loss: 0.1977Epoch 68/150 Step 70 Loss: 0.2676Epoch 68/150 Step 80 Loss: 0.3135Epoch 68/150 Step 90 Loss: 0.2310Epoch 68/150 Step 100 Loss: 0.1118Epoch 68/150 Step 110 Loss: 0.2852Epoch 68/150 Step 120 Loss: 0.1774Epoch 68/150 Step 130 Loss: 0.1523Epoch 68/150 Step 140 Loss: 0.1219Epoch 68/150 Step 150 Loss: 0.2505Epoch 68/150 Step 160 Loss: 0.3137Epoch 68/150 Step 170 Loss: 0.2506
+Epoch 68 Avg Loss: 0.2156
+[DEBUG Ep68] Max Pred: 0.7142, Max GT: 1.0
+[DEBUG Ep68] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5087 | LR: 0.00000583
+>>> New Best Model Saved!
+Epoch 69/150 Step 10 Loss: 0.2360Epoch 69/150 Step 20 Loss: 0.2494Epoch 69/150 Step 30 Loss: 0.2281Epoch 69/150 Step 40 Loss: 0.2001Epoch 69/150 Step 50 Loss: 0.2141Epoch 69/150 Step 60 Loss: 0.2889Epoch 69/150 Step 70 Loss: 0.2553Epoch 69/150 Step 80 Loss: 0.2966Epoch 69/150 Step 90 Loss: 0.2400Epoch 69/150 Step 100 Loss: 0.3607Epoch 69/150 Step 110 Loss: 0.1464Epoch 69/150 Step 120 Loss: 0.2587Epoch 69/150 Step 130 Loss: 0.1675Epoch 69/150 Step 140 Loss: 0.2311Epoch 69/150 Step 150 Loss: 0.1185Epoch 69/150 Step 160 Loss: 0.1662Epoch 69/150 Step 170 Loss: 0.2442
+Epoch 69 Avg Loss: 0.2252
+[DEBUG Ep69] Max Pred: 0.8591, Max GT: 1.0
+[DEBUG Ep69] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5000 | LR: 0.00000573
+Epoch 70/150 Step 10 Loss: 0.1543Epoch 70/150 Step 20 Loss: 0.3059Epoch 70/150 Step 30 Loss: 0.2157Epoch 70/150 Step 40 Loss: 0.2380Epoch 70/150 Step 50 Loss: 0.2578Epoch 70/150 Step 60 Loss: 0.0883Epoch 70/150 Step 70 Loss: 0.0577Epoch 70/150 Step 80 Loss: 0.2008Epoch 70/150 Step 90 Loss: 0.2500Epoch 70/150 Step 100 Loss: 0.2603Epoch 70/150 Step 110 Loss: 0.1971Epoch 70/150 Step 120 Loss: 0.2641Epoch 70/150 Step 130 Loss: 0.2471Epoch 70/150 Step 140 Loss: 0.2080Epoch 70/150 Step 150 Loss: 0.2377Epoch 70/150 Step 160 Loss: 0.2242Epoch 70/150 Step 170 Loss: 0.1933
+Epoch 70 Avg Loss: 0.2233
+[DEBUG Ep70] Max Pred: 0.7288, Max GT: 1.0
+[DEBUG Ep70] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4974 | LR: 0.00000563
+Epoch 71/150 Step 10 Loss: 0.3083Epoch 71/150 Step 20 Loss: 0.0971Epoch 71/150 Step 30 Loss: 0.1779Epoch 71/150 Step 40 Loss: 0.2869Epoch 71/150 Step 50 Loss: 0.2487Epoch 71/150 Step 60 Loss: 0.1374Epoch 71/150 Step 70 Loss: 0.0597Epoch 71/150 Step 80 Loss: 0.1234Epoch 71/150 Step 90 Loss: 0.2204Epoch 71/150 Step 100 Loss: 0.2489Epoch 71/150 Step 110 Loss: 0.2709Epoch 71/150 Step 120 Loss: 0.1821Epoch 71/150 Step 130 Loss: 0.2164Epoch 71/150 Step 140 Loss: 0.2550Epoch 71/150 Step 150 Loss: 0.2440Epoch 71/150 Step 160 Loss: 0.2213Epoch 71/150 Step 170 Loss: 0.2041
+Epoch 71 Avg Loss: 0.2231
+[DEBUG Ep71] Max Pred: 0.7799, Max GT: 1.0
+[DEBUG Ep71] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4993 | LR: 0.00000552
+Epoch 72/150 Step 10 Loss: 0.1606Epoch 72/150 Step 20 Loss: 0.1397Epoch 72/150 Step 30 Loss: 0.2367Epoch 72/150 Step 40 Loss: 0.2608Epoch 72/150 Step 50 Loss: 0.2525Epoch 72/150 Step 60 Loss: 0.1627Epoch 72/150 Step 70 Loss: 0.2553Epoch 72/150 Step 80 Loss: 0.2437Epoch 72/150 Step 90 Loss: 0.2699Epoch 72/150 Step 100 Loss: 0.1257Epoch 72/150 Step 110 Loss: 0.3112Epoch 72/150 Step 120 Loss: 0.1590Epoch 72/150 Step 130 Loss: 0.2393Epoch 72/150 Step 140 Loss: 0.1073Epoch 72/150 Step 150 Loss: 0.2453Epoch 72/150 Step 160 Loss: 0.1145Epoch 72/150 Step 170 Loss: 0.2238
+Epoch 72 Avg Loss: 0.2141
+[DEBUG Ep72] Max Pred: 0.6549, Max GT: 1.0
+[DEBUG Ep72] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4956 | LR: 0.00000542
+Epoch 73/150 Step 10 Loss: 0.3056Epoch 73/150 Step 20 Loss: 0.2429Epoch 73/150 Step 30 Loss: 0.3159Epoch 73/150 Step 40 Loss: 0.2997Epoch 73/150 Step 50 Loss: 0.3637Epoch 73/150 Step 60 Loss: 0.2755Epoch 73/150 Step 70 Loss: 0.1517Epoch 73/150 Step 80 Loss: 0.1432Epoch 73/150 Step 90 Loss: 0.1647Epoch 73/150 Step 100 Loss: 0.2467Epoch 73/150 Step 110 Loss: 0.2463Epoch 73/150 Step 120 Loss: 0.3160Epoch 73/150 Step 130 Loss: 0.1964Epoch 73/150 Step 140 Loss: 0.3466Epoch 73/150 Step 150 Loss: 0.1878Epoch 73/150 Step 160 Loss: 0.1189Epoch 73/150 Step 170 Loss: 0.3011
+Epoch 73 Avg Loss: 0.2242
+[DEBUG Ep73] Max Pred: 0.6916, Max GT: 1.0
+[DEBUG Ep73] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5030 | LR: 0.00000531
+Epoch 74/150 Step 10 Loss: 0.1290Epoch 74/150 Step 20 Loss: 0.0789Epoch 74/150 Step 30 Loss: 0.1604Epoch 74/150 Step 40 Loss: 0.3248Epoch 74/150 Step 50 Loss: 0.3056Epoch 74/150 Step 60 Loss: 0.3271Epoch 74/150 Step 70 Loss: 0.3556Epoch 74/150 Step 80 Loss: 0.2310Epoch 74/150 Step 90 Loss: 0.3298Epoch 74/150 Step 100 Loss: 0.1875Epoch 74/150 Step 110 Loss: 0.3410Epoch 74/150 Step 120 Loss: 0.2655Epoch 74/150 Step 130 Loss: 0.2881Epoch 74/150 Step 140 Loss: 0.3541Epoch 74/150 Step 150 Loss: 0.1328Epoch 74/150 Step 160 Loss: 0.3004Epoch 74/150 Step 170 Loss: 0.3145
+Epoch 74 Avg Loss: 0.2227
+[DEBUG Ep74] Max Pred: 0.6795, Max GT: 1.0
+[DEBUG Ep74] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5017 | LR: 0.00000521
+Epoch 75/150 Step 10 Loss: 0.2472Epoch 75/150 Step 20 Loss: 0.2262Epoch 75/150 Step 30 Loss: 0.1554Epoch 75/150 Step 40 Loss: 0.2765Epoch 75/150 Step 50 Loss: 0.1656Epoch 75/150 Step 60 Loss: 0.3426Epoch 75/150 Step 70 Loss: 0.1883Epoch 75/150 Step 80 Loss: 0.2357Epoch 75/150 Step 90 Loss: 0.2190Epoch 75/150 Step 100 Loss: 0.2228Epoch 75/150 Step 110 Loss: 0.1787Epoch 75/150 Step 120 Loss: 0.1933Epoch 75/150 Step 130 Loss: 0.1522Epoch 75/150 Step 140 Loss: 0.2393Epoch 75/150 Step 150 Loss: 0.1986Epoch 75/150 Step 160 Loss: 0.3129Epoch 75/150 Step 170 Loss: 0.2537
+Epoch 75 Avg Loss: 0.2265
+[DEBUG Ep75] Max Pred: 0.7461, Max GT: 1.0
+[DEBUG Ep75] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4927 | LR: 0.00000510
+Epoch 76/150 Step 10 Loss: 0.1615Epoch 76/150 Step 20 Loss: 0.2624Epoch 76/150 Step 30 Loss: 0.2428Epoch 76/150 Step 40 Loss: 0.2294Epoch 76/150 Step 50 Loss: 0.2497Epoch 76/150 Step 60 Loss: 0.2152Epoch 76/150 Step 70 Loss: 0.2194Epoch 76/150 Step 80 Loss: 0.2104Epoch 76/150 Step 90 Loss: 0.2565Epoch 76/150 Step 100 Loss: 0.1920Epoch 76/150 Step 110 Loss: 0.2118Epoch 76/150 Step 120 Loss: 0.1764Epoch 76/150 Step 130 Loss: 0.2111Epoch 76/150 Step 140 Loss: 0.1629Epoch 76/150 Step 150 Loss: 0.1636Epoch 76/150 Step 160 Loss: 0.2205Epoch 76/150 Step 170 Loss: 0.1971
+Epoch 76 Avg Loss: 0.2194
+[DEBUG Ep76] Max Pred: 0.8478, Max GT: 1.0
+[DEBUG Ep76] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4986 | LR: 0.00000500
+Epoch 77/150 Step 10 Loss: 0.2597Epoch 77/150 Step 20 Loss: 0.2238Epoch 77/150 Step 30 Loss: 0.2071Epoch 77/150 Step 40 Loss: 0.1676Epoch 77/150 Step 50 Loss: 0.2800Epoch 77/150 Step 60 Loss: 0.1949Epoch 77/150 Step 70 Loss: 0.2099Epoch 77/150 Step 80 Loss: 0.1827Epoch 77/150 Step 90 Loss: 0.2413Epoch 77/150 Step 100 Loss: 0.1781Epoch 77/150 Step 110 Loss: 0.1652Epoch 77/150 Step 120 Loss: 0.2492Epoch 77/150 Step 130 Loss: 0.1152Epoch 77/150 Step 140 Loss: 0.1030Epoch 77/150 Step 150 Loss: 0.2931Epoch 77/150 Step 160 Loss: 0.2888Epoch 77/150 Step 170 Loss: 0.1520
+Epoch 77 Avg Loss: 0.2233
+[DEBUG Ep77] Max Pred: 0.8222, Max GT: 1.0
+[DEBUG Ep77] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5078 | LR: 0.00000490
+Epoch 78/150 Step 10 Loss: 0.3493Epoch 78/150 Step 20 Loss: 0.2145Epoch 78/150 Step 30 Loss: 0.2813Epoch 78/150 Step 40 Loss: 0.1744Epoch 78/150 Step 50 Loss: 0.2981Epoch 78/150 Step 60 Loss: 0.2630Epoch 78/150 Step 70 Loss: 0.2637Epoch 78/150 Step 80 Loss: 0.2187Epoch 78/150 Step 90 Loss: 0.2505Epoch 78/150 Step 100 Loss: 0.1417Epoch 78/150 Step 110 Loss: 0.2889Epoch 78/150 Step 120 Loss: 0.3229Epoch 78/150 Step 130 Loss: 0.1354Epoch 78/150 Step 140 Loss: 0.2762Epoch 78/150 Step 150 Loss: 0.1945Epoch 78/150 Step 160 Loss: 0.3107Epoch 78/150 Step 170 Loss: 0.2639
+Epoch 78 Avg Loss: 0.2211
+[DEBUG Ep78] Max Pred: 0.5995, Max GT: 1.0
+[DEBUG Ep78] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5164 | LR: 0.00000479
+>>> New Best Model Saved!
+Epoch 79/150 Step 10 Loss: 0.1904Epoch 79/150 Step 20 Loss: 0.1633Epoch 79/150 Step 30 Loss: 0.1253Epoch 79/150 Step 40 Loss: 0.1695Epoch 79/150 Step 50 Loss: 0.2355Epoch 79/150 Step 60 Loss: 0.2793Epoch 79/150 Step 70 Loss: 0.2465Epoch 79/150 Step 80 Loss: 0.1897Epoch 79/150 Step 90 Loss: 0.2884Epoch 79/150 Step 100 Loss: 0.2361Epoch 79/150 Step 110 Loss: 0.2066Epoch 79/150 Step 120 Loss: 0.1732Epoch 79/150 Step 130 Loss: 0.2028Epoch 79/150 Step 140 Loss: 0.2655Epoch 79/150 Step 150 Loss: 0.2156Epoch 79/150 Step 160 Loss: 0.1393Epoch 79/150 Step 170 Loss: 0.2327
+Epoch 79 Avg Loss: 0.2152
+[DEBUG Ep79] Max Pred: 0.6478, Max GT: 1.0
+[DEBUG Ep79] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5130 | LR: 0.00000469
+Epoch 80/150 Step 10 Loss: 0.2836Epoch 80/150 Step 20 Loss: 0.2646Epoch 80/150 Step 30 Loss: 0.2328Epoch 80/150 Step 40 Loss: 0.2409Epoch 80/150 Step 50 Loss: 0.1478Epoch 80/150 Step 60 Loss: 0.3565Epoch 80/150 Step 70 Loss: 0.2308Epoch 80/150 Step 80 Loss: 0.1802Epoch 80/150 Step 90 Loss: 0.2689Epoch 80/150 Step 100 Loss: 0.3161Epoch 80/150 Step 110 Loss: 0.2203Epoch 80/150 Step 120 Loss: 0.2461Epoch 80/150 Step 130 Loss: 0.2941Epoch 80/150 Step 140 Loss: 0.1749Epoch 80/150 Step 150 Loss: 0.2110Epoch 80/150 Step 160 Loss: 0.2768Epoch 80/150 Step 170 Loss: 0.2193
+Epoch 80 Avg Loss: 0.2272
+[DEBUG Ep80] Max Pred: 0.5636, Max GT: 1.0
+[DEBUG Ep80] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5018 | LR: 0.00000458
+Epoch 81/150 Step 10 Loss: 0.3501Epoch 81/150 Step 20 Loss: 0.2224Epoch 81/150 Step 30 Loss: 0.1708Epoch 81/150 Step 40 Loss: 0.1886Epoch 81/150 Step 50 Loss: 0.3700Epoch 81/150 Step 60 Loss: 0.2235Epoch 81/150 Step 70 Loss: 0.2127Epoch 81/150 Step 80 Loss: 0.3440Epoch 81/150 Step 90 Loss: 0.1702Epoch 81/150 Step 100 Loss: 0.2602Epoch 81/150 Step 110 Loss: 0.1927Epoch 81/150 Step 120 Loss: 0.2298Epoch 81/150 Step 130 Loss: 0.1492Epoch 81/150 Step 140 Loss: 0.1159Epoch 81/150 Step 150 Loss: 0.1503Epoch 81/150 Step 160 Loss: 0.1359Epoch 81/150 Step 170 Loss: 0.1315
+Epoch 81 Avg Loss: 0.2191
+[DEBUG Ep81] Max Pred: 0.4785, Max GT: 1.0
+[DEBUG Ep81] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.4883 | LR: 0.00000448
+Epoch 82/150 Step 10 Loss: 0.1587Epoch 82/150 Step 20 Loss: 0.3007Epoch 82/150 Step 30 Loss: 0.0876Epoch 82/150 Step 40 Loss: 0.2477Epoch 82/150 Step 50 Loss: 0.3368Epoch 82/150 Step 60 Loss: 0.3103Epoch 82/150 Step 70 Loss: 0.1916Epoch 82/150 Step 80 Loss: 0.2109Epoch 82/150 Step 90 Loss: 0.2553Epoch 82/150 Step 100 Loss: 0.1458Epoch 82/150 Step 110 Loss: 0.2582Epoch 82/150 Step 120 Loss: 0.1959Epoch 82/150 Step 130 Loss: 0.1942Epoch 82/150 Step 140 Loss: 0.3450Epoch 82/150 Step 150 Loss: 0.1757Epoch 82/150 Step 160 Loss: 0.1518Epoch 82/150 Step 170 Loss: 0.2264
+Epoch 82 Avg Loss: 0.2165
+[DEBUG Ep82] Max Pred: 0.8192, Max GT: 1.0
+[DEBUG Ep82] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5053 | LR: 0.00000437
+Epoch 83/150 Step 10 Loss: 0.2652Epoch 83/150 Step 20 Loss: 0.1655Epoch 83/150 Step 30 Loss: 0.2037Epoch 83/150 Step 40 Loss: 0.3034Epoch 83/150 Step 50 Loss: 0.2859Epoch 83/150 Step 60 Loss: 0.2977Epoch 83/150 Step 70 Loss: 0.2760Epoch 83/150 Step 80 Loss: 0.1533Epoch 83/150 Step 90 Loss: 0.2610Epoch 83/150 Step 100 Loss: 0.2385Epoch 83/150 Step 110 Loss: 0.1682Epoch 83/150 Step 120 Loss: 0.2574Epoch 83/150 Step 130 Loss: 0.1971Epoch 83/150 Step 140 Loss: 0.2663Epoch 83/150 Step 150 Loss: 0.2937Epoch 83/150 Step 160 Loss: 0.3562Epoch 83/150 Step 170 Loss: 0.2362
+Epoch 83 Avg Loss: 0.2248
+[DEBUG Ep83] Max Pred: 0.8095, Max GT: 1.0
+[DEBUG Ep83] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5031 | LR: 0.00000427
+Epoch 84/150 Step 10 Loss: 0.2541Epoch 84/150 Step 20 Loss: 0.1706Epoch 84/150 Step 30 Loss: 0.1558Epoch 84/150 Step 40 Loss: 0.2614Epoch 84/150 Step 50 Loss: 0.2833Epoch 84/150 Step 60 Loss: 0.1941Epoch 84/150 Step 70 Loss: 0.1947Epoch 84/150 Step 80 Loss: 0.2592Epoch 84/150 Step 90 Loss: 0.2129Epoch 84/150 Step 100 Loss: 0.2205Epoch 84/150 Step 110 Loss: 0.2041Epoch 84/150 Step 120 Loss: 0.1172Epoch 84/150 Step 130 Loss: 0.2496Epoch 84/150 Step 140 Loss: 0.2288Epoch 84/150 Step 150 Loss: 0.2287Epoch 84/150 Step 160 Loss: 0.3143Epoch 84/150 Step 170 Loss: 0.1571
+Epoch 84 Avg Loss: 0.2162
+[DEBUG Ep84] Max Pred: 0.6513, Max GT: 1.0
+[DEBUG Ep84] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5080 | LR: 0.00000417
+Epoch 85/150 Step 10 Loss: 0.2343Epoch 85/150 Step 20 Loss: 0.3531Epoch 85/150 Step 30 Loss: 0.1262Epoch 85/150 Step 40 Loss: 0.1520Epoch 85/150 Step 50 Loss: 0.1124Epoch 85/150 Step 60 Loss: 0.1312Epoch 85/150 Step 70 Loss: 0.2984Epoch 85/150 Step 80 Loss: 0.2012Epoch 85/150 Step 90 Loss: 0.1857Epoch 85/150 Step 100 Loss: 0.2485Epoch 85/150 Step 110 Loss: 0.2081Epoch 85/150 Step 120 Loss: 0.2536Epoch 85/150 Step 130 Loss: 0.2437Epoch 85/150 Step 140 Loss: 0.1616Epoch 85/150 Step 150 Loss: 0.2275Epoch 85/150 Step 160 Loss: 0.1270Epoch 85/150 Step 170 Loss: 0.2353
+Epoch 85 Avg Loss: 0.2274
+[DEBUG Ep85] Max Pred: 0.6944, Max GT: 1.0
+[DEBUG Ep85] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5063 | LR: 0.00000406
+Epoch 86/150 Step 10 Loss: 0.2706Epoch 86/150 Step 20 Loss: 0.2490Epoch 86/150 Step 30 Loss: 0.2035Epoch 86/150 Step 40 Loss: 0.1418Epoch 86/150 Step 50 Loss: 0.2733Epoch 86/150 Step 60 Loss: 0.1459Epoch 86/150 Step 70 Loss: 0.1976Epoch 86/150 Step 80 Loss: 0.2803Epoch 86/150 Step 90 Loss: 0.3806Epoch 86/150 Step 100 Loss: 0.2801Epoch 86/150 Step 110 Loss: 0.1811Epoch 86/150 Step 120 Loss: 0.2871Epoch 86/150 Step 130 Loss: 0.2037Epoch 86/150 Step 140 Loss: 0.2913Epoch 86/150 Step 150 Loss: 0.1494Epoch 86/150 Step 160 Loss: 0.3353Epoch 86/150 Step 170 Loss: 0.2005
+Epoch 86 Avg Loss: 0.2211
+[DEBUG Ep86] Max Pred: 0.6607, Max GT: 1.0
+[DEBUG Ep86] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5127 | LR: 0.00000396
+Epoch 87/150 Step 10 Loss: 0.1378Epoch 87/150 Step 20 Loss: 0.1604Epoch 87/150 Step 30 Loss: 0.2263Epoch 87/150 Step 40 Loss: 0.1335Epoch 87/150 Step 50 Loss: 0.2251Epoch 87/150 Step 60 Loss: 0.2124Epoch 87/150 Step 70 Loss: 0.2103Epoch 87/150 Step 80 Loss: 0.2013Epoch 87/150 Step 90 Loss: 0.2664Epoch 87/150 Step 100 Loss: 0.2576Epoch 87/150 Step 110 Loss: 0.1405Epoch 87/150 Step 120 Loss: 0.1348Epoch 87/150 Step 130 Loss: 0.2138Epoch 87/150 Step 140 Loss: 0.2294Epoch 87/150 Step 150 Loss: 0.1496Epoch 87/150 Step 160 Loss: 0.1896Epoch 87/150 Step 170 Loss: 0.1553
+Epoch 87 Avg Loss: 0.2143
+[DEBUG Ep87] Max Pred: 0.7131, Max GT: 1.0
+[DEBUG Ep87] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5214 | LR: 0.00000386
+>>> New Best Model Saved!
+Epoch 88/150 Step 10 Loss: 0.2473Epoch 88/150 Step 20 Loss: 0.0797Epoch 88/150 Step 30 Loss: 0.3288Epoch 88/150 Step 40 Loss: 0.2888Epoch 88/150 Step 50 Loss: 0.2516Epoch 88/150 Step 60 Loss: 0.2534Epoch 88/150 Step 70 Loss: 0.2224Epoch 88/150 Step 80 Loss: 0.2836Epoch 88/150 Step 90 Loss: 0.1448Epoch 88/150 Step 100 Loss: 0.1178Epoch 88/150 Step 110 Loss: 0.2367Epoch 88/150 Step 120 Loss: 0.2006Epoch 88/150 Step 130 Loss: 0.1639Epoch 88/150 Step 140 Loss: 0.2061Epoch 88/150 Step 150 Loss: 0.2072Epoch 88/150 Step 160 Loss: 0.1815Epoch 88/150 Step 170 Loss: 0.1925
+Epoch 88 Avg Loss: 0.2239
+[DEBUG Ep88] Max Pred: 0.8270, Max GT: 1.0
+[DEBUG Ep88] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5142 | LR: 0.00000376
+Epoch 89/150 Step 10 Loss: 0.1383Epoch 89/150 Step 20 Loss: 0.3451Epoch 89/150 Step 30 Loss: 0.2787Epoch 89/150 Step 40 Loss: 0.1739Epoch 89/150 Step 50 Loss: 0.2270Epoch 89/150 Step 60 Loss: 0.2601Epoch 89/150 Step 70 Loss: 0.1524Epoch 89/150 Step 80 Loss: 0.0878Epoch 89/150 Step 90 Loss: 0.3173Epoch 89/150 Step 100 Loss: 0.2017Epoch 89/150 Step 110 Loss: 0.1826Epoch 89/150 Step 120 Loss: 0.3173Epoch 89/150 Step 130 Loss: 0.2427Epoch 89/150 Step 140 Loss: 0.2029Epoch 89/150 Step 150 Loss: 0.1163Epoch 89/150 Step 160 Loss: 0.1444Epoch 89/150 Step 170 Loss: 0.2294
+Epoch 89 Avg Loss: 0.2178
+[DEBUG Ep89] Max Pred: 0.7637, Max GT: 1.0
+[DEBUG Ep89] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5098 | LR: 0.00000366
+Epoch 90/150 Step 10 Loss: 0.2118Epoch 90/150 Step 20 Loss: 0.1926Epoch 90/150 Step 30 Loss: 0.1465Epoch 90/150 Step 40 Loss: 0.2757Epoch 90/150 Step 50 Loss: 0.2345Epoch 90/150 Step 60 Loss: 0.3780Epoch 90/150 Step 70 Loss: 0.1831Epoch 90/150 Step 80 Loss: 0.1508Epoch 90/150 Step 90 Loss: 0.1412Epoch 90/150 Step 100 Loss: 0.1844Epoch 90/150 Step 110 Loss: 0.2456Epoch 90/150 Step 120 Loss: 0.1895Epoch 90/150 Step 130 Loss: 0.0892Epoch 90/150 Step 140 Loss: 0.3025Epoch 90/150 Step 150 Loss: 0.2396Epoch 90/150 Step 160 Loss: 0.2893Epoch 90/150 Step 170 Loss: 0.2190
+Epoch 90 Avg Loss: 0.2165
+[DEBUG Ep90] Max Pred: 0.7450, Max GT: 1.0
+[DEBUG Ep90] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5205 | LR: 0.00000355
+Epoch 91/150 Step 10 Loss: 0.2629Epoch 91/150 Step 20 Loss: 0.1344Epoch 91/150 Step 30 Loss: 0.1236Epoch 91/150 Step 40 Loss: 0.2285Epoch 91/150 Step 50 Loss: 0.1269Epoch 91/150 Step 60 Loss: 0.2259Epoch 91/150 Step 70 Loss: 0.3823Epoch 91/150 Step 80 Loss: 0.2275Epoch 91/150 Step 90 Loss: 0.2758Epoch 91/150 Step 100 Loss: 0.2369Epoch 91/150 Step 110 Loss: 0.2053Epoch 91/150 Step 120 Loss: 0.2540Epoch 91/150 Step 130 Loss: 0.4087Epoch 91/150 Step 140 Loss: 0.2014Epoch 91/150 Step 150 Loss: 0.1768Epoch 91/150 Step 160 Loss: 0.1160Epoch 91/150 Step 170 Loss: 0.1589
+Epoch 91 Avg Loss: 0.2198
+[DEBUG Ep91] Max Pred: 0.6466, Max GT: 1.0
+[DEBUG Ep91] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5205 | LR: 0.00000345
+Epoch 92/150 Step 10 Loss: 0.1715Epoch 92/150 Step 20 Loss: 0.2923Epoch 92/150 Step 30 Loss: 0.1916Epoch 92/150 Step 40 Loss: 0.1938Epoch 92/150 Step 50 Loss: 0.2162Epoch 92/150 Step 60 Loss: 0.2491Epoch 92/150 Step 70 Loss: 0.2853Epoch 92/150 Step 80 Loss: 0.1933Epoch 92/150 Step 90 Loss: 0.1647Epoch 92/150 Step 100 Loss: 0.1703Epoch 92/150 Step 110 Loss: 0.2448Epoch 92/150 Step 120 Loss: 0.1504Epoch 92/150 Step 130 Loss: 0.2470Epoch 92/150 Step 140 Loss: 0.1316Epoch 92/150 Step 150 Loss: 0.2922Epoch 92/150 Step 160 Loss: 0.1628Epoch 92/150 Step 170 Loss: 0.2242
+Epoch 92 Avg Loss: 0.2202
+[DEBUG Ep92] Max Pred: 0.6084, Max GT: 1.0
+[DEBUG Ep92] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5233 | LR: 0.00000336
+>>> New Best Model Saved!
+Epoch 93/150 Step 10 Loss: 0.1309Epoch 93/150 Step 20 Loss: 0.1840Epoch 93/150 Step 30 Loss: 0.2825Epoch 93/150 Step 40 Loss: 0.2907Epoch 93/150 Step 50 Loss: 0.1393Epoch 93/150 Step 60 Loss: 0.1823Epoch 93/150 Step 70 Loss: 0.2348Epoch 93/150 Step 80 Loss: 0.2770Epoch 93/150 Step 90 Loss: 0.2525Epoch 93/150 Step 100 Loss: 0.2908Epoch 93/150 Step 110 Loss: 0.1960Epoch 93/150 Step 120 Loss: 0.2624Epoch 93/150 Step 130 Loss: 0.1105Epoch 93/150 Step 140 Loss: 0.3085Epoch 93/150 Step 150 Loss: 0.2683Epoch 93/150 Step 160 Loss: 0.1470Epoch 93/150 Step 170 Loss: 0.2006
+Epoch 93 Avg Loss: 0.2150
+[DEBUG Ep93] Max Pred: 0.7168, Max GT: 1.0
+[DEBUG Ep93] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5213 | LR: 0.00000326
+Epoch 94/150 Step 10 Loss: 0.1455Epoch 94/150 Step 20 Loss: 0.2401Epoch 94/150 Step 30 Loss: 0.4159Epoch 94/150 Step 40 Loss: 0.0853Epoch 94/150 Step 50 Loss: 0.3193Epoch 94/150 Step 60 Loss: 0.2931Epoch 94/150 Step 70 Loss: 0.2246Epoch 94/150 Step 80 Loss: 0.1798Epoch 94/150 Step 90 Loss: 0.1960Epoch 94/150 Step 100 Loss: 0.3193Epoch 94/150 Step 110 Loss: 0.1787Epoch 94/150 Step 120 Loss: 0.2107Epoch 94/150 Step 130 Loss: 0.2109Epoch 94/150 Step 140 Loss: 0.2274Epoch 94/150 Step 150 Loss: 0.2608Epoch 94/150 Step 160 Loss: 0.1285Epoch 94/150 Step 170 Loss: 0.1884
+Epoch 94 Avg Loss: 0.2123
+[DEBUG Ep94] Max Pred: 0.6944, Max GT: 1.0
+[DEBUG Ep94] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5161 | LR: 0.00000316
+Epoch 95/150 Step 10 Loss: 0.2356Epoch 95/150 Step 20 Loss: 0.3912Epoch 95/150 Step 30 Loss: 0.2354Epoch 95/150 Step 40 Loss: 0.0832Epoch 95/150 Step 50 Loss: 0.3129Epoch 95/150 Step 60 Loss: 0.1982Epoch 95/150 Step 70 Loss: 0.2119Epoch 95/150 Step 80 Loss: 0.2556Epoch 95/150 Step 90 Loss: 0.1567Epoch 95/150 Step 100 Loss: 0.1938Epoch 95/150 Step 110 Loss: 0.0744Epoch 95/150 Step 120 Loss: 0.2043Epoch 95/150 Step 130 Loss: 0.2649Epoch 95/150 Step 140 Loss: 0.3279Epoch 95/150 Step 150 Loss: 0.1343Epoch 95/150 Step 160 Loss: 0.0680Epoch 95/150 Step 170 Loss: 0.2866
+Epoch 95 Avg Loss: 0.2152
+[DEBUG Ep95] Max Pred: 0.7945, Max GT: 1.0
+[DEBUG Ep95] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5075 | LR: 0.00000306
+Epoch 96/150 Step 10 Loss: 0.3437Epoch 96/150 Step 20 Loss: 0.2163Epoch 96/150 Step 30 Loss: 0.2209Epoch 96/150 Step 40 Loss: 0.3058Epoch 96/150 Step 50 Loss: 0.3097Epoch 96/150 Step 60 Loss: 0.1441Epoch 96/150 Step 70 Loss: 0.1875Epoch 96/150 Step 80 Loss: 0.1348Epoch 96/150 Step 90 Loss: 0.1891Epoch 96/150 Step 100 Loss: 0.3078Epoch 96/150 Step 110 Loss: 0.3145Epoch 96/150 Step 120 Loss: 0.3008Epoch 96/150 Step 130 Loss: 0.2657Epoch 96/150 Step 140 Loss: 0.1749Epoch 96/150 Step 150 Loss: 0.1415Epoch 96/150 Step 160 Loss: 0.1629Epoch 96/150 Step 170 Loss: 0.1396
+Epoch 96 Avg Loss: 0.2146
+[DEBUG Ep96] Max Pred: 0.7853, Max GT: 1.0
+[DEBUG Ep96] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5129 | LR: 0.00000297
+Epoch 97/150 Step 10 Loss: 0.1614Epoch 97/150 Step 20 Loss: 0.2099Epoch 97/150 Step 30 Loss: 0.1150Epoch 97/150 Step 40 Loss: 0.1218Epoch 97/150 Step 50 Loss: 0.2546Epoch 97/150 Step 60 Loss: 0.1928Epoch 97/150 Step 70 Loss: 0.2276Epoch 97/150 Step 80 Loss: 0.2781Epoch 97/150 Step 90 Loss: 0.2279Epoch 97/150 Step 100 Loss: 0.1703Epoch 97/150 Step 110 Loss: 0.1639Epoch 97/150 Step 120 Loss: 0.1686Epoch 97/150 Step 130 Loss: 0.2383Epoch 97/150 Step 140 Loss: 0.2133Epoch 97/150 Step 150 Loss: 0.2813Epoch 97/150 Step 160 Loss: 0.3359Epoch 97/150 Step 170 Loss: 0.2518
+Epoch 97 Avg Loss: 0.2067
+[DEBUG Ep97] Max Pred: 0.7213, Max GT: 1.0
+[DEBUG Ep97] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5149 | LR: 0.00000287
+Epoch 98/150 Step 10 Loss: 0.2103Epoch 98/150 Step 20 Loss: 0.2872Epoch 98/150 Step 30 Loss: 0.2673Epoch 98/150 Step 40 Loss: 0.1878Epoch 98/150 Step 50 Loss: 0.1469Epoch 98/150 Step 60 Loss: 0.2102Epoch 98/150 Step 70 Loss: 0.1996Epoch 98/150 Step 80 Loss: 0.2397Epoch 98/150 Step 90 Loss: 0.2212Epoch 98/150 Step 100 Loss: 0.1063Epoch 98/150 Step 110 Loss: 0.2552Epoch 98/150 Step 120 Loss: 0.1326Epoch 98/150 Step 130 Loss: 0.1953Epoch 98/150 Step 140 Loss: 0.2913Epoch 98/150 Step 150 Loss: 0.1964Epoch 98/150 Step 160 Loss: 0.2250Epoch 98/150 Step 170 Loss: 0.1559
+Epoch 98 Avg Loss: 0.2121
+[DEBUG Ep98] Max Pred: 0.8073, Max GT: 1.0
+[DEBUG Ep98] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5077 | LR: 0.00000278
+Epoch 99/150 Step 10 Loss: 0.2265Epoch 99/150 Step 20 Loss: 0.1468Epoch 99/150 Step 30 Loss: 0.2157Epoch 99/150 Step 40 Loss: 0.2080Epoch 99/150 Step 50 Loss: 0.1835Epoch 99/150 Step 60 Loss: 0.1005Epoch 99/150 Step 70 Loss: 0.1700Epoch 99/150 Step 80 Loss: 0.1880Epoch 99/150 Step 90 Loss: 0.1441Epoch 99/150 Step 100 Loss: 0.2705Epoch 99/150 Step 110 Loss: 0.1805Epoch 99/150 Step 120 Loss: 0.2375Epoch 99/150 Step 130 Loss: 0.1083Epoch 99/150 Step 140 Loss: 0.2281Epoch 99/150 Step 150 Loss: 0.2125Epoch 99/150 Step 160 Loss: 0.2012Epoch 99/150 Step 170 Loss: 0.2498
+Epoch 99 Avg Loss: 0.2281
+[DEBUG Ep99] Max Pred: 0.7807, Max GT: 1.0
+[DEBUG Ep99] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5087 | LR: 0.00000268
+Epoch 100/150 Step 10 Loss: 0.3255Epoch 100/150 Step 20 Loss: 0.0832Epoch 100/150 Step 30 Loss: 0.1985Epoch 100/150 Step 40 Loss: 0.1361Epoch 100/150 Step 50 Loss: 0.2449Epoch 100/150 Step 60 Loss: 0.1897Epoch 100/150 Step 70 Loss: 0.1524Epoch 100/150 Step 80 Loss: 0.2173Epoch 100/150 Step 90 Loss: 0.2217Epoch 100/150 Step 100 Loss: 0.3173Epoch 100/150 Step 110 Loss: 0.1039Epoch 100/150 Step 120 Loss: 0.1506Epoch 100/150 Step 130 Loss: 0.2720Epoch 100/150 Step 140 Loss: 0.3164Epoch 100/150 Step 150 Loss: 0.2424Epoch 100/150 Step 160 Loss: 0.2238Epoch 100/150 Step 170 Loss: 0.1764
+Epoch 100 Avg Loss: 0.2161
+[DEBUG Ep100] Max Pred: 0.7471, Max GT: 1.0
+[DEBUG Ep100] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5115 | LR: 0.00000259
+Epoch 101/150 Step 10 Loss: 0.2025Epoch 101/150 Step 20 Loss: 0.2552Epoch 101/150 Step 30 Loss: 0.1914Epoch 101/150 Step 40 Loss: 0.1845Epoch 101/150 Step 50 Loss: 0.3353Epoch 101/150 Step 60 Loss: 0.2716Epoch 101/150 Step 70 Loss: 0.1413Epoch 101/150 Step 80 Loss: 0.3745Epoch 101/150 Step 90 Loss: 0.1737Epoch 101/150 Step 100 Loss: 0.1953Epoch 101/150 Step 110 Loss: 0.2488Epoch 101/150 Step 120 Loss: 0.2827Epoch 101/150 Step 130 Loss: 0.1743Epoch 101/150 Step 140 Loss: 0.0816Epoch 101/150 Step 150 Loss: 0.0776Epoch 101/150 Step 160 Loss: 0.0963Epoch 101/150 Step 170 Loss: 0.1834
+Epoch 101 Avg Loss: 0.2183
+[DEBUG Ep101] Max Pred: 0.6646, Max GT: 1.0
+[DEBUG Ep101] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5173 | LR: 0.00000250
+Epoch 102/150 Step 10 Loss: 0.1914Epoch 102/150 Step 20 Loss: 0.1895Epoch 102/150 Step 30 Loss: 0.2561Epoch 102/150 Step 40 Loss: 0.1728Epoch 102/150 Step 50 Loss: 0.1359Epoch 102/150 Step 60 Loss: 0.1702Epoch 102/150 Step 70 Loss: 0.2662Epoch 102/150 Step 80 Loss: 0.1845Epoch 102/150 Step 90 Loss: 0.2788Epoch 102/150 Step 100 Loss: 0.1395Epoch 102/150 Step 110 Loss: 0.1861Epoch 102/150 Step 120 Loss: 0.2344Epoch 102/150 Step 130 Loss: 0.0675Epoch 102/150 Step 140 Loss: 0.1895Epoch 102/150 Step 150 Loss: 0.2003Epoch 102/150 Step 160 Loss: 0.2338Epoch 102/150 Step 170 Loss: 0.2088
+Epoch 102 Avg Loss: 0.2106
+[DEBUG Ep102] Max Pred: 0.8282, Max GT: 1.0
+[DEBUG Ep102] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5129 | LR: 0.00000241
+Epoch 103/150 Step 10 Loss: 0.2593Epoch 103/150 Step 20 Loss: 0.3275Epoch 103/150 Step 30 Loss: 0.1682Epoch 103/150 Step 40 Loss: 0.3397Epoch 103/150 Step 50 Loss: 0.2175Epoch 103/150 Step 60 Loss: 0.1173Epoch 103/150 Step 70 Loss: 0.2248Epoch 103/150 Step 80 Loss: 0.1474Epoch 103/150 Step 90 Loss: 0.1352Epoch 103/150 Step 100 Loss: 0.2465Epoch 103/150 Step 110 Loss: 0.2669Epoch 103/150 Step 120 Loss: 0.2246Epoch 103/150 Step 130 Loss: 0.1921Epoch 103/150 Step 140 Loss: 0.2131Epoch 103/150 Step 150 Loss: 0.2519Epoch 103/150 Step 160 Loss: 0.1141Epoch 103/150 Step 170 Loss: 0.1599
+Epoch 103 Avg Loss: 0.2074
+[DEBUG Ep103] Max Pred: 0.8975, Max GT: 1.0
+[DEBUG Ep103] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5076 | LR: 0.00000232
+Epoch 104/150 Step 10 Loss: 0.3584Epoch 104/150 Step 20 Loss: 0.2190Epoch 104/150 Step 30 Loss: 0.4480Epoch 104/150 Step 40 Loss: 0.2171Epoch 104/150 Step 50 Loss: 0.2136Epoch 104/150 Step 60 Loss: 0.1439Epoch 104/150 Step 70 Loss: 0.0945Epoch 104/150 Step 80 Loss: 0.3792Epoch 104/150 Step 90 Loss: 0.2026Epoch 104/150 Step 100 Loss: 0.3060Epoch 104/150 Step 110 Loss: 0.1604Epoch 104/150 Step 120 Loss: 0.2187Epoch 104/150 Step 130 Loss: 0.1271Epoch 104/150 Step 140 Loss: 0.2357Epoch 104/150 Step 150 Loss: 0.2863Epoch 104/150 Step 160 Loss: 0.1957Epoch 104/150 Step 170 Loss: 0.1391
+Epoch 104 Avg Loss: 0.2167
+[DEBUG Ep104] Max Pred: 0.7797, Max GT: 1.0
+[DEBUG Ep104] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5185 | LR: 0.00000223
+Epoch 105/150 Step 10 Loss: 0.1838Epoch 105/150 Step 20 Loss: 0.2708Epoch 105/150 Step 30 Loss: 0.1567Epoch 105/150 Step 40 Loss: 0.1593Epoch 105/150 Step 50 Loss: 0.2300Epoch 105/150 Step 60 Loss: 0.2513Epoch 105/150 Step 70 Loss: 0.2342Epoch 105/150 Step 80 Loss: 0.1887Epoch 105/150 Step 90 Loss: 0.2806Epoch 105/150 Step 100 Loss: 0.2377Epoch 105/150 Step 110 Loss: 0.1158Epoch 105/150 Step 120 Loss: 0.1982Epoch 105/150 Step 130 Loss: 0.3231Epoch 105/150 Step 140 Loss: 0.1900Epoch 105/150 Step 150 Loss: 0.1190Epoch 105/150 Step 160 Loss: 0.2676Epoch 105/150 Step 170 Loss: 0.1630
+Epoch 105 Avg Loss: 0.2196
+[DEBUG Ep105] Max Pred: 0.7591, Max GT: 1.0
+[DEBUG Ep105] Pred Shape: torch.Size([1, 1, 215, 215, 299]), GT Shape: torch.Size([1, 1, 215, 215, 299])
+Validation Dice (Lung Tumor): 0.5175 | LR: 0.00000215
+
+------------------------------------------------------------
+Sender: LSF System <jdl1fe@abts55787>
+Subject: Job 21725448: <vista3d_H200> in cluster <abt-dl01> Exited
+
+Job <vista3d_H200> was submitted from host <abts55130> by user <dem7clj> in cluster <abt-dl01> at Thu Dec 18 00:41:39 2025
+Job was executed on host(s) <4*abts55787>, in queue <batch_h200>, as user <dem7clj> in cluster <abt-dl01> at Thu Dec 18 00:42:36 2025
+</home/dem7clj> was used as the home directory.
+</home/dem7clj/repos/mirpr> was used as the working directory.
+Started at Thu Dec 18 00:42:36 2025
+Terminated at Thu Dec 18 12:42:53 2025
+Results reported at Thu Dec 18 12:42:53 2025
+
+Your job looked like:
+
+------------------------------------------------------------
+# LSBATCH: User input
+#!/bin/bash
+# --- LSF Batch Job Submission Script for VISTA-3D Fine-Tuning ---
+# Uses a standard Python venv, not conda.
+
+# --- LSF Job Parameters ---
+#BSUB -J vista3d_H200         # Job name
+#BSUB -q batch_h200            # Your H200 queue
+#BSUB -n 4                     # Request 4 CPU cores (for dataloaders)
+#BSUB -W 12:00                 # Set wall-clock time limit to 24 hours
+#BSUB -M 150000                # Request 150 GB of host RAM
+#BSUB -R "span[hosts=1]"       # Ensure all cores are on the same host
+#BSUB -gpu "num=1"
+
+# --- Logging Configuration ---
+# Logs will be saved to a 'logs' directory in the submission folder.
+#BSUB -o logs/%J.stdout
+#BSUB -e logs/%J.stderr
+
+# --- Script Execution Logic ---
+
+# 1. Create the log directory if it doesn't exist.
+mkdir -p logs
+
+# 2. Set up the Python Virtual Environment (venv)
+#    *** THIS IS THE FIX ***
+#    We are now sourcing the 'activate' script from your venv directory.
+#    All 'conda' commands have been removed.
+VENV_PATH="/home/dem7clj/repos/mirpr/mirpr/bin/activate"
+if [ -f "$VENV_PATH" ]; then
+    echo "Activating venv: $VENV_PATH"
+    source $VENV_PATH
+else
+    echo "FATAL: Could not find venv activate script at $VENV_PATH"
+    exit 1
+fi
+
+# 3. Navigate to the project directory.
+cd ~/repos/mirpr || { echo "Failed to cd to ~/repos/mirpr"; exit 1; }
+
+echo "======================================================"
+echo "          Project Root: $(pwd)"
+echo "          Job ID: $LSB_JOBID"
+echo "          Python Path: $(which python)"
+echo "======================================================"
+echo ""
+echo "======================================================"
+echo "          Configuration (config.py)"
+echo "======================================================"
+cat config.py
+echo "======================================================"
+
+(... more ...)
+------------------------------------------------------------
+
+TERM_RUNLIMIT: job killed after reaching LSF run time limit.
+Exited with exit code 140.
+
+Resource usage summary:
+
+    CPU time :                                   58236.00 sec.
+    Max Memory :                                 57641 MB
+    Average Memory :                             54397.57 MB
+    Total Requested Memory :                     600000.00 MB
+    Delta Memory :                               542359.00 MB
+    Max Swap :                                   -
+    Max Processes :                              12
+    Max Threads :                                49
+    Run time :                                   43215 sec.
+    Turnaround time :                            43274 sec.
+
+The output (if any) is above this job summary.
+
+
+
+PS:
+
+Read file <logs/21725448.stderr> for stderr output of this job.
+

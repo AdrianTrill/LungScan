@@ -1,0 +1,126 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=0.7in]{geometry}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\title{\textbf{Deep Learning for Lung Cancer Detection:\\ Summary of Two Research Papers}}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+\vspace{-0.5cm}
+
+\section{Introduction}
+
+Lung cancer causes 18\% of cancer deaths globally, with 5-year survival rates of 10--20\%. Early detection via CT imaging significantly improves outcomes. This report summarizes two papers: one proposing an interpretable model (ConRad) and another reviewing deep learning techniques for lung cancer detection.
+
+\section{Paper 1: ConRad - Interpretable Machine Learning}
+
+\subsection{Reference}
+Brocki \& Chung (2023). \textit{Integration of Radiomics and Tumor Biomarkers in Interpretable Machine Learning Models}. Cancers, 15, 2459.
+\vspace{-0.2cm}
+
+\subsection{Problem/Solution: The ConRad Model}
+Deep learning models act as ``black boxes,'' limiting clinical adoption. \textbf{ConRad} solves this by combining two interpretable features fed into a transparent classifier (SVM/Lasso):
+\begin{itemize}[noitemsep, topsep=0pt, parsep=0pt, leftmargin=1em]
+    \item \textbf{Radiomics (107 features)}: Statistical image properties (first-order, shape, texture).
+    \item \textbf{Predicted Biomarkers (8 features)}: Clinical variables (subtlety, calcification, margin, etc.) predicted automatically by a pre-trained ResNet-50.
+\end{itemize}
+\textbf{Innovation}: Biomarkers are predicted automatically, removing the need for manual annotation in new images.
+\vspace{-0.2cm}
+
+\subsection{Results and Feature Selection}
+\textbf{Dataset}: LIDC-IDRI (854 nodules).
+\vspace{-0.2cm}
+
+\begin{table}[h]
+    \centering
+    \begin{tabular}{lc}
+        \toprule
+        \textbf{Model} & \textbf{Accuracy} \\
+        \midrule
+        Nonlinear SVM (ConRad) & \textbf{89.7\%} \\
+        Logistic Regression + Lasso (ConRad) & \textbf{89.6\%} \\
+        End-to-end CNN (baseline) & 89.1\% \\
+        \bottomrule
+    \end{tabular}
+    \caption{ConRad vs. black-box CNN performance}
+\end{table}
+\vspace{-0.3cm}
+
+\textbf{Feature Selection Breakthrough}: Lasso regularization reduced features from 114 to only \textbf{12} (5 biomarkers + 7 radiomics), \textbf{increasing} accuracy to 89.6\% and proving redundancy among features.
+\vspace{-0.2cm}
+
+\subsection{Main Contributions}
+\begin{enumerate}[noitemsep, topsep=0pt, parsep=0pt, leftmargin=1.5em]
+    \item Achieves interpretability without sacrificing accuracy.
+    \item Enables human-in-the-loop clinical correction.
+\end{enumerate}
+
+\section{Paper 2: Deep Learning Techniques Review}
+
+\subsection{Reference}
+Thanoon et al. (2023). \textit{A Review of Deep Learning Techniques for Lung Cancer Screening and Diagnosis Based on CT Images}. Diagnostics, 13, 2617.
+\vspace{-0.2cm}
+
+\subsection{Scope and Architectures}
+Comprehensive review (2018-2023) covering segmentation (U-Net, Mask R-CNN) and classification (2D/3D CNNs, Transfer learning: ResNet-50, VGG) for CT-based lung cancer detection.
+\vspace{-0.2cm}
+
+\subsection{Performance Benchmarks}
+
+\begin{table}[h]
+    \centering
+    \begin{tabular}{llc}
+        \toprule
+        \textbf{Year} & \textbf{Method} & \textbf{Accuracy} \\
+        \midrule
+        2022 & SegChaNet (DITNN) & 98.4\% \\
+        2023 & CNN Gradient Descent & 97.9\% \\
+        2020 & Mask R-CNN & 97.7\% \\
+        \bottomrule
+    \end{tabular}
+    \caption{Select recent performance from literature}
+\end{table}
+\vspace{-0.3cm}
+
+\subsection{Major Challenges Identified}
+\begin{itemize}[noitemsep, topsep=0pt, parsep=0pt, leftmargin=1em]
+    \item \textbf{Technical}: High false-positive rates (up to 96\% in NLST), limited labeled data, and small nodule detection ($<3$mm).
+    \item \textbf{Clinical}: Lack of model \textbf{interpretability}, difficulty distinguishing benign vs. malignant, and poor generalization across populations.
+\end{itemize}
+\vspace{-0.2cm}
+
+\subsection{Future Directions}
+\begin{enumerate}[noitemsep, topsep=0pt, parsep=0pt, leftmargin=1.5em]
+    \item Multi-modal integration (CT + PET + clinical data).
+    \item \textbf{Explainable AI} (XAI) development.
+    \item Standardized pre-processing pipelines.
+\end{enumerate}
+\vspace{-0.2cm}
+
+\section{Comparative Analysis and Conclusion}
+
+\begin{table}[h]
+    \centering
+    \begin{tabular}{lll}
+        \toprule
+        \textbf{Aspect} & \textbf{Paper 1 (ConRad)} & \textbf{Paper 2 (Review)} \\
+        \midrule
+        Type & Original research & Literature review \\
+        Focus & Interpretability & Technique comparison \\
+        Performance & 89.6\% (interpretable) & 95--99\% (various) \\
+        Main contribution & ConRad model & Research landscape \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+\vspace{-0.3cm}
+
+\subsection{Key Takeaway}
+Both papers agree that \textbf{interpretability is critical} for clinical adoption and that false positives remain a major challenge. Paper 2 shows that high accuracy (95--99\%) is possible, but often lacks transparency. Paper 1 offers a concrete solution, demonstrating that a robust, interpretable model (ConRad) can achieve competitive performance (89.6\%) using only \textbf{12 selected features}. The path forward requires balancing high performance with the explainability demanded by medical applications.
+
+\end{document}

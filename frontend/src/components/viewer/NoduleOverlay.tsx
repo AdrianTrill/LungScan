@@ -57,7 +57,10 @@ export default function NoduleOverlay({
       {nodules.map((nodule) => {
         const x = nodule.x * scaleX;
         const y = nodule.y * scaleY;
-        const radius = nodule.radius * Math.min(scaleX, scaleY);
+        // Make visual markers smaller - cap at reasonable size
+        const baseRadius = nodule.radius * Math.min(scaleX, scaleY);
+        const maxRadius = Math.min(baseRadius, 40); // Cap at 40px for display
+        const radius = Math.max(maxRadius, 15); // Minimum 15px for visibility
         const color = getColorForScore(nodule.malignancy_score);
 
         return (
@@ -111,6 +114,39 @@ export default function NoduleOverlay({
               }}
             >
               {(nodule.malignancy_score * 100).toFixed(0)}
+            </motion.div>
+            {/* Enhanced Confidence Indicators */}
+            {/* Confidence Indicator Bar */}
+            <div className="absolute bottom-0 left-0 right-0 h-1.5 bg-black/20 rounded-b-full overflow-hidden">
+              <motion.div
+                initial={{ width: 0 }}
+                animate={{ width: `${nodule.malignancy_score * 100}%` }}
+                transition={{ delay: 0.4, duration: 0.5 }}
+                className="h-full"
+                style={{
+                  backgroundColor: color,
+                }}
+              />
+            </div>
+            {/* Confidence Ring Indicator */}
+            <div className="absolute top-0 right-0 w-3 h-3 rounded-full border-2"
+              style={{
+                borderColor: color,
+                backgroundColor: nodule.malignancy_score >= 0.7 ? color : 'transparent',
+                opacity: nodule.malignancy_score >= 0.7 ? 0.8 : 0.4,
+              }}
+            />
+            {/* Confidence Score Badge (on hover) */}
+            <motion.div
+              initial={{ opacity: 0, scale: 0.8 }}
+              whileHover={{ opacity: 1, scale: 1 }}
+              className="absolute -top-8 left-1/2 transform -translate-x-1/2 px-2 py-1 rounded text-xs font-semibold whitespace-nowrap pointer-events-none z-20"
+              style={{
+                backgroundColor: color,
+                color: "white",
+              }}
+            >
+              {(nodule.malignancy_score * 100).toFixed(1)}% confidence
             </motion.div>
           </motion.div>
         );

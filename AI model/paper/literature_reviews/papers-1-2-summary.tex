@@ -1,0 +1,90 @@
+\documentclass[11pt,a4paper]{article}
+
+%---------------------------------------------------------
+%  Packages
+%---------------------------------------------------------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{geometry}      % Margins
+\geometry{margin=1in}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{amsmath,amssymb}
+
+% Hyperref setup (optional tweaks)
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+%---------------------------------------------------------
+%  Document
+%---------------------------------------------------------
+\begin{document}
+
+\section*{Key Evidence Base for the Virtual Biopsy Project}
+
+\subsection*{Paper~1: \textit{Chen Y} \textit{et~al.}, \textit{European Radiology}, 2025\\
+(Systematic Review \& Meta-Analysis)}
+
+This comprehensive meta-analysis synthesises the results of \textbf{89 studies} on AI models that predict \textbf{EGFR, ALK, and KRAS} mutations in NSCLC.\cite{Chen2025}
+The pooled performance establishes a robust benchmark:
+
+\begin{itemize}[itemsep=2pt]
+  \item Radiomics models achieved a mean sensitivity of $\sim 0.75$ for all three biomarkers.
+  \item False--positive rates were non-trivial, ranging from $0.225$ (ALK) to $0.376$ (KRAS).
+  \item A multimodal strategy (radiomics $+$ clinical data) boosted EGFR sensitivity to $0.800$.\cite{Chen2025b}
+\end{itemize}
+
+\textbf{Significance.} 
+The study provides strong, aggregate evidence validating the \emph{Virtual Biopsy} project’s core hypothesis: multimodal architectures outperform imaging-only approaches. 
+It also offers clear, quantitative benchmarks that the project must at least match—ideally surpass.
+
+%---------------------------------------------------------
+\subsection*{Multimodal Radiomics and Deep-Learning Fusion}
+%---------------------------------------------------------
+
+\subsubsection*{Paper~2: \textit{Huang L} \textit{et~al.}, \textit{Academic Radiology}, 2024\\
+(Fusion of Radiomics, DL, and Clinical Features)}
+
+Using a cohort of \textbf{826} lung adenocarcinoma patients, this study proposes an advanced fusion framework for EGFR prediction.\cite{Huang2024}
+Two main innovations drive its success:
+
+\begin{enumerate}[itemsep=2pt]
+  \item \textbf{Extended Region of Interest.}  
+        Image analysis encompasses the \emph{peritumoural} zone (up to 10\,mm beyond the tumour border), capturing micro-environmental signals.
+  \item \textbf{Tri-modal Feature Fusion.}  
+        Hand-crafted radiomic features, CNN-derived deep features, and clinical variables are stacked in a blended model.
+\end{enumerate}
+
+The final ensemble delivered an \textbf{AUC of 0.925} (internal validation) and \textbf{0.889} (external validation), significantly outperforming single-modality baselines.\cite{Huang2024}
+
+\textbf{Significance.}  
+The work supplies a technical blueprint for the Virtual Biopsy pipeline. 
+Importantly, it shows that including the tumour \emph{micro-environment} can unlock additional predictive power—an advantage over physical biopsy, which samples only a small core of the lesion.
+
+%---------------------------------------------------------
+%  References  (swap for BibTeX if preferred)
+%---------------------------------------------------------
+\begin{thebibliography}{9}
+\bibitem{Chen2025}
+Chen~Y, \textit{et~al}.
+Comprehensive AI prediction of driver mutations in NSCLC: a meta-analysis.
+\textit{European Radiology}. 2025.
+
+\bibitem{Chen2025b}
+Chen~Y, \textit{et~al}.
+Supplementary data to the above study. 2025.
+
+\bibitem{Huang2024}
+Huang~L, \textit{et~al}.
+Multimodal fusion for EGFR status prediction.
+\textit{Academic Radiology}. 2024.
+\end{thebibliography}
+
+\end{document}

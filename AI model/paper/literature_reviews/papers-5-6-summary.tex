@@ -1,0 +1,77 @@
+\documentclass[11pt,a4paper]{article}
+
+%---------------------------------------------------------
+%  Packages
+%---------------------------------------------------------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{geometry}      % Margins
+\geometry{margin=1in}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{amsmath,amssymb}
+
+% Hyperref setup
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+%---------------------------------------------------------
+%  Document
+%---------------------------------------------------------
+\begin{document}
+
+\section*{Relevant Foundational Work for Predictive Oncology}
+
+\subsection*{Paper~1: \textit{Zhong J} \textit{et~al.}, \textit{EBioMedicine}, 2019\\(Multimodal Fusion for Cancer Prognosis)}
+
+While its primary goal was predicting cancer recurrence, this study provides a powerful methodological template for data integration.\cite{Zhong2019} The authors developed a framework that fuses three distinct data types to predict patient outcomes:
+
+\begin{itemize}[itemsep=2pt]
+  \item \textbf{Genomic Data:} Gene expression profiles.
+  \item \textbf{Radiomic Data:} Quantitative features extracted from medical images.
+  \item \textbf{Clinical Data:} Standard patient demographic and clinical information.
+\end{itemize}
+
+The core algorithm is a \textbf{Support Vector Machine (SVM)}, which demonstrated remarkable predictive accuracy. The fused, multimodal model achieved an Area Under the Curve (AUC) of up to \textbf{0.95}, significantly outperforming models trained on any single data modality.
+
+\textbf{Significance.}
+This work is crucial because it empirically validates the core premise of our project: that integrating disparate data sources (genomics, imaging, clinical) yields a more powerful predictive signal than any single source alone. It provides a strong precedent for our multimodal fusion strategy. The code for this paper is not explicitly provided.
+
+%---------------------------------------------------------
+\subsection*{Paper~2: \textit{Ardila D} \textit{et~al.}, \textit{Nature Medicine}, 2019\\(Deep Learning for Lung Cancer Diagnosis from CT)}
+%---------------------------------------------------------
+
+This landmark study from Google Health demonstrates the state-of-the-art in applying deep learning to medical imaging for primary cancer diagnosis.\cite{Ardila2019} The research focused on predicting the malignancy of lung nodules from low-dose chest computed tomography (LDCT) scans.
+
+\begin{enumerate}[itemsep=2pt]
+    \item \textbf{Data Used:} The model was trained on a massive dataset of \textbf{42,290} LDCT scans from clinical trial cohorts.
+    \item \textbf{AI Algorithm:} The architecture is a \textbf{3D Convolutional Neural Network (CNN)}, which allows the model to learn from the full volumetric context of the CT scan, including nodule morphology and its surroundings.
+\end{enumerate}
+
+The model's performance was compared against board-certified radiologists. The deep learning system achieved an \textbf{AUC of 0.94}, demonstrating performance on par with or exceeding that of human experts.
+
+\textbf{Significance.}
+This paper is essential reading as it establishes a high-water mark for deep learning performance in thoracic CT imaging. It provides a clear blueprint for an end-to-end deep learning approach to cancer screening and serves as a key performance benchmark that modern architectures in this domain should aspire to meet or surpass. While the dataset is not public, the methodology is well-described.
+
+%---------------------------------------------------------
+%  References  (Placeholders for BibTeX)
+%---------------------------------------------------------
+\begin{thebibliography}{9}
+\bibitem{Zhong2019}
+Zhong~J, \textit{et~al}.
+A deep learning-based multi-modal fusion framework for prediction of cancer prognosis.
+\textit{EBioMedicine}. 2019;49:151-160.
+
+\bibitem{Ardila2019}
+Ardila~D, \textit{et~al}.
+End-to-end lung cancer screening with three-dimensional deep learning on low-dose chest computed tomography.
+\textit{Nature Medicine}. 2019;25:954–961.
+\end{thebibliography}
+
+\end{document}

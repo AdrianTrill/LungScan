@@ -5,13 +5,17 @@ import { useRouter } from "next/navigation";
 import { Case } from "@/lib/types";
 import CaseCard from "./CaseCard";
 
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
 interface CaseListProps {
   cases: Case[];
   onDelete: (caseId: string) => void;
   onRefresh: () => void;
+  onAnalyze?: (caseId: string) => void;
+  noduleCounts?: Record<string, number>;
 }
 
-export default function CaseList({ cases, onDelete, onRefresh }: CaseListProps) {
+export default function CaseList({ cases, onDelete, onRefresh, onAnalyze, noduleCounts }: CaseListProps) {
   const router = useRouter();
 
   const handleView = (caseId: string) => {
@@ -51,7 +55,10 @@ export default function CaseList({ cases, onDelete, onRefresh }: CaseListProps) 
           case={caseData}
           onDelete={onDelete}
           onView={handleView}
+          onAnalyze={onAnalyze}
           index={index}
+          noduleCount={noduleCounts?.[caseData.id]}
+          imageThumbnailUrl={`${API_URL}/api/cases/${caseData.id}/image?t=${new Date(caseData.updated_at).getTime()}`}
         />
       ))}
     </div>

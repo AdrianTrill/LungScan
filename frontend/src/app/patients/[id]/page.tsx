@@ -1,11 +1,15 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import toast from "react-hot-toast";
 import { useParams, useRouter } from "next/navigation";
 import { api } from "@/lib/api";
 import { PatientDetail } from "@/lib/types";
+import { calculateAge } from "@/lib/utils";
 import Badge from "@/components/ui/Badge";
 import CaseCard from "@/components/cases/CaseCard";
+
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 export default function PatientDetailPage() {
   const params = useParams();
@@ -13,6 +17,7 @@ export default function PatientDetailPage() {
   const patientId = params.id as string;
   const [patientDetail, setPatientDetail] = useState<PatientDetail | null>(null);
   const [loading, setLoading] = useState(true);
+  const [noduleCounts, setNoduleCounts] = useState<Record<string, number>>({});
 
   useEffect(() => {
     if (patientId && patientId !== "new") {
@@ -25,23 +30,30 @@ export default function PatientDetailPage() {
       setLoading(true);
       const data = await api.getPatient(patientId);
       setPatientDetail(data);
+      
+      // Fetch nodule counts for analyzed cases
+      const counts: Record<string, number> = {};
+      const analyzedCases = data.cases.filter(c => c.status === "analyzed");
+      
+      const detailPromises = analyzedCases.map(async (caseItem) => {
+        try {
+          const detail = await api.getCase(caseItem.id);
+          if (detail.analysis_result) {
+            counts[caseItem.id] = detail.analysis_result.nodules.length;
+          }
+        } catch (error) {
+          // Silently fail for individual cases
+        }
+      });
+      
+      await Promise.all(detailPromises);
+      setNoduleCounts(counts);
     } catch (error) {
       console.error("Failed to load patient:", error);
-      alert("Failed to load patient");
+      toast.error("Failed to load patient");
     } finally {
       setLoading(false);
     }
-  };
-
-  const calculateAge = (dateOfBirth: string): number => {
-    const today = new Date();
-    const birth = new Date(dateOfBirth);
-    let age = today.getFullYear() - birth.getFullYear();
-    const monthDiff = today.getMonth() - birth.getMonth();
-    if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birth.getDate())) {
-      age--;
-    }
-    return age;
   };
 
   if (patientId === "new") {
@@ -141,10 +153,17 @@ export default function PatientDetailPage() {
                   key={caseData.id}
                   case={caseData}
                   onDelete={async () => {
-                    await api.deleteCase(caseData.id);
-                    await loadPatient();
+                    try {
+                      await api.deleteCase(caseData.id);
+                      await loadPatient();
+                      toast.success("Case deleted successfully");
+                    } catch (error) {
+                      toast.error("Failed to delete case");
+                    }
                   }}
                   onView={(id) => router.push(`/cases/${id}`)}
+                  noduleCount={noduleCounts[caseData.id]}
+                  imageThumbnailUrl={`${API_URL}/api/cases/${caseData.id}/image?t=${new Date(caseData.updated_at).getTime()}`}
                 />
               ))}
             </div>

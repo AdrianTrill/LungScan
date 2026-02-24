@@ -89,6 +89,8 @@ async def delete_patient(patient_id: str):
 @router.post("/cases/{case_id}/assign/{patient_id}")
 async def assign_case_to_patient(case_id: str, patient_id: str):
     """Assign a case to a patient.
+    
+    Validates that the patient doesn't already have a case assigned.
 
     Args:
         case_id: Case identifier
@@ -98,12 +100,27 @@ async def assign_case_to_patient(case_id: str, patient_id: str):
         Updated case
 
     Raises:
-        HTTPException: If case or patient is not found
+        HTTPException: If case or patient is not found, or patient already has a case
     """
+    # Check if patient already has a case
+    patient_detail = storage.get_patient_detail(patient_id)
+    if not patient_detail:
+        raise HTTPException(
+            status_code=404, detail=f"Patient {patient_id} not found"
+        )
+    
+    # Check if patient already has cases (excluding the current case being assigned)
+    existing_cases = [c for c in patient_detail.cases if c.id != case_id]
+    if existing_cases:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Patient {patient_detail.patient.first_name} {patient_detail.patient.last_name} already has {len(existing_cases)} case(s) assigned. Each patient can only have one case."
+        )
+    
     case = storage.assign_case_to_patient(case_id, patient_id)
     if not case:
         raise HTTPException(
-            status_code=404, detail=f"Case {case_id} or patient {patient_id} not found"
+            status_code=404, detail=f"Case {case_id} not found"
         )
     return case
 
