@@ -95,6 +95,10 @@ backend/.pytest_cache/
 backend/uploads/
 uploads/
 
+# Persistent storage data
+backend/data/
+data/
+
 # Model cache
 .cache/
 *.pth

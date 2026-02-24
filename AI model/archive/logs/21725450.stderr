@@ -1,0 +1,26 @@
+V2 training, adamW instead of the previous Adam, lower final lr (1e-7), biger validation batch size
+
+dice: 0.3510 at epoch 11 (did not train long enough)
+
+TARGET_SPACING = (0.7, 0.7, 0.7) 
+INTENSITY_RANGE = (-1000, 1000) 
+ROI_SIZE = (96, 96, 96)
+BATCH_SIZE = 32
+NUM_WORKERS = 8
+MAX_EPOCHS = 150
+VAL_INTERVAL = 1
+LR = 1e-4
+
+MAX_POINT = 5
+MAX_PROMPT = 32
+MAX_BACKPROMPT = 4
+DROP_POINT_PROB = 0.7 
+DROP_LABEL_PROB = 0.1
+
+pos=4
+neg=1
+num_samples=8
+
+lambda_dice=1.0
+lambda_focal=1.0
+squared_pred=True

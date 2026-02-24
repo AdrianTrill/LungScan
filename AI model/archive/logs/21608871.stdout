@@ -1,0 +1,4878 @@
+Activating venv: /home/dem7clj/repos/mirpr/mirpr/bin/activate
+======================================================
+          Project Root: /home/dem7clj/repos/mirpr
+          Job ID: 21608871
+          Python Path: /home/dem7clj/repos/mirpr/mirpr/bin/python
+======================================================
+
+======================================================
+          Configuration (config.py)
+======================================================
+import os
+
+# --- PROJECT PATHS ---
+PROJECT_ROOT = "/home/dem7clj/repos/mirpr"
+DATA_ROOT = "/shares/CC_v_Val_FV_Gen3_all/VIDT_DL/data/cnn_training/projects/smart_data_selection/town_signs/preprocessed_output/"
+IMG_DIR = os.path.join(DATA_ROOT, "images")
+MASK_DIR = os.path.join(DATA_ROOT, "masks")
+
+PRETRAINED_CHECKPOINT = os.path.join(PROJECT_ROOT, "models/model.pt")
+
+EXPERIMENT_DIR = os.path.join(PROJECT_ROOT, "runs/vista3d_sota_lidc")
+CHECKPOINT_DIR = os.path.join(EXPERIMENT_DIR, "checkpoints")
+LOG_DIR = os.path.join(EXPERIMENT_DIR, "logs")
+
+# --- DATA CONFIG ---
+INPUT_SHAPE = (96, 96, 96) 
+IN_CHANNELS = 1
+
+# --- VISTA CLASS MAPPING (SOTA STRATEGY) ---
+# We map original label "1" (nodule) to VISTA class "23" (lung nodule)
+TARGET_VISTA_CLASS = 23 
+LABEL_MAPPINGS = {"default": [[1, TARGET_VISTA_CLASS]]} 
+LABEL_SET = [0, TARGET_VISTA_CLASS] 
+
+# --- HYPERPARAMETERS ---
+BATCH_SIZE = 4  
+NUM_WORKERS = 8 
+
+# STRICT ALIGNMENT WITH OFFICIAL RECIPE
+LR = 1e-5         # Lowered from 1e-4 to prevent NaN/Collapse
+WEIGHT_DECAY = 0  # Official example usually relies on default Adam WD (0) or low values
+MAX_EPOCHS = 100
+VAL_INTERVAL = 1======================================================
+
+======================================================
+          Model (model.py)
+======================================================
+import torch
+import torch.nn as nn
+import os
+import config as cfg
+
+# Import strictly from standard MONAI paths or fallback
+try:
+    from monai.networks.nets import vista3d132
+except ImportError:
+    from scripts.modeling.vista3d import vista3d132
+
+def get_vista_model(load_weights=True):
+    """
+    Returns the full VISTA-3D architecture (132 classes).
+    We do NOT replace the head. We use prompt-based fine-tuning.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # 1. Instantiate Official Model
+    print(f"[Model] Initializing VISTA-3D (132 Classes)...")
+    model = vista3d132(encoder_embed_dim=48, in_channels=1)
+    
+    # 2. Load Weights
+    if load_weights:
+        if not os.path.exists(cfg.PRETRAINED_CHECKPOINT):
+            print(f"[WARNING] Checkpoint not found at {cfg.PRETRAINED_CHECKPOINT}")
+        else:
+            print(f"[Model] Loading weights from {cfg.PRETRAINED_CHECKPOINT}...")
+            # weights_only=True is safer and recommended by PyTorch/MONAI now
+            try:
+                state_dict = torch.load(cfg.PRETRAINED_CHECKPOINT, map_location="cpu", weights_only=True)
+                model.load_state_dict(state_dict)
+                print("[Model] Weights loaded successfully.")
+            except Exception as e:
+                print(f"[ERROR] Weight load failed: {e}")
+                
+    return model======================================================
+
+======================================================
+          Train Script (train.py)
+======================================================
+import os
+import torch
+import torch.cuda.amp as amp
+import config as cfg
+from dataset import get_dataloaders
+from model import get_vista_model
+
+from monai.metrics import compute_dice
+from monai.losses import DiceLoss
+from monai.inferers import sliding_window_inference
+from monai.apps.vista3d.sampler import sample_prompt_pairs
+from monai.apps.vista3d.transforms import VistaPostTransformd
+
+def main():
+    os.makedirs(cfg.CHECKPOINT_DIR, exist_ok=True)
+    os.makedirs(cfg.LOG_DIR, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    train_loader, val_loader = get_dataloaders()
+    model = get_vista_model(load_weights=True).to(device)
+    
+    loss_function = DiceLoss(to_onehot_y=False, sigmoid=True) 
+    
+    # CHANGED: Use standard Adam to match official VISTA finetuning recipe
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.LR)
+    
+    scaler = amp.GradScaler()
+    
+    # Training Config
+    max_point = 5
+    max_prompt = 32
+    max_backprompt = 4
+    drop_label_prob = 0.2
+    drop_point_prob = 0.5 
+    
+    best_metric = -1
+    best_metric_epoch = -1
+
+    print(f"--- Training Started | Simulated Batch Size: {cfg.BATCH_SIZE} | LR: {cfg.LR} ---")
+    
+    for epoch in range(cfg.MAX_EPOCHS):
+        model.train()
+        epoch_loss = 0
+        step = 0
+        
+        for batch_data in train_loader:
+            step += 1
+            inputs_all = batch_data["image"].to(device)
+            labels_all = batch_data["label"].to(device)
+            
+            optimizer.zero_grad()
+            batch_loss_accumulator = 0.0
+            
+            # Virtual Batch Loop
+            for i in range(labels_all.shape[0]):
+                inputs = inputs_all[[i]]
+                labels = labels_all[[i]]
+                
+                label_prompt, point, point_label, prompt_class = sample_prompt_pairs(
+                    labels,
+                    cfg.LABEL_SET,
+                    max_point=max_point,
+                    max_prompt=max_prompt,
+                    max_backprompt=max_backprompt,
+                    max_foreprompt=None,
+                    drop_label_prob=drop_label_prob,
+                    drop_point_prob=drop_point_prob,
+                )
+                
+                if prompt_class is None: 
+                    continue
+
+                with amp.autocast():
+                    outputs = model(
+                        input_images=inputs, 
+                        point_coords=point, 
+                        point_labels=point_label, 
+                        class_vector=label_prompt
+                    )
+                    
+                    loss = torch.tensor(0.0, device=device)
+                    loss_n = torch.tensor(0.0, device=device)
+                    
+                    for id in range(len(prompt_class)):
+                        # FIX: Cast target to float explicitly for stability
+                        target = (labels == prompt_class[id]).float()
+                        
+                        loss += loss_function(outputs[[id]].float(), target)
+                        loss_n += 1.0
+                    
+                    loss /= max(loss_n, 1.0)
+                    loss = loss / labels_all.shape[0] # Normalize for accumulation
+
+                scaler.scale(loss).backward()
+                batch_loss_accumulator += loss.item() * labels_all.shape[0]
+            
+            # FIX: Gradient Clipping to prevent NaN
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            scaler.step(optimizer)
+            scaler.update()
+                
+            epoch_loss += batch_loss_accumulator
+
+            if step % 20 == 0:
+                print(f"  Ep {epoch+1} [{step}/{len(train_loader)}] Loss: {batch_loss_accumulator:.4f}")
+
+        epoch_loss /= step
+        print(f"Ep {epoch+1} Avg Loss: {epoch_loss:.4f}")
+
+        # --- VALIDATION ---
+        if (epoch + 1) % cfg.VAL_INTERVAL == 0:
+            model.eval()
+            dice_scores = []
+            target_class_tensor = torch.tensor([cfg.TARGET_VISTA_CLASS], device=device)
+            
+            # Monitoring model collapse
+            total_pred_pixels = 0 
+
+            with torch.no_grad():
+                for val_data in val_loader:
+                    val_inputs = val_data["image"].to(device)
+                    val_labels = val_data["label"].to(device)
+                    
+                    with amp.autocast():
+                        val_outputs = sliding_window_inference(
+                            inputs=val_inputs,
+                            roi_size=cfg.INPUT_SHAPE,
+                            sw_batch_size=4,
+                            predictor=model,
+                            overlap=0.25, 
+                            transpose=True, 
+                            class_vector=target_class_tensor
+                        )
+                    
+                    post_pred = VistaPostTransformd(keys="pred")(
+                        {"pred": val_outputs, "label_prompt": target_class_tensor}
+                    )["pred"]
+                    
+                    pred_binary = (post_pred.unsqueeze(0) == cfg.TARGET_VISTA_CLASS).float()
+                    label_binary = (val_labels == cfg.TARGET_VISTA_CLASS).float()
+                    
+                    total_pred_pixels += pred_binary.sum().item()
+
+                    # Handle Empty GT (True Negatives)
+                    if label_binary.sum() == 0:
+                        if pred_binary.sum() == 0:
+                            dice_item = 1.0 
+                        else:
+                            dice_item = 0.0 
+                    else:
+                        dice = compute_dice(
+                            y_pred=pred_binary, 
+                            y=label_binary, 
+                            include_background=False
+                        )
+                        dice_item = dice.item()
+
+                    if dice_item != dice_item: # Check NaN
+                        dice_item = 0.0
+                        
+                    dice_scores.append(dice_item)
+            
+            if len(dice_scores) > 0:
+                mean_dice = sum(dice_scores) / len(dice_scores)
+                # This log helps you see if model is dead (Pred Sum = 0)
+                print(f"Ep {epoch+1} Val Dice: {mean_dice:.4f} | Total Pred Pixels: {int(total_pred_pixels)}")
+                
+                if mean_dice > best_metric:
+                    best_metric = mean_dice
+                    best_metric_epoch = epoch + 1
+                    torch.save(model.state_dict(), os.path.join(cfg.CHECKPOINT_DIR, "best_model.pth"))
+                    print(f"  >>> New Best Model (Dice: {best_metric:.4f})")
+
+    print(f"Done. Best Dice: {best_metric:.4f} at Epoch {best_metric_epoch}")
+
+if __name__ == "__main__":
+    main()======================================================
+
+import os
+import torch
+import numpy as np
+from tqdm import tqdm
+from monai.metrics import DiceMetric, HausdorffDistanceMetric
+from monai.inferers import sliding_window_inference
+from monai.apps.vista3d.transforms import VistaPostTransformd
+import config as cfg
+from dataset import get_dataloaders
+from model import get_vista_model
+
+def evaluate():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[Eval] Device: {device}")
+
+    # We only need the validation/test loader here
+    _, val_loader = get_dataloaders()
+    model = get_vista_model(load_weights=False).to(device)
+    
+    weight_path = os.path.join(cfg.CHECKPOINT_DIR, "best_model.pth")
+    if os.path.exists(weight_path):
+        model.load_state_dict(torch.load(weight_path, map_location=device))
+        print(f"[Eval] Loaded weights from {weight_path}")
+    else:
+        print(f"[Error] No weights found at {weight_path}")
+        return
+
+    model.eval()
+
+    dice_metric = DiceMetric(include_background=False, reduction="mean")
+    hd95_metric = HausdorffDistanceMetric(include_background=False, percentile=95, reduction="mean")
+
+    target_class_tensor = torch.tensor([cfg.TARGET_VISTA_CLASS], device=device)
+
+    print("[Eval] Starting inference...")
+    
+    with torch.no_grad():
+        for test_data in tqdm(val_loader):
+            inputs = test_data["image"].to(device)
+            labels = test_data["label"].to(device)
+            
+            with torch.cuda.amp.autocast():
+                outputs = sliding_window_inference(
+                    inputs=inputs,
+                    roi_size=cfg.INPUT_SHAPE,
+                    sw_batch_size=4,
+                    predictor=model,
+                    overlap=0.5, 
+                    transpose=True,
+                    class_vector=target_class_tensor 
+                )
+            
+            # Post-process: Converts raw model output to class indices
+            post_pred = VistaPostTransformd(keys="pred")(
+                {"pred": outputs, "label_prompt": target_class_tensor}
+            )["pred"]
+            
+            # Binarize: Check if predicted class index matches Target Class
+            pred_binary = (post_pred.unsqueeze(0) == cfg.TARGET_VISTA_CLASS).float()
+            label_binary = (labels == cfg.TARGET_VISTA_CLASS).float()
+            
+            dice_metric(y_pred=pred_binary, y=label_binary)
+            hd95_metric(y_pred=pred_binary, y=label_binary)
+
+    print("\n=========================================")
+    print(f" RESULTS FOR VISTA-3D (Virtual Biopsy)")
+    print("=========================================")
+    # Aggregate returns a tensor, .item() gets the float value
+    print(f" NODULE DICE: {dice_metric.aggregate().item():.4f}")
+    print(f" HD95 (mm):   {hd95_metric.aggregate().item():.4f}")
+    print("=========================================")
+
+if __name__ == "__main__":
+    evaluate()import os
+import glob
+import torch
+import warnings
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from monai.transforms import (
+    Compose, LoadImaged, EnsureChannelFirstd, RandFlipd, 
+    RandRotate90d, RandShiftIntensityd, EnsureTyped,
+    RandCropByPosNegLabeld
+)
+from monai.apps.vista3d.transforms import Relabeld
+import config as cfg
+
+warnings.filterwarnings("ignore")
+
+class SingleCropByPosNegLabeld(RandCropByPosNegLabeld):
+    """
+    MONAI's RandCropByPosNegLabeld returns a LIST of crops (even if num_samples=1).
+    This wrapper extracts the single item so PyTorch DataLoaders receive a Tensor, not a List.
+    """
+    def __call__(self, data, **kwargs):
+        results = super().__call__(data, **kwargs)
+        if isinstance(results, list) and len(results) > 0:
+            return results[0]
+        return results
+
+class LidcDataset(Dataset):
+    def __init__(self, file_list, transforms=None):
+        self.files = file_list
+        self.transforms = transforms
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        img_path, mask_path = self.files[idx]
+        data = {"image": img_path, "label": mask_path}
+        if self.transforms:
+            try:
+                data = self.transforms(data)
+            except Exception as e:
+                print(f"[Dataset] Error processing {img_path}: {e}")
+                raise e
+        return data
+
+def get_transforms(mode="train"):
+    # Base transforms
+    base_transforms = [
+        LoadImaged(keys=["image", "label"], ensure_channel_first=False),
+        EnsureChannelFirstd(keys=["image", "label"], channel_dim=0),
+        
+        # --- CRITICAL FIX: Ensure Label is Integer for Relabeld ---
+        # Since preprocess.py saved them as floats, we must cast here.
+        EnsureTyped(keys=["label"], dtype=torch.int64),
+        
+        # Map original Mask ID (1) to VISTA Target ID (23)
+        Relabeld(keys="label", label_mappings=cfg.LABEL_MAPPINGS, dtype=torch.uint8), 
+    ]
+    
+    if mode == "train":
+        augments = [
+            SingleCropByPosNegLabeld(
+                keys=["image", "label"], label_key="label",
+                spatial_size=cfg.INPUT_SHAPE,
+                pos=1.0, 
+                neg=0.5, # Increased slightly to 0.5 to show *some* negatives during training
+                num_samples=1, 
+                image_key="image", image_threshold=0,
+            ),
+            RandRotate90d(keys=["image", "label"], prob=0.5, spatial_axes=(0, 1)),
+            RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
+            RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
+            RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=2),
+            RandShiftIntensityd(keys=["image"], offsets=0.1, prob=0.2),
+            EnsureTyped(keys=["image", "label"]),
+        ]
+        return Compose(base_transforms + augments)
+    else:
+        # Validation: No cropping, full volume evaluation
+        return Compose(base_transforms + [EnsureTyped(keys=["image", "label"])])
+
+def get_dataloaders():
+    print(f"[Data] Scanning {cfg.IMG_DIR}...")
+    all_images = sorted(glob.glob(os.path.join(cfg.IMG_DIR, "*.npy")))
+    
+    if len(all_images) == 0:
+        raise ValueError(f"No .npy files found in {cfg.IMG_DIR}. Did preprocessing run?")
+
+    patient_map = {}
+    for img_path in all_images:
+        filename = os.path.basename(img_path)
+        # Parse patient ID to prevent data leakage across splits
+        pid = "_".join(filename.split("_")[:-1]) 
+        mask_path = os.path.join(cfg.MASK_DIR, filename)
+        
+        if os.path.exists(mask_path):
+            if pid not in patient_map: patient_map[pid] = []
+            patient_map[pid].append((img_path, mask_path))
+
+    pids = sorted(list(patient_map.keys()))
+    
+    # Stratified Split (Patient Level)
+    train_pids, temp = train_test_split(pids, train_size=0.8, random_state=42)
+    val_pids, test_pids = train_test_split(temp, test_size=0.5, random_state=42)
+
+    flatten = lambda plist: [f for pid in plist for f in patient_map[pid]]
+    train_files, val_files = flatten(train_pids), flatten(val_pids)
+
+    print(f"[Data] Train Patches: {len(train_files)} | Val Patches: {len(val_files)}")
+
+    train_loader = DataLoader(
+        LidcDataset(train_files, transforms=get_transforms("train")), 
+        batch_size=cfg.BATCH_SIZE, 
+        shuffle=True, 
+        num_workers=cfg.NUM_WORKERS, 
+        pin_memory=True, 
+        drop_last=True
+    )
+    
+    val_loader = DataLoader(
+        LidcDataset(val_files, transforms=get_transforms("val")), 
+        batch_size=1, # Validation must be 1 for Sliding Window
+        shuffle=False, 
+        num_workers=cfg.NUM_WORKERS, 
+        pin_memory=True
+    )
+
+    return train_loader, val_loaderimport os
+import sys
+import numpy as np
+import warnings
+import configparser
+
+# --- CRITICAL FIX: MONKEY PATCH FOR PYLIDC ---
+# pylidc uses deprecated numpy aliases (np.int, np.float) which were removed in numpy 1.24+.
+np.int = int
+np.float = float
+np.bool = np.bool_ 
+# ---------------------------------------------
+
+# --- PATH CONFIGURATION ---
+# 1. Input Data Root (Where LIDC-IDRI folder is located)
+PROJECT_ROOT = "/shares/CC_v_Val_FV_Gen3_all/VIDT_DL/data/cnn_training/projects/smart_data_selection/town_signs/mirprfull/"
+DICOM_DIR = os.path.join(PROJECT_ROOT, "LIDC-IDRI")
+
+# 2. Output Data Root
+OUTPUT_ROOT = "/shares/CC_v_Val_FV_Gen3_all/VIDT_DL/data/cnn_training/projects/smart_data_selection/town_signs/preprocessed_output/"
+IMG_DIR = os.path.join(OUTPUT_ROOT, "images")
+MASK_DIR = os.path.join(OUTPUT_ROOT, "masks")
+
+# 3. Pylidc Config Location (We will auto-generate this)
+PYLIDC_CFG_PATH = os.path.join(PROJECT_ROOT, ".pylidcrc_local")
+os.environ["PYLIDCRC"] = PYLIDC_CFG_PATH
+
+# --- SETUP PYLIDC AUTOMATICALLY ---
+def setup_pylidc_config():
+    """Generates a local .pylidcrc file pointing to your dataset."""
+    if not os.path.exists(DICOM_DIR):
+        raise FileNotFoundError(f"CRITICAL: DICOM directory not found at {DICOM_DIR}")
+
+    config = configparser.ConfigParser()
+    config['dicom'] = {
+        'path': DICOM_DIR,
+        'warn_improper_ct_image': 'true'
+    }
+    # We use a local SQLite db file inside the project root to avoid home dir issues
+    db_path = os.path.join(PROJECT_ROOT, "pylidc.db")
+    config['database'] = {
+        'path': db_path
+    }
+
+    with open(PYLIDC_CFG_PATH, 'w') as configfile:
+        config.write(configfile)
+    
+    print(f"--- Pylidc Configuration Generated ---")
+    print(f"Config File: {PYLIDC_CFG_PATH}")
+    print(f"DICOM Path:  {DICOM_DIR}")
+    print(f"DB Path:     {db_path}")
+    print(f"------------------------------------")
+
+# Run setup BEFORE importing pylidc
+setup_pylidc_config()
+
+import pylidc as pl
+import torch
+import torch.nn.functional as F
+import torch.multiprocessing as mp
+from tqdm import tqdm
+import random
+import queue
+
+# --- PROCESSING CONFIGURATION ---
+TARGET_SPACING = (1.0, 1.0, 1.0)
+CUBE_SIZE = (192, 192, 192)
+STRIDE = (96, 96, 96)
+LUNG_WINDOW = [-1000, 400]
+NUM_WORKERS = 12 
+# ---------------------
+
+def create_consensus_mask_cpu(scan_id, vol_shape):
+    """
+    Worker function to generate mask. 
+    """
+    # Re-query inside worker to avoid pickle issues
+    scan = pl.query(pl.Scan).filter(pl.Scan.id == scan_id).first()
+    mask = np.zeros(vol_shape, dtype=np.uint8) 
+    
+    try:
+        annotation_clusters = scan.cluster_annotations()
+        if not annotation_clusters: return mask
+        
+        for ann_cluster in annotation_clusters:
+            for ann in ann_cluster:
+                try:
+                    cropped_mask = ann.boolean_mask()
+                    slices = ann.bbox()
+                    
+                    mask_slice_view = mask[slices]
+                    
+                    # Handle boundary/shape mismatch edge cases
+                    if mask_slice_view.shape == cropped_mask.shape:
+                        combined = (mask_slice_view > 0) | cropped_mask
+                        mask[slices] = combined.astype(np.uint8)
+                    else:
+                        s_shape = mask_slice_view.shape
+                        cropped_mask_view = cropped_mask[:s_shape[0], :s_shape[1], :s_shape[2]]
+                        combined = (mask_slice_view > 0) | cropped_mask_view
+                        mask[slices] = combined.astype(np.uint8)
+                except: continue
+    except: pass
+    return mask
+
+def worker_producer(worker_id, scan_ids_queue, data_queue):
+    """
+    CPU Worker: Loads DICOMs, Generates Masks, Pushes to Queue.
+    """
+    warnings.filterwarnings("ignore")
+    
+    # Reload config in worker process to ensure DB connection works
+    os.environ["PYLIDCRC"] = PYLIDC_CFG_PATH
+    
+    while True:
+        try:
+            scan_id = scan_ids_queue.get(timeout=5)
+        except queue.Empty:
+            break
+            
+        try:
+            scan = pl.query(pl.Scan).filter(pl.Scan.id == scan_id).first()
+            patient_id = scan.patient_id
+            
+            # CPU Heavy IO
+            ct_vol = scan.to_volume(verbose=False)
+            current_spacing = (scan.slice_spacing, scan.pixel_spacing, scan.pixel_spacing)
+            mask_vol = create_consensus_mask_cpu(scan_id, ct_vol.shape)
+            
+            # Push to GPU Consumer
+            data_queue.put((patient_id, ct_vol, mask_vol, current_spacing))
+            
+        except Exception as e:
+            # Skip failed scans (e.g., corrupt DICOM) without crashing
+            pass
+            
+    data_queue.put(None) # Signal finished
+
+def gpu_resample(tensor, current_spacing, target_spacing, mode='trilinear'):
+    """
+    H100 GPU Interpolation
+    """
+    if current_spacing == target_spacing: return tensor
+    
+    # Convert numpy/list to tensor for calculation if necessary
+    scale_factor = [c / t for c, t in zip(current_spacing, target_spacing)]
+    
+    new_depth = int(tensor.shape[0] * scale_factor[0])
+    new_height = int(tensor.shape[1] * scale_factor[1])
+    new_width = int(tensor.shape[2] * scale_factor[2])
+    
+    # Add batch/channel dims for interpolate: (1, 1, D, H, W)
+    tensor = tensor.unsqueeze(0).unsqueeze(0)
+    
+    # Use float32 for geometric precision
+    with torch.amp.autocast('cuda', enabled=False):
+        tensor = F.interpolate(
+            tensor.float(), 
+            size=(new_depth, new_height, new_width), 
+            mode=mode, 
+            align_corners=False if mode != 'nearest' else None
+        )
+        
+    return tensor.squeeze(0).squeeze(0)
+
+def main():
+    # Set start method to spawn for CUDA compatibility
+    mp.set_start_method('spawn', force=True)
+    
+    print(f"--- SOTA Preprocessing Started ---")
+    
+    os.makedirs(IMG_DIR, exist_ok=True)
+    os.makedirs(MASK_DIR, exist_ok=True)
+    
+    device = torch.device("cuda")
+    print(f"Using Device: {device}")
+    print(f"Saving to: {OUTPUT_ROOT}")
+    
+    # 1. Setup Queue
+    print("Querying LIDC-IDRI DB...")
+    scans = pl.query(pl.Scan).all()
+    all_scan_ids = [s.id for s in scans]
+    total_scans = len(all_scan_ids)
+    print(f"Found {total_scans} scans.")
+    
+    scan_ids_queue = mp.Queue()
+    data_queue = mp.Queue(maxsize=8) # Keep RAM usage controlled
+    
+    for sid in all_scan_ids:
+        scan_ids_queue.put(sid)
+
+    # 2. Launch Workers
+    print(f"Launching {NUM_WORKERS} CPU workers...")
+    processes = []
+    for i in range(NUM_WORKERS):
+        p = mp.Process(target=worker_producer, args=(i, scan_ids_queue, data_queue))
+        p.start()
+        processes.append(p)
+
+    # 3. GPU Consumer Loop
+    global_patch_count = 0
+    finished_workers = 0
+    pbar = tqdm(total=total_scans, desc="Processing")
+    
+    while finished_workers < NUM_WORKERS:
+        try:
+            item = data_queue.get(timeout=1)
+        except queue.Empty:
+            continue
+
+        if item is None:
+            finished_workers += 1
+            continue
+
+        patient_id, ct_np, mask_np, current_spacing = item
+        
+        try:
+            # Move to GPU
+            ct_tensor = torch.from_numpy(ct_np).to(device, dtype=torch.float32)
+            mask_tensor = torch.from_numpy(mask_np).to(device, dtype=torch.float32)
+
+            # --- 1. Resample ---
+            ct_res = gpu_resample(ct_tensor, current_spacing, TARGET_SPACING, 'trilinear')
+            mask_res = gpu_resample(mask_tensor, current_spacing, TARGET_SPACING, 'nearest')
+            
+            # --- 2. Normalize & Window ---
+            ct_norm = torch.clamp(ct_res, LUNG_WINDOW[0], LUNG_WINDOW[1])
+            ct_norm = (ct_norm - LUNG_WINDOW[0]) / (LUNG_WINDOW[1] - LUNG_WINDOW[0])
+            
+            # --- 3. Pad if smaller than Patch Size ---
+            shape = ct_norm.shape
+            pad_z = max(0, CUBE_SIZE[0] - shape[0])
+            pad_y = max(0, CUBE_SIZE[1] - shape[1])
+            pad_x = max(0, CUBE_SIZE[2] - shape[2])
+            
+            if pad_z > 0 or pad_y > 0 or pad_x > 0:
+                pad_args = (0, pad_x, 0, pad_y, 0, pad_z)
+                ct_norm = F.pad(ct_norm, pad_args, value=0)
+                mask_res = F.pad(mask_res, pad_args, value=0)
+
+            # --- 4. Extract Patches ---
+            shape = ct_norm.shape
+            pos_patches = []
+            neg_patches = []
+            
+            # Slide on CPU dimensions, slice on GPU tensors
+            for z in range(0, shape[0] - CUBE_SIZE[0] + 1, STRIDE[0]):
+                for y in range(0, shape[1] - CUBE_SIZE[1] + 1, STRIDE[1]):
+                    for x in range(0, shape[2] - CUBE_SIZE[2] + 1, STRIDE[2]):
+                        
+                        img_gpu = ct_norm[z:z+CUBE_SIZE[0], y:y+CUBE_SIZE[1], x:x+CUBE_SIZE[2]]
+                        mask_gpu = mask_res[z:z+CUBE_SIZE[0], y:y+CUBE_SIZE[1], x:x+CUBE_SIZE[2]]
+                        
+                        # FILTER: Skip Air
+                        if torch.mean(img_gpu) < 0.02: continue
+                        
+                        # CLASSIFY: Pos vs Neg
+                        is_pos = torch.sum(mask_gpu) > 0
+                        
+                        # DOWNLOAD: Move only valid patches to CPU
+                        patch_tuple = (img_gpu.cpu().numpy(), mask_gpu.cpu().numpy())
+                        
+                        if is_pos: pos_patches.append(patch_tuple)
+                        else: neg_patches.append(patch_tuple)
+
+            # --- 5. Smart Balancing ---
+            final_patches = pos_patches # Always keep positives
+            
+            # Keep 2 negatives for every 1 positive
+            # Or keep 5 randoms if the scan is empty (healthy patient)
+            n_keep = max(5, len(pos_patches)*2)
+            
+            if len(neg_patches) > n_keep:
+                random.shuffle(neg_patches)
+                final_patches.extend(neg_patches[:n_keep])
+            else:
+                final_patches.extend(neg_patches)
+
+            # --- 6. Save to Disk ---
+            for img, mask in final_patches:
+                pid = f"{patient_id}_{global_patch_count:05d}"
+                
+                # Add Channel Dim (1, D, H, W)
+                np.save(os.path.join(IMG_DIR, f"{pid}.npy"), np.expand_dims(img, 0))
+                np.save(os.path.join(MASK_DIR, f"{pid}.npy"), np.expand_dims(mask, 0))
+                
+                global_patch_count += 1
+            
+            # Cleanup VRAM
+            del ct_tensor, mask_tensor, ct_res, mask_res, ct_norm
+            pbar.update(1)
+
+        except Exception as e:
+            # print(f"Error processing {patient_id}: {e}")
+            pass
+
+    pbar.close()
+    for p in processes: p.join()
+    print(f"\n--- Done! Total Patches Saved: {global_patch_count} ---")
+
+if __name__ == "__main__":
+    main()We used this for preprocessing:
+Starting Python training script... Log files are in the 'logs' directory.
+[Data] Scanning /shares/CC_v_Val_FV_Gen3_all/VIDT_DL/data/cnn_training/projects/smart_data_selection/town_signs/preprocessed_output/images...
+[Data] Train Patches: 9225 | Val Patches: 1202
+[Model] Initializing VISTA-3D (132 Classes)...
+[Model] Loading weights from /home/dem7clj/repos/mirpr/models/model.pt...
+[Model] Weights loaded successfully.
+--- Training Started | Simulated Batch Size: 4 | LR: 1e-05 ---
+  Ep 1 [20/2306] Loss: 3.6966
+  Ep 1 [40/2306] Loss: 3.2702
+  Ep 1 [60/2306] Loss: 3.7297
+  Ep 1 [80/2306] Loss: 3.9969
+  Ep 1 [100/2306] Loss: 3.1734
+  Ep 1 [120/2306] Loss: 3.6005
+  Ep 1 [140/2306] Loss: 3.3026
+  Ep 1 [160/2306] Loss: 2.3490
+  Ep 1 [180/2306] Loss: 2.4309
+  Ep 1 [200/2306] Loss: 2.0944
+  Ep 1 [220/2306] Loss: 1.9360
+  Ep 1 [240/2306] Loss: 2.3830
+  Ep 1 [260/2306] Loss: 1.7596
+  Ep 1 [280/2306] Loss: 1.5952
+  Ep 1 [300/2306] Loss: 2.0205
+  Ep 1 [320/2306] Loss: 1.9931
+  Ep 1 [340/2306] Loss: 2.0008
+  Ep 1 [360/2306] Loss: 1.8446
+  Ep 1 [380/2306] Loss: 2.0015
+  Ep 1 [400/2306] Loss: 1.4167
+  Ep 1 [420/2306] Loss: 1.9146
+  Ep 1 [440/2306] Loss: 1.8220
+  Ep 1 [460/2306] Loss: 1.5490
+  Ep 1 [480/2306] Loss: 2.3497
+  Ep 1 [500/2306] Loss: 1.7332
+  Ep 1 [520/2306] Loss: 1.7802
+  Ep 1 [540/2306] Loss: 2.0055
+  Ep 1 [560/2306] Loss: 2.0001
+  Ep 1 [580/2306] Loss: 2.0001
+  Ep 1 [600/2306] Loss: 2.0012
+  Ep 1 [620/2306] Loss: 1.7764
+  Ep 1 [640/2306] Loss: 2.0002
+  Ep 1 [660/2306] Loss: 1.4355
+  Ep 1 [680/2306] Loss: 2.0002
+  Ep 1 [700/2306] Loss: 1.9587
+  Ep 1 [720/2306] Loss: 1.9065
+  Ep 1 [740/2306] Loss: 1.3089
+  Ep 1 [760/2306] Loss: 1.6443
+  Ep 1 [780/2306] Loss: 1.8905
+  Ep 1 [800/2306] Loss: 1.2990
+  Ep 1 [820/2306] Loss: 1.7453
+  Ep 1 [840/2306] Loss: 2.0003
+  Ep 1 [860/2306] Loss: 1.4876
+  Ep 1 [880/2306] Loss: 1.6379
+  Ep 1 [900/2306] Loss: 2.0492
+  Ep 1 [920/2306] Loss: 1.9910
+  Ep 1 [940/2306] Loss: 2.3116
+  Ep 1 [960/2306] Loss: 2.0001
+  Ep 1 [980/2306] Loss: 2.0452
+  Ep 1 [1000/2306] Loss: 2.0002
+  Ep 1 [1020/2306] Loss: 1.7328
+  Ep 1 [1040/2306] Loss: 1.3698
+  Ep 1 [1060/2306] Loss: 1.6277
+  Ep 1 [1080/2306] Loss: 1.7400
+  Ep 1 [1100/2306] Loss: 1.8601
+  Ep 1 [1120/2306] Loss: 1.6154
+  Ep 1 [1140/2306] Loss: 2.4896
+  Ep 1 [1160/2306] Loss: 1.5970
+  Ep 1 [1180/2306] Loss: 1.3323
+  Ep 1 [1200/2306] Loss: 2.2877
+  Ep 1 [1220/2306] Loss: 1.7406
+  Ep 1 [1240/2306] Loss: 2.0000
+  Ep 1 [1260/2306] Loss: 1.8874
+  Ep 1 [1280/2306] Loss: 1.9998
+  Ep 1 [1300/2306] Loss: 2.0000
+  Ep 1 [1320/2306] Loss: 1.7474
+  Ep 1 [1340/2306] Loss: 1.7015
+  Ep 1 [1360/2306] Loss: 2.0010
+  Ep 1 [1380/2306] Loss: 1.6190
+  Ep 1 [1400/2306] Loss: 1.6555
+  Ep 1 [1420/2306] Loss: 1.6195
+  Ep 1 [1440/2306] Loss: 1.2769
+  Ep 1 [1460/2306] Loss: 1.6836
+  Ep 1 [1480/2306] Loss: 2.0007
+  Ep 1 [1500/2306] Loss: 1.7297
+  Ep 1 [1520/2306] Loss: 1.9994
+  Ep 1 [1540/2306] Loss: 1.7871
+  Ep 1 [1560/2306] Loss: 1.9968
+  Ep 1 [1580/2306] Loss: 1.6297
+  Ep 1 [1600/2306] Loss: 1.5525
+  Ep 1 [1620/2306] Loss: 1.5869
+  Ep 1 [1640/2306] Loss: 1.9999
+  Ep 1 [1660/2306] Loss: 1.6111
+  Ep 1 [1680/2306] Loss: 1.6635
+  Ep 1 [1700/2306] Loss: 1.9989
+  Ep 1 [1720/2306] Loss: 1.5301
+  Ep 1 [1740/2306] Loss: 1.3840
+  Ep 1 [1760/2306] Loss: 1.9744
+  Ep 1 [1780/2306] Loss: 1.7572
+  Ep 1 [1800/2306] Loss: 2.0003
+  Ep 1 [1820/2306] Loss: 2.0001
+  Ep 1 [1840/2306] Loss: 1.9999
+  Ep 1 [1860/2306] Loss: 1.9999
+  Ep 1 [1880/2306] Loss: 1.3860
+  Ep 1 [1900/2306] Loss: 1.9999
+  Ep 1 [1920/2306] Loss: 1.9992
+  Ep 1 [1940/2306] Loss: 1.6563
+  Ep 1 [1960/2306] Loss: 1.9182
+  Ep 1 [1980/2306] Loss: 1.7553
+  Ep 1 [2000/2306] Loss: 0.4999
+  Ep 1 [2020/2306] Loss: 0.0002
+  Ep 1 [2040/2306] Loss: 0.2527
+  Ep 1 [2060/2306] Loss: 0.5000
+  Ep 1 [2080/2306] Loss: 0.0001
+  Ep 1 [2100/2306] Loss: 0.5209
+  Ep 1 [2120/2306] Loss: 0.2121
+  Ep 1 [2140/2306] Loss: 1.2557
+  Ep 1 [2160/2306] Loss: 0.5118
+  Ep 1 [2180/2306] Loss: 0.4260
+  Ep 1 [2200/2306] Loss: 0.1821
+  Ep 1 [2220/2306] Loss: 0.0016
+  Ep 1 [2240/2306] Loss: 0.5016
+  Ep 1 [2260/2306] Loss: 0.4648
+  Ep 1 [2280/2306] Loss: 0.7610
+  Ep 1 [2300/2306] Loss: 0.5000
+Ep 1 Avg Loss: 1.7708
+Ep 1 Val Dice: 0.5813 | Total Pred Pixels: 60569
+  >>> New Best Model (Dice: 0.5813)
+  Ep 2 [20/2306] Loss: 0.8426
+  Ep 2 [40/2306] Loss: 1.8465
+  Ep 2 [60/2306] Loss: 0.6373
+  Ep 2 [80/2306] Loss: 0.0000
+  Ep 2 [100/2306] Loss: 0.5000
+  Ep 2 [120/2306] Loss: 0.3056
+  Ep 2 [140/2306] Loss: 0.5003
+  Ep 2 [160/2306] Loss: 0.2616
+  Ep 2 [180/2306] Loss: 0.2108
+  Ep 2 [200/2306] Loss: 0.4942
+  Ep 2 [220/2306] Loss: 0.4137
+  Ep 2 [240/2306] Loss: 0.5000
+  Ep 2 [260/2306] Loss: 0.0000
+  Ep 2 [280/2306] Loss: 0.0000
+  Ep 2 [300/2306] Loss: 0.0000
+  Ep 2 [320/2306] Loss: 0.5816
+  Ep 2 [340/2306] Loss: 0.4080
+  Ep 2 [360/2306] Loss: 0.2234
+  Ep 2 [380/2306] Loss: 0.9577
+  Ep 2 [400/2306] Loss: 0.4286
+  Ep 2 [420/2306] Loss: 0.4475
+  Ep 2 [440/2306] Loss: 0.1492
+  Ep 2 [460/2306] Loss: 0.6562
+  Ep 2 [480/2306] Loss: 0.1932
+  Ep 2 [500/2306] Loss: 0.2047
+  Ep 2 [520/2306] Loss: 0.1679
+  Ep 2 [540/2306] Loss: 0.1492
+  Ep 2 [560/2306] Loss: 0.0000
+  Ep 2 [580/2306] Loss: 0.5921
+  Ep 2 [600/2306] Loss: 1.4879
+  Ep 2 [620/2306] Loss: 0.7163
+  Ep 2 [640/2306] Loss: 0.2657
+  Ep 2 [660/2306] Loss: 0.1855
+  Ep 2 [680/2306] Loss: 0.3250
+  Ep 2 [700/2306] Loss: 1.5001
+  Ep 2 [720/2306] Loss: 0.7865
+  Ep 2 [740/2306] Loss: 0.3732
+  Ep 2 [760/2306] Loss: 0.8697
+  Ep 2 [780/2306] Loss: 0.5001
+  Ep 2 [800/2306] Loss: 0.1093
+  Ep 2 [820/2306] Loss: 0.0001
+  Ep 2 [840/2306] Loss: 0.5009
+  Ep 2 [860/2306] Loss: 0.9014
+  Ep 2 [880/2306] Loss: 1.3244
+  Ep 2 [900/2306] Loss: 0.7317
+  Ep 2 [920/2306] Loss: 0.4523
+  Ep 2 [940/2306] Loss: 0.2279
+  Ep 2 [960/2306] Loss: 0.1580
+  Ep 2 [980/2306] Loss: 0.0000
+  Ep 2 [1000/2306] Loss: 0.4321
+  Ep 2 [1020/2306] Loss: 0.6905
+  Ep 2 [1040/2306] Loss: 0.8617
+  Ep 2 [1060/2306] Loss: 0.0000
+  Ep 2 [1080/2306] Loss: 0.4448
+  Ep 2 [1100/2306] Loss: 0.3628
+  Ep 2 [1120/2306] Loss: 0.6118
+  Ep 2 [1140/2306] Loss: 0.3146
+  Ep 2 [1160/2306] Loss: 0.5001
+  Ep 2 [1180/2306] Loss: 1.5000
+  Ep 2 [1200/2306] Loss: 0.9570
+  Ep 2 [1220/2306] Loss: 0.3654
+  Ep 2 [1240/2306] Loss: 0.5002
+  Ep 2 [1260/2306] Loss: 1.1225
+  Ep 2 [1280/2306] Loss: 0.1437
+  Ep 2 [1300/2306] Loss: 0.0003
+  Ep 2 [1320/2306] Loss: 0.0000
+  Ep 2 [1340/2306] Loss: 0.3138
+  Ep 2 [1360/2306] Loss: 0.1304
+  Ep 2 [1380/2306] Loss: 0.8456
+  Ep 2 [1400/2306] Loss: 0.5000
+  Ep 2 [1420/2306] Loss: 0.1345
+  Ep 2 [1440/2306] Loss: 0.3149
+  Ep 2 [1460/2306] Loss: 0.0000
+  Ep 2 [1480/2306] Loss: 0.8492
+  Ep 2 [1500/2306] Loss: 0.3199
+  Ep 2 [1520/2306] Loss: 0.5208
+  Ep 2 [1540/2306] Loss: 0.3427
+  Ep 2 [1560/2306] Loss: 0.2576
+  Ep 2 [1580/2306] Loss: 0.8903
+  Ep 2 [1600/2306] Loss: 0.6653
+  Ep 2 [1620/2306] Loss: 1.0699
+  Ep 2 [1640/2306] Loss: 0.5734
+  Ep 2 [1660/2306] Loss: 0.5457
+  Ep 2 [1680/2306] Loss: 0.0000
+  Ep 2 [1700/2306] Loss: 0.3719
+  Ep 2 [1720/2306] Loss: 0.3014
+  Ep 2 [1740/2306] Loss: 0.5001
+  Ep 2 [1760/2306] Loss: 0.5001
+  Ep 2 [1780/2306] Loss: 0.4938
+  Ep 2 [1800/2306] Loss: 0.0001
+  Ep 2 [1820/2306] Loss: 0.1867
+  Ep 2 [1840/2306] Loss: 0.0000
+  Ep 2 [1860/2306] Loss: 0.5002
+  Ep 2 [1880/2306] Loss: 0.1817
+  Ep 2 [1900/2306] Loss: 0.3620
+  Ep 2 [1920/2306] Loss: 0.2488
+  Ep 2 [1940/2306] Loss: 0.1622
+  Ep 2 [1960/2306] Loss: 0.5070
+  Ep 2 [1980/2306] Loss: 0.0001
+  Ep 2 [2000/2306] Loss: 0.1072
+  Ep 2 [2020/2306] Loss: 0.0004
+  Ep 2 [2040/2306] Loss: 0.2066
+  Ep 2 [2060/2306] Loss: 0.5006
+  Ep 2 [2080/2306] Loss: 0.9180
+  Ep 2 [2100/2306] Loss: 0.5004
+  Ep 2 [2120/2306] Loss: 0.1357
+  Ep 2 [2140/2306] Loss: 0.5001
+  Ep 2 [2160/2306] Loss: 0.3232
+  Ep 2 [2180/2306] Loss: 0.8492
+  Ep 2 [2200/2306] Loss: 0.6441
+  Ep 2 [2220/2306] Loss: 0.0951
+  Ep 2 [2240/2306] Loss: 0.1672
+  Ep 2 [2260/2306] Loss: 0.0000
+  Ep 2 [2280/2306] Loss: 0.3313
+  Ep 2 [2300/2306] Loss: 0.3502
+Ep 2 Avg Loss: 0.4955
+Ep 2 Val Dice: 0.5539 | Total Pred Pixels: 290929
+  Ep 3 [20/2306] Loss: 0.3174
+  Ep 3 [40/2306] Loss: 0.8485
+  Ep 3 [60/2306] Loss: 0.7211
+  Ep 3 [80/2306] Loss: 0.9008
+  Ep 3 [100/2306] Loss: 0.4654
+  Ep 3 [120/2306] Loss: 0.1094
+  Ep 3 [140/2306] Loss: 0.4182
+  Ep 3 [160/2306] Loss: 0.0000
+  Ep 3 [180/2306] Loss: 0.5003
+  Ep 3 [200/2306] Loss: 0.8384
+  Ep 3 [220/2306] Loss: 0.7559
+  Ep 3 [240/2306] Loss: 0.2882
+  Ep 3 [260/2306] Loss: 0.0000
+  Ep 3 [280/2306] Loss: 0.0000
+  Ep 3 [300/2306] Loss: 0.5033
+  Ep 3 [320/2306] Loss: 0.5001
+  Ep 3 [340/2306] Loss: 0.1501
+  Ep 3 [360/2306] Loss: 0.3553
+  Ep 3 [380/2306] Loss: 0.2200
+  Ep 3 [400/2306] Loss: 0.1918
+  Ep 3 [420/2306] Loss: 0.6377
+  Ep 3 [440/2306] Loss: 0.4243
+  Ep 3 [460/2306] Loss: 0.2094
+  Ep 3 [480/2306] Loss: 0.5861
+  Ep 3 [500/2306] Loss: 0.2360
+  Ep 3 [520/2306] Loss: 0.0000
+  Ep 3 [540/2306] Loss: 0.5999
+  Ep 3 [560/2306] Loss: 0.5761
+  Ep 3 [580/2306] Loss: 0.6745
+  Ep 3 [600/2306] Loss: 1.0166
+  Ep 3 [620/2306] Loss: 0.1110
+  Ep 3 [640/2306] Loss: 1.2355
+  Ep 3 [660/2306] Loss: 1.2144
+  Ep 3 [680/2306] Loss: 0.2326
+  Ep 3 [700/2306] Loss: 0.8508
+  Ep 3 [720/2306] Loss: 0.5382
+  Ep 3 [740/2306] Loss: 0.2871
+  Ep 3 [760/2306] Loss: 1.3252
+  Ep 3 [780/2306] Loss: 0.3575
+  Ep 3 [800/2306] Loss: 0.3053
+  Ep 3 [820/2306] Loss: 0.7580
+  Ep 3 [840/2306] Loss: 0.0000
+  Ep 3 [860/2306] Loss: 0.1417
+  Ep 3 [880/2306] Loss: 0.1096
+  Ep 3 [900/2306] Loss: 0.6153
+  Ep 3 [920/2306] Loss: 0.1372
+  Ep 3 [940/2306] Loss: 0.1516
+  Ep 3 [960/2306] Loss: 1.3746
+  Ep 3 [980/2306] Loss: 0.6673
+  Ep 3 [1000/2306] Loss: 0.5717
+  Ep 3 [1020/2306] Loss: 0.5000
+  Ep 3 [1040/2306] Loss: 0.9821
+  Ep 3 [1060/2306] Loss: 0.0000
+  Ep 3 [1080/2306] Loss: 0.6665
+  Ep 3 [1100/2306] Loss: 0.5137
+  Ep 3 [1120/2306] Loss: 0.0001
+  Ep 3 [1140/2306] Loss: 0.2514
+  Ep 3 [1160/2306] Loss: 0.3739
+  Ep 3 [1180/2306] Loss: 0.1637
+  Ep 3 [1200/2306] Loss: 1.8972
+  Ep 3 [1220/2306] Loss: 0.5332
+  Ep 3 [1240/2306] Loss: 0.7956
+  Ep 3 [1260/2306] Loss: 0.3495
+  Ep 3 [1280/2306] Loss: 0.3960
+  Ep 3 [1300/2306] Loss: 0.3560
+  Ep 3 [1320/2306] Loss: 0.5001
+  Ep 3 [1340/2306] Loss: 0.2217
+  Ep 3 [1360/2306] Loss: 0.2442
+  Ep 3 [1380/2306] Loss: 0.1314
+  Ep 3 [1400/2306] Loss: 1.5630
+  Ep 3 [1420/2306] Loss: 0.5000
+  Ep 3 [1440/2306] Loss: 0.5000
+  Ep 3 [1460/2306] Loss: 0.3392
+  Ep 3 [1480/2306] Loss: 0.8765
+  Ep 3 [1500/2306] Loss: 1.2516
+  Ep 3 [1520/2306] Loss: 0.1631
+  Ep 3 [1540/2306] Loss: 0.1103
+  Ep 3 [1560/2306] Loss: 1.0839
+  Ep 3 [1580/2306] Loss: 0.0001
+  Ep 3 [1600/2306] Loss: 0.3518
+  Ep 3 [1620/2306] Loss: 0.2049
+  Ep 3 [1640/2306] Loss: 0.0000
+  Ep 3 [1660/2306] Loss: 0.6867
+  Ep 3 [1680/2306] Loss: 0.5522
+  Ep 3 [1700/2306] Loss: 0.0000
+  Ep 3 [1720/2306] Loss: 0.0000
+  Ep 3 [1740/2306] Loss: 0.6530
+  Ep 3 [1760/2306] Loss: 0.3769
+  Ep 3 [1780/2306] Loss: 0.2939
+  Ep 3 [1800/2306] Loss: 1.0000
+  Ep 3 [1820/2306] Loss: 1.0982
+  Ep 3 [1840/2306] Loss: 1.0001
+  Ep 3 [1860/2306] Loss: 0.7741
+  Ep 3 [1880/2306] Loss: 0.3418
+  Ep 3 [1900/2306] Loss: 0.4271
+  Ep 3 [1920/2306] Loss: 1.3666
+  Ep 3 [1940/2306] Loss: 1.2267
+  Ep 3 [1960/2306] Loss: 0.5228
+  Ep 3 [1980/2306] Loss: 0.6575
+  Ep 3 [2000/2306] Loss: 0.5003
+  Ep 3 [2020/2306] Loss: 0.1991
+  Ep 3 [2040/2306] Loss: 1.2160
+  Ep 3 [2060/2306] Loss: 0.1992
+  Ep 3 [2080/2306] Loss: 0.5004
+  Ep 3 [2100/2306] Loss: 0.2692
+  Ep 3 [2120/2306] Loss: 0.6122
+  Ep 3 [2140/2306] Loss: 0.8100
+  Ep 3 [2160/2306] Loss: 0.0000
+  Ep 3 [2180/2306] Loss: 0.0000
+  Ep 3 [2200/2306] Loss: 0.1916
+  Ep 3 [2220/2306] Loss: 0.2131
+  Ep 3 [2240/2306] Loss: 0.1309
+  Ep 3 [2260/2306] Loss: 0.0001
+  Ep 3 [2280/2306] Loss: 0.0000
+  Ep 3 [2300/2306] Loss: 0.8612
+Ep 3 Avg Loss: 0.4629
+Ep 3 Val Dice: 0.4897 | Total Pred Pixels: 1036298
+  Ep 4 [20/2306] Loss: 0.6158
+  Ep 4 [40/2306] Loss: 0.2563
+  Ep 4 [60/2306] Loss: 0.5001
+  Ep 4 [80/2306] Loss: 0.0000
+  Ep 4 [100/2306] Loss: 0.1528
+  Ep 4 [120/2306] Loss: 0.5000
+  Ep 4 [140/2306] Loss: 0.1030
+  Ep 4 [160/2306] Loss: 0.8857
+  Ep 4 [180/2306] Loss: 1.0495
+  Ep 4 [200/2306] Loss: 0.5001
+  Ep 4 [220/2306] Loss: 0.4956
+  Ep 4 [240/2306] Loss: 0.5000
+  Ep 4 [260/2306] Loss: 0.4156
+  Ep 4 [280/2306] Loss: 0.4996
+  Ep 4 [300/2306] Loss: 0.3913
+  Ep 4 [320/2306] Loss: 0.2357
+  Ep 4 [340/2306] Loss: 0.5730
+  Ep 4 [360/2306] Loss: 0.1022
+  Ep 4 [380/2306] Loss: 1.3084
+  Ep 4 [400/2306] Loss: 0.5119
+  Ep 4 [420/2306] Loss: 0.0000
+  Ep 4 [440/2306] Loss: 0.3693
+  Ep 4 [460/2306] Loss: 0.6470
+  Ep 4 [480/2306] Loss: 0.5001
+  Ep 4 [500/2306] Loss: 0.5807
+  Ep 4 [520/2306] Loss: 0.9630
+  Ep 4 [540/2306] Loss: 0.4207
+  Ep 4 [560/2306] Loss: 0.8518
+  Ep 4 [580/2306] Loss: 0.7858
+  Ep 4 [600/2306] Loss: 0.3891
+  Ep 4 [620/2306] Loss: 0.5004
+  Ep 4 [640/2306] Loss: 0.7769
+  Ep 4 [660/2306] Loss: 0.0000
+  Ep 4 [680/2306] Loss: 0.0000
+  Ep 4 [700/2306] Loss: 0.9743
+  Ep 4 [720/2306] Loss: 0.3432
+  Ep 4 [740/2306] Loss: 0.3392
+  Ep 4 [760/2306] Loss: 0.4283
+  Ep 4 [780/2306] Loss: 0.8129
+  Ep 4 [800/2306] Loss: 0.3337
+  Ep 4 [820/2306] Loss: 0.9533
+  Ep 4 [840/2306] Loss: 0.0000
+  Ep 4 [860/2306] Loss: 0.4999
+  Ep 4 [880/2306] Loss: 0.2518
+  Ep 4 [900/2306] Loss: 0.4925
+  Ep 4 [920/2306] Loss: 0.0000
+  Ep 4 [940/2306] Loss: 0.0786
+  Ep 4 [960/2306] Loss: 0.6211
+  Ep 4 [980/2306] Loss: 0.7102
+  Ep 4 [1000/2306] Loss: 0.1960
+  Ep 4 [1020/2306] Loss: 0.4183
+  Ep 4 [1040/2306] Loss: 0.5000
+  Ep 4 [1060/2306] Loss: 0.7889
+  Ep 4 [1080/2306] Loss: 0.0000
+  Ep 4 [1100/2306] Loss: 0.1838
+  Ep 4 [1120/2306] Loss: 0.0000
+  Ep 4 [1140/2306] Loss: 0.0000
+  Ep 4 [1160/2306] Loss: 0.0000
+  Ep 4 [1180/2306] Loss: 0.1082
+  Ep 4 [1200/2306] Loss: 0.4758
+  Ep 4 [1220/2306] Loss: 0.4588
+  Ep 4 [1240/2306] Loss: 0.1835
+  Ep 4 [1260/2306] Loss: 0.6564
+  Ep 4 [1280/2306] Loss: 1.3295
+  Ep 4 [1300/2306] Loss: 0.1695
+  Ep 4 [1320/2306] Loss: 0.2296
+  Ep 4 [1340/2306] Loss: 0.5369
+  Ep 4 [1360/2306] Loss: 1.2715
+  Ep 4 [1380/2306] Loss: 0.2214
+  Ep 4 [1400/2306] Loss: 0.4884
+  Ep 4 [1420/2306] Loss: 0.7750
+  Ep 4 [1440/2306] Loss: 0.9235
+  Ep 4 [1460/2306] Loss: 1.1244
+  Ep 4 [1480/2306] Loss: 0.0000
+  Ep 4 [1500/2306] Loss: 0.5851
+  Ep 4 [1520/2306] Loss: 0.3119
+  Ep 4 [1540/2306] Loss: 0.4092
+  Ep 4 [1560/2306] Loss: 0.3413
+  Ep 4 [1580/2306] Loss: 0.0746
+  Ep 4 [1600/2306] Loss: 0.2049
+  Ep 4 [1620/2306] Loss: 0.5753
+  Ep 4 [1640/2306] Loss: 0.9216
+  Ep 4 [1660/2306] Loss: 0.8870
+  Ep 4 [1680/2306] Loss: 0.4104
+  Ep 4 [1700/2306] Loss: 1.2474
+  Ep 4 [1720/2306] Loss: 0.1793
+  Ep 4 [1740/2306] Loss: 0.1127
+  Ep 4 [1760/2306] Loss: 0.0530
+  Ep 4 [1780/2306] Loss: 0.2785
+  Ep 4 [1800/2306] Loss: 0.1067
+  Ep 4 [1820/2306] Loss: 0.0000
+  Ep 4 [1840/2306] Loss: 0.6360
+  Ep 4 [1860/2306] Loss: 0.0710
+  Ep 4 [1880/2306] Loss: 0.5003
+  Ep 4 [1900/2306] Loss: 0.8623
+  Ep 4 [1920/2306] Loss: 0.4710
+  Ep 4 [1940/2306] Loss: 0.0004
+  Ep 4 [1960/2306] Loss: 0.8076
+  Ep 4 [1980/2306] Loss: 0.0000
+  Ep 4 [2000/2306] Loss: 0.2036
+  Ep 4 [2020/2306] Loss: 1.0420
+  Ep 4 [2040/2306] Loss: 0.9679
+  Ep 4 [2060/2306] Loss: 0.0000
+  Ep 4 [2080/2306] Loss: 0.5001
+  Ep 4 [2100/2306] Loss: 0.0000
+  Ep 4 [2120/2306] Loss: 1.0789
+  Ep 4 [2140/2306] Loss: 0.1138
+  Ep 4 [2160/2306] Loss: 0.1658
+  Ep 4 [2180/2306] Loss: 0.3333
+  Ep 4 [2200/2306] Loss: 0.0000
+  Ep 4 [2220/2306] Loss: 0.3741
+  Ep 4 [2240/2306] Loss: 0.6857
+  Ep 4 [2260/2306] Loss: 0.7194
+  Ep 4 [2280/2306] Loss: 0.1007
+  Ep 4 [2300/2306] Loss: 0.8862
+Ep 4 Avg Loss: 0.4578
+Ep 4 Val Dice: 0.6205 | Total Pred Pixels: 218882
+  >>> New Best Model (Dice: 0.6205)
+  Ep 5 [20/2306] Loss: 0.2147
+  Ep 5 [40/2306] Loss: 0.3658
+  Ep 5 [60/2306] Loss: 0.9298
+  Ep 5 [80/2306] Loss: 0.1096
+  Ep 5 [100/2306] Loss: 0.2326
+  Ep 5 [120/2306] Loss: 1.0587
+  Ep 5 [140/2306] Loss: 1.3980
+  Ep 5 [160/2306] Loss: 0.4616
+  Ep 5 [180/2306] Loss: 0.6365
+  Ep 5 [200/2306] Loss: 0.7849
+  Ep 5 [220/2306] Loss: 1.1124
+  Ep 5 [240/2306] Loss: 0.7723
+  Ep 5 [260/2306] Loss: 0.1610
+  Ep 5 [280/2306] Loss: 0.4039
+  Ep 5 [300/2306] Loss: 0.1138
+  Ep 5 [320/2306] Loss: 0.3446
+  Ep 5 [340/2306] Loss: 0.6749
+  Ep 5 [360/2306] Loss: 0.7561
+  Ep 5 [380/2306] Loss: 0.0000
+  Ep 5 [400/2306] Loss: 0.5437
+  Ep 5 [420/2306] Loss: 0.0000
+  Ep 5 [440/2306] Loss: 0.3492
+  Ep 5 [460/2306] Loss: 0.2417
+  Ep 5 [480/2306] Loss: 0.2424
+  Ep 5 [500/2306] Loss: 0.8783
+  Ep 5 [520/2306] Loss: 0.4947
+  Ep 5 [540/2306] Loss: 0.7597
+  Ep 5 [560/2306] Loss: 0.5000
+  Ep 5 [580/2306] Loss: 0.6667
+  Ep 5 [600/2306] Loss: 0.3480
+  Ep 5 [620/2306] Loss: 0.5000
+  Ep 5 [640/2306] Loss: 0.1991
+  Ep 5 [660/2306] Loss: 0.5001
+  Ep 5 [680/2306] Loss: 0.2564
+  Ep 5 [700/2306] Loss: 0.0001
+  Ep 5 [720/2306] Loss: 0.1117
+  Ep 5 [740/2306] Loss: 0.0644
+  Ep 5 [760/2306] Loss: 0.6909
+  Ep 5 [780/2306] Loss: 0.3777
+  Ep 5 [800/2306] Loss: 0.2321
+  Ep 5 [820/2306] Loss: 0.5000
+  Ep 5 [840/2306] Loss: 0.5005
+  Ep 5 [860/2306] Loss: 0.1524
+  Ep 5 [880/2306] Loss: 0.8058
+  Ep 5 [900/2306] Loss: 0.0000
+  Ep 5 [920/2306] Loss: 0.4197
+  Ep 5 [940/2306] Loss: 0.0000
+  Ep 5 [960/2306] Loss: 0.1208
+  Ep 5 [980/2306] Loss: 0.5842
+  Ep 5 [1000/2306] Loss: 0.0739
+  Ep 5 [1020/2306] Loss: 0.8406
+  Ep 5 [1040/2306] Loss: 0.8647
+  Ep 5 [1060/2306] Loss: 0.9783
+  Ep 5 [1080/2306] Loss: 0.5002
+  Ep 5 [1100/2306] Loss: 0.5488
+  Ep 5 [1120/2306] Loss: 0.0971
+  Ep 5 [1140/2306] Loss: 0.7028
+  Ep 5 [1160/2306] Loss: 0.0001
+  Ep 5 [1180/2306] Loss: 0.5272
+  Ep 5 [1200/2306] Loss: 1.0001
+  Ep 5 [1220/2306] Loss: 0.5362
+  Ep 5 [1240/2306] Loss: 0.2769
+  Ep 5 [1260/2306] Loss: 0.3022
+  Ep 5 [1280/2306] Loss: 0.3144
+  Ep 5 [1300/2306] Loss: 1.0869
+  Ep 5 [1320/2306] Loss: 0.1243
+  Ep 5 [1340/2306] Loss: 0.0000
+  Ep 5 [1360/2306] Loss: 0.9701
+  Ep 5 [1380/2306] Loss: 0.1076
+  Ep 5 [1400/2306] Loss: 0.3632
+  Ep 5 [1420/2306] Loss: 0.2735
+  Ep 5 [1440/2306] Loss: 0.3165
+  Ep 5 [1460/2306] Loss: 0.6418
+  Ep 5 [1480/2306] Loss: 0.5624
+  Ep 5 [1500/2306] Loss: 0.4830
+  Ep 5 [1520/2306] Loss: 0.2115
+  Ep 5 [1540/2306] Loss: 1.5792
+  Ep 5 [1560/2306] Loss: 0.9140
+  Ep 5 [1580/2306] Loss: 0.4353
+  Ep 5 [1600/2306] Loss: 0.2441
+  Ep 5 [1620/2306] Loss: 0.1356
+  Ep 5 [1640/2306] Loss: 0.5003
+  Ep 5 [1660/2306] Loss: 0.5493
+  Ep 5 [1680/2306] Loss: 0.4994
+  Ep 5 [1700/2306] Loss: 1.1206
+  Ep 5 [1720/2306] Loss: 0.3927
+  Ep 5 [1740/2306] Loss: 1.0000
+  Ep 5 [1760/2306] Loss: 0.1571
+  Ep 5 [1780/2306] Loss: 0.7226
+  Ep 5 [1800/2306] Loss: 0.5001
+  Ep 5 [1820/2306] Loss: 0.0000
+  Ep 5 [1840/2306] Loss: 0.2887
+  Ep 5 [1860/2306] Loss: 0.6935
+  Ep 5 [1880/2306] Loss: 0.1054
+  Ep 5 [1900/2306] Loss: 0.8234
+  Ep 5 [1920/2306] Loss: 0.2971
+  Ep 5 [1940/2306] Loss: 0.5000
+  Ep 5 [1960/2306] Loss: 0.0000
+  Ep 5 [1980/2306] Loss: 0.1261
+  Ep 5 [2000/2306] Loss: 0.0000
+  Ep 5 [2020/2306] Loss: 0.4108
+  Ep 5 [2040/2306] Loss: 0.3076
+  Ep 5 [2060/2306] Loss: 0.0000
+  Ep 5 [2080/2306] Loss: 0.0000
+  Ep 5 [2100/2306] Loss: 0.8649
+  Ep 5 [2120/2306] Loss: 0.2529
+  Ep 5 [2140/2306] Loss: 0.1675
+  Ep 5 [2160/2306] Loss: 0.2883
+  Ep 5 [2180/2306] Loss: 0.2816
+  Ep 5 [2200/2306] Loss: 0.7330
+  Ep 5 [2220/2306] Loss: 0.7789
+  Ep 5 [2240/2306] Loss: 0.6178
+  Ep 5 [2260/2306] Loss: 1.0666
+  Ep 5 [2280/2306] Loss: 0.2183
+  Ep 5 [2300/2306] Loss: 0.0000
+Ep 5 Avg Loss: 0.4505
+Ep 5 Val Dice: 0.5249 | Total Pred Pixels: 847719
+  Ep 6 [20/2306] Loss: 1.5112
+  Ep 6 [40/2306] Loss: 0.1933
+  Ep 6 [60/2306] Loss: 0.7371
+  Ep 6 [80/2306] Loss: 0.9434
+  Ep 6 [100/2306] Loss: 0.9998
+  Ep 6 [120/2306] Loss: 0.7994
+  Ep 6 [140/2306] Loss: 0.5062
+  Ep 6 [160/2306] Loss: 1.3679
+  Ep 6 [180/2306] Loss: 0.7687
+  Ep 6 [200/2306] Loss: 0.1712
+  Ep 6 [220/2306] Loss: 0.5775
+  Ep 6 [240/2306] Loss: 0.5319
+  Ep 6 [260/2306] Loss: 0.1237
+  Ep 6 [280/2306] Loss: 0.1491
+  Ep 6 [300/2306] Loss: 0.1437
+  Ep 6 [320/2306] Loss: 0.7679
+  Ep 6 [340/2306] Loss: 0.2323
+  Ep 6 [360/2306] Loss: 0.9366
+  Ep 6 [380/2306] Loss: 0.0000
+  Ep 6 [400/2306] Loss: 0.1616
+  Ep 6 [420/2306] Loss: 0.5798
+  Ep 6 [440/2306] Loss: 0.0004
+  Ep 6 [460/2306] Loss: 0.7104
+  Ep 6 [480/2306] Loss: 0.0483
+  Ep 6 [500/2306] Loss: 0.5000
+  Ep 6 [520/2306] Loss: 0.4219
+  Ep 6 [540/2306] Loss: 0.0000
+  Ep 6 [560/2306] Loss: 0.5000
+  Ep 6 [580/2306] Loss: 0.1957
+  Ep 6 [600/2306] Loss: 0.8089
+  Ep 6 [620/2306] Loss: 0.2638
+  Ep 6 [640/2306] Loss: 0.6875
+  Ep 6 [660/2306] Loss: 1.0003
+  Ep 6 [680/2306] Loss: 0.0854
+  Ep 6 [700/2306] Loss: 1.2079
+  Ep 6 [720/2306] Loss: 0.5000
+  Ep 6 [740/2306] Loss: 0.7791
+  Ep 6 [760/2306] Loss: 0.0403
+  Ep 6 [780/2306] Loss: 0.1910
+  Ep 6 [800/2306] Loss: 0.9233
+  Ep 6 [820/2306] Loss: 0.3028
+  Ep 6 [840/2306] Loss: 0.8779
+  Ep 6 [860/2306] Loss: 0.5005
+  Ep 6 [880/2306] Loss: 0.5012
+  Ep 6 [900/2306] Loss: 0.5000
+  Ep 6 [920/2306] Loss: 0.0000
+  Ep 6 [940/2306] Loss: 0.0000
+  Ep 6 [960/2306] Loss: 0.0000
+  Ep 6 [980/2306] Loss: 0.5000
+  Ep 6 [1000/2306] Loss: 0.3840
+  Ep 6 [1020/2306] Loss: 0.5001
+  Ep 6 [1040/2306] Loss: 0.0000
+  Ep 6 [1060/2306] Loss: 0.4814
+  Ep 6 [1080/2306] Loss: 0.2713
+  Ep 6 [1100/2306] Loss: 0.6628
+  Ep 6 [1120/2306] Loss: 0.0763
+  Ep 6 [1140/2306] Loss: 0.5797
+  Ep 6 [1160/2306] Loss: 0.1639
+  Ep 6 [1180/2306] Loss: 0.1266
+  Ep 6 [1200/2306] Loss: 0.4477
+  Ep 6 [1220/2306] Loss: 1.4297
+  Ep 6 [1240/2306] Loss: 0.5332
+  Ep 6 [1260/2306] Loss: 0.0000
+  Ep 6 [1280/2306] Loss: 0.0957
+  Ep 6 [1300/2306] Loss: 0.5001
+  Ep 6 [1320/2306] Loss: 0.0000
+  Ep 6 [1340/2306] Loss: 0.5930
+  Ep 6 [1360/2306] Loss: 0.1933
+  Ep 6 [1380/2306] Loss: 0.3082
+  Ep 6 [1400/2306] Loss: 0.4573
+  Ep 6 [1420/2306] Loss: 0.2323
+  Ep 6 [1440/2306] Loss: 0.3010
+  Ep 6 [1460/2306] Loss: 0.0000
+  Ep 6 [1480/2306] Loss: 0.5000
+  Ep 6 [1500/2306] Loss: 0.7359
+  Ep 6 [1520/2306] Loss: 0.0000
+  Ep 6 [1540/2306] Loss: 0.4990
+  Ep 6 [1560/2306] Loss: 1.4555
+  Ep 6 [1580/2306] Loss: 0.5655
+  Ep 6 [1600/2306] Loss: 0.4469
+  Ep 6 [1620/2306] Loss: 0.1415
+  Ep 6 [1640/2306] Loss: 0.0000
+  Ep 6 [1660/2306] Loss: 0.0843
+  Ep 6 [1680/2306] Loss: 0.5015
+  Ep 6 [1700/2306] Loss: 0.5000
+  Ep 6 [1720/2306] Loss: 0.1783
+  Ep 6 [1740/2306] Loss: 0.6584
+  Ep 6 [1760/2306] Loss: 0.3634
+  Ep 6 [1780/2306] Loss: 0.0000
+  Ep 6 [1800/2306] Loss: 0.3136
+  Ep 6 [1820/2306] Loss: 0.2136
+  Ep 6 [1840/2306] Loss: 0.9787
+  Ep 6 [1860/2306] Loss: 0.0000
+  Ep 6 [1880/2306] Loss: 0.9538
+  Ep 6 [1900/2306] Loss: 0.6743
+  Ep 6 [1920/2306] Loss: 0.0000
+  Ep 6 [1940/2306] Loss: 0.5096
+  Ep 6 [1960/2306] Loss: 0.0001
+  Ep 6 [1980/2306] Loss: 0.2012
+  Ep 6 [2000/2306] Loss: 0.0783
+  Ep 6 [2020/2306] Loss: 0.0514
+  Ep 6 [2040/2306] Loss: 0.0005
+  Ep 6 [2060/2306] Loss: 0.4446
+  Ep 6 [2080/2306] Loss: 0.2079
+  Ep 6 [2100/2306] Loss: 1.2620
+  Ep 6 [2120/2306] Loss: 0.4369
+  Ep 6 [2140/2306] Loss: 0.9888
+  Ep 6 [2160/2306] Loss: 0.0000
+  Ep 6 [2180/2306] Loss: 0.4685
+  Ep 6 [2200/2306] Loss: 0.1305
+  Ep 6 [2220/2306] Loss: 0.2723
+  Ep 6 [2240/2306] Loss: 0.2147
+  Ep 6 [2260/2306] Loss: 0.0000
+  Ep 6 [2280/2306] Loss: 0.0000
+  Ep 6 [2300/2306] Loss: 0.6668
+Ep 6 Avg Loss: 0.4211
+Ep 6 Val Dice: 0.6390 | Total Pred Pixels: 164215
+  >>> New Best Model (Dice: 0.6390)
+  Ep 7 [20/2306] Loss: 0.2558
+  Ep 7 [40/2306] Loss: 0.1759
+  Ep 7 [60/2306] Loss: 0.0000
+  Ep 7 [80/2306] Loss: 0.4308
+  Ep 7 [100/2306] Loss: 0.5016
+  Ep 7 [120/2306] Loss: 0.8637
+  Ep 7 [140/2306] Loss: 0.5470
+  Ep 7 [160/2306] Loss: 0.1902
+  Ep 7 [180/2306] Loss: 0.3582
+  Ep 7 [200/2306] Loss: 0.3546
+  Ep 7 [220/2306] Loss: 0.4546
+  Ep 7 [240/2306] Loss: 0.2805
+  Ep 7 [260/2306] Loss: 0.0000
+  Ep 7 [280/2306] Loss: 0.2285
+  Ep 7 [300/2306] Loss: 0.0000
+  Ep 7 [320/2306] Loss: 1.2907
+  Ep 7 [340/2306] Loss: 0.2208
+  Ep 7 [360/2306] Loss: 0.7957
+  Ep 7 [380/2306] Loss: 0.9390
+  Ep 7 [400/2306] Loss: 0.1758
+  Ep 7 [420/2306] Loss: 0.1795
+  Ep 7 [440/2306] Loss: 1.0007
+  Ep 7 [460/2306] Loss: 0.2667
+  Ep 7 [480/2306] Loss: 0.0000
+  Ep 7 [500/2306] Loss: 0.6117
+  Ep 7 [520/2306] Loss: 0.8473
+  Ep 7 [540/2306] Loss: 0.3452
+  Ep 7 [560/2306] Loss: 0.0000
+  Ep 7 [580/2306] Loss: 0.2139
+  Ep 7 [600/2306] Loss: 0.0000
+  Ep 7 [620/2306] Loss: 0.1692
+  Ep 7 [640/2306] Loss: 0.7830
+  Ep 7 [660/2306] Loss: 0.3463
+  Ep 7 [680/2306] Loss: 0.6305
+  Ep 7 [700/2306] Loss: 0.2220
+  Ep 7 [720/2306] Loss: 0.4941
+  Ep 7 [740/2306] Loss: 0.0000
+  Ep 7 [760/2306] Loss: 0.0797
+  Ep 7 [780/2306] Loss: 0.4278
+  Ep 7 [800/2306] Loss: 0.9464
+  Ep 7 [820/2306] Loss: 0.1585
+  Ep 7 [840/2306] Loss: 0.2265
+  Ep 7 [860/2306] Loss: 1.0001
+  Ep 7 [880/2306] Loss: 0.3719
+  Ep 7 [900/2306] Loss: 0.3645
+  Ep 7 [920/2306] Loss: 0.0785
+  Ep 7 [940/2306] Loss: 0.0000
+  Ep 7 [960/2306] Loss: 0.5401
+  Ep 7 [980/2306] Loss: 0.5546
+  Ep 7 [1000/2306] Loss: 0.8985
+  Ep 7 [1020/2306] Loss: 0.5948
+  Ep 7 [1040/2306] Loss: 0.6787
+  Ep 7 [1060/2306] Loss: 0.0000
+  Ep 7 [1080/2306] Loss: 0.5612
+  Ep 7 [1100/2306] Loss: 0.3114
+  Ep 7 [1120/2306] Loss: 0.2031
+  Ep 7 [1140/2306] Loss: 0.4171
+  Ep 7 [1160/2306] Loss: 0.1263
+  Ep 7 [1180/2306] Loss: 0.6863
+  Ep 7 [1200/2306] Loss: 0.2203
+  Ep 7 [1220/2306] Loss: 0.2218
+  Ep 7 [1240/2306] Loss: 0.5001
+  Ep 7 [1260/2306] Loss: 0.4104
+  Ep 7 [1280/2306] Loss: 0.2999
+  Ep 7 [1300/2306] Loss: 0.0743
+  Ep 7 [1320/2306] Loss: 0.3196
+  Ep 7 [1340/2306] Loss: 0.5694
+  Ep 7 [1360/2306] Loss: 0.0000
+  Ep 7 [1380/2306] Loss: 0.5896
+  Ep 7 [1400/2306] Loss: 0.0577
+  Ep 7 [1420/2306] Loss: 0.4104
+  Ep 7 [1440/2306] Loss: 1.0003
+  Ep 7 [1460/2306] Loss: 0.5000
+  Ep 7 [1480/2306] Loss: 1.3677
+  Ep 7 [1500/2306] Loss: 1.5004
+  Ep 7 [1520/2306] Loss: 0.7503
+  Ep 7 [1540/2306] Loss: 0.0000
+  Ep 7 [1560/2306] Loss: 0.6597
+  Ep 7 [1580/2306] Loss: 0.4672
+  Ep 7 [1600/2306] Loss: 0.0000
+  Ep 7 [1620/2306] Loss: 0.7305
+  Ep 7 [1640/2306] Loss: 1.1000
+  Ep 7 [1660/2306] Loss: 0.5311
+  Ep 7 [1680/2306] Loss: 1.5882
+  Ep 7 [1700/2306] Loss: 0.2913
+  Ep 7 [1720/2306] Loss: 0.6372
+  Ep 7 [1740/2306] Loss: 0.4738
+  Ep 7 [1760/2306] Loss: 0.1948
+  Ep 7 [1780/2306] Loss: 0.2494
+  Ep 7 [1800/2306] Loss: 0.3557
+  Ep 7 [1820/2306] Loss: 0.0000
+  Ep 7 [1840/2306] Loss: 0.5617
+  Ep 7 [1860/2306] Loss: 0.0751
+  Ep 7 [1880/2306] Loss: 0.1614
+  Ep 7 [1900/2306] Loss: 0.1150
+  Ep 7 [1920/2306] Loss: 0.0776
+  Ep 7 [1940/2306] Loss: 0.5000
+  Ep 7 [1960/2306] Loss: 0.3515
+  Ep 7 [1980/2306] Loss: 0.1043
+  Ep 7 [2000/2306] Loss: 0.5001
+  Ep 7 [2020/2306] Loss: 0.0000
+  Ep 7 [2040/2306] Loss: 0.1366
+  Ep 7 [2060/2306] Loss: 0.8860
+  Ep 7 [2080/2306] Loss: 0.0000
+  Ep 7 [2100/2306] Loss: 0.5841
+  Ep 7 [2120/2306] Loss: 1.1006
+  Ep 7 [2140/2306] Loss: 0.3887
+  Ep 7 [2160/2306] Loss: 0.5968
+  Ep 7 [2180/2306] Loss: 0.1948
+  Ep 7 [2200/2306] Loss: 0.0077
+  Ep 7 [2220/2306] Loss: 0.5001
+  Ep 7 [2240/2306] Loss: 0.2063
+  Ep 7 [2260/2306] Loss: 0.4976
+  Ep 7 [2280/2306] Loss: 0.0000
+  Ep 7 [2300/2306] Loss: 0.0000
+Ep 7 Avg Loss: 0.4330
+Ep 7 Val Dice: 0.6128 | Total Pred Pixels: 335585
+  Ep 8 [20/2306] Loss: 0.6267
+  Ep 8 [40/2306] Loss: 0.0800
+  Ep 8 [60/2306] Loss: 0.6231
+  Ep 8 [80/2306] Loss: 0.2546
+  Ep 8 [100/2306] Loss: 0.1569
+  Ep 8 [120/2306] Loss: 0.9715
+  Ep 8 [140/2306] Loss: 0.3589
+  Ep 8 [160/2306] Loss: 0.6944
+  Ep 8 [180/2306] Loss: 0.5838
+  Ep 8 [200/2306] Loss: 0.4861
+  Ep 8 [220/2306] Loss: 0.7356
+  Ep 8 [240/2306] Loss: 0.8207
+  Ep 8 [260/2306] Loss: 0.0000
+  Ep 8 [280/2306] Loss: 0.0000
+  Ep 8 [300/2306] Loss: 1.0004
+  Ep 8 [320/2306] Loss: 0.2549
+  Ep 8 [340/2306] Loss: 0.8480
+  Ep 8 [360/2306] Loss: 0.3116
+  Ep 8 [380/2306] Loss: 0.3349
+  Ep 8 [400/2306] Loss: 0.3086
+  Ep 8 [420/2306] Loss: 0.0003
+  Ep 8 [440/2306] Loss: 0.1929
+  Ep 8 [460/2306] Loss: 0.0001
+  Ep 8 [480/2306] Loss: 0.3319
+  Ep 8 [500/2306] Loss: 0.5000
+  Ep 8 [520/2306] Loss: 0.0000
+  Ep 8 [540/2306] Loss: 0.4872
+  Ep 8 [560/2306] Loss: 0.5000
+  Ep 8 [580/2306] Loss: 0.6904
+  Ep 8 [600/2306] Loss: 0.9427
+  Ep 8 [620/2306] Loss: 0.5000
+  Ep 8 [640/2306] Loss: 0.4701
+  Ep 8 [660/2306] Loss: 0.3872
+  Ep 8 [680/2306] Loss: 0.1557
+  Ep 8 [700/2306] Loss: 0.1199
+  Ep 8 [720/2306] Loss: 0.8252
+  Ep 8 [740/2306] Loss: 0.7480
+  Ep 8 [760/2306] Loss: 0.5000
+  Ep 8 [780/2306] Loss: 0.0000
+  Ep 8 [800/2306] Loss: 0.3292
+  Ep 8 [820/2306] Loss: 0.2673
+  Ep 8 [840/2306] Loss: 0.1196
+  Ep 8 [860/2306] Loss: 0.3631
+  Ep 8 [880/2306] Loss: 0.1995
+  Ep 8 [900/2306] Loss: 0.0000
+  Ep 8 [920/2306] Loss: 0.9536
+  Ep 8 [940/2306] Loss: 0.0000
+  Ep 8 [960/2306] Loss: 0.3500
+  Ep 8 [980/2306] Loss: 0.6157
+  Ep 8 [1000/2306] Loss: 0.0841
+  Ep 8 [1020/2306] Loss: 0.4409
+  Ep 8 [1040/2306] Loss: 0.6874
+  Ep 8 [1060/2306] Loss: 0.2500
+  Ep 8 [1080/2306] Loss: 0.6309
+  Ep 8 [1100/2306] Loss: 0.4164
+  Ep 8 [1120/2306] Loss: 0.7735
+  Ep 8 [1140/2306] Loss: 1.1988
+  Ep 8 [1160/2306] Loss: 1.1233
+  Ep 8 [1180/2306] Loss: 1.2165
+  Ep 8 [1200/2306] Loss: 0.2029
+  Ep 8 [1220/2306] Loss: 0.0891
+  Ep 8 [1240/2306] Loss: 0.5579
+  Ep 8 [1260/2306] Loss: 0.0577
+  Ep 8 [1280/2306] Loss: 0.6032
+  Ep 8 [1300/2306] Loss: 0.0000
+  Ep 8 [1320/2306] Loss: 0.4918
+  Ep 8 [1340/2306] Loss: 0.1757
+  Ep 8 [1360/2306] Loss: 0.0000
+  Ep 8 [1380/2306] Loss: 0.6099
+  Ep 8 [1400/2306] Loss: 0.8540
+  Ep 8 [1420/2306] Loss: 0.2270
+  Ep 8 [1440/2306] Loss: 0.5579
+  Ep 8 [1460/2306] Loss: 1.2340
+  Ep 8 [1480/2306] Loss: 0.4669
+  Ep 8 [1500/2306] Loss: 0.4640
+  Ep 8 [1520/2306] Loss: 0.4776
+  Ep 8 [1540/2306] Loss: 0.7801
+  Ep 8 [1560/2306] Loss: 0.0000
+  Ep 8 [1580/2306] Loss: 0.6665
+  Ep 8 [1600/2306] Loss: 1.0001
+  Ep 8 [1620/2306] Loss: 0.4189
+  Ep 8 [1640/2306] Loss: 0.0000
+  Ep 8 [1660/2306] Loss: 0.0921
+  Ep 8 [1680/2306] Loss: 0.1753
+  Ep 8 [1700/2306] Loss: 0.0000
+  Ep 8 [1720/2306] Loss: 0.0528
+  Ep 8 [1740/2306] Loss: 0.0000
+  Ep 8 [1760/2306] Loss: 0.3382
+  Ep 8 [1780/2306] Loss: 0.5001
+  Ep 8 [1800/2306] Loss: 0.1722
+  Ep 8 [1820/2306] Loss: 1.0148
+  Ep 8 [1840/2306] Loss: 0.1386
+  Ep 8 [1860/2306] Loss: 0.0000
+  Ep 8 [1880/2306] Loss: 0.6464
+  Ep 8 [1900/2306] Loss: 0.0000
+  Ep 8 [1920/2306] Loss: 0.5498
+  Ep 8 [1940/2306] Loss: 0.5000
+  Ep 8 [1960/2306] Loss: 0.4137
+  Ep 8 [1980/2306] Loss: 1.0001
+  Ep 8 [2000/2306] Loss: 0.6012
+  Ep 8 [2020/2306] Loss: 0.2903
+  Ep 8 [2040/2306] Loss: 1.0004
+  Ep 8 [2060/2306] Loss: 0.5000
+  Ep 8 [2080/2306] Loss: 0.5001
+  Ep 8 [2100/2306] Loss: 0.4462
+  Ep 8 [2120/2306] Loss: 0.8227
+  Ep 8 [2140/2306] Loss: 1.3589
+  Ep 8 [2160/2306] Loss: 0.2339
+  Ep 8 [2180/2306] Loss: 0.6178
+  Ep 8 [2200/2306] Loss: 0.4281
+  Ep 8 [2220/2306] Loss: 0.1868
+  Ep 8 [2240/2306] Loss: 0.1615
+  Ep 8 [2260/2306] Loss: 0.0940
+  Ep 8 [2280/2306] Loss: 0.7136
+  Ep 8 [2300/2306] Loss: 1.0691
+Ep 8 Avg Loss: 0.4324
+Ep 8 Val Dice: 0.5404 | Total Pred Pixels: 577219
+  Ep 9 [20/2306] Loss: 0.0000
+  Ep 9 [40/2306] Loss: 0.1955
+  Ep 9 [60/2306] Loss: 0.1035
+  Ep 9 [80/2306] Loss: 0.3243
+  Ep 9 [100/2306] Loss: 0.8478
+  Ep 9 [120/2306] Loss: 0.2226
+  Ep 9 [140/2306] Loss: 0.1182
+  Ep 9 [160/2306] Loss: 0.2931
+  Ep 9 [180/2306] Loss: 1.2427
+  Ep 9 [200/2306] Loss: 0.3272
+  Ep 9 [220/2306] Loss: 0.1143
+  Ep 9 [240/2306] Loss: 0.7595
+  Ep 9 [260/2306] Loss: 0.1229
+  Ep 9 [280/2306] Loss: 0.7739
+  Ep 9 [300/2306] Loss: 0.5001
+  Ep 9 [320/2306] Loss: 0.5853
+  Ep 9 [340/2306] Loss: 0.5000
+  Ep 9 [360/2306] Loss: 0.0000
+  Ep 9 [380/2306] Loss: 0.0000
+  Ep 9 [400/2306] Loss: 0.0923
+  Ep 9 [420/2306] Loss: 0.7364
+  Ep 9 [440/2306] Loss: 0.5079
+  Ep 9 [460/2306] Loss: 0.1981
+  Ep 9 [480/2306] Loss: 0.2816
+  Ep 9 [500/2306] Loss: 1.2234
+  Ep 9 [520/2306] Loss: 0.0000
+  Ep 9 [540/2306] Loss: 1.0585
+  Ep 9 [560/2306] Loss: 0.0443
+  Ep 9 [580/2306] Loss: 0.6354
+  Ep 9 [600/2306] Loss: 0.9112
+  Ep 9 [620/2306] Loss: 0.2016
+  Ep 9 [640/2306] Loss: 0.2294
+  Ep 9 [660/2306] Loss: 0.0000
+  Ep 9 [680/2306] Loss: 0.5000
+  Ep 9 [700/2306] Loss: 0.1641
+  Ep 9 [720/2306] Loss: 0.1842
+  Ep 9 [740/2306] Loss: 0.2273
+  Ep 9 [760/2306] Loss: 0.0000
+  Ep 9 [780/2306] Loss: 0.0902
+  Ep 9 [800/2306] Loss: 0.2150
+  Ep 9 [820/2306] Loss: 1.0749
+  Ep 9 [840/2306] Loss: 1.1115
+  Ep 9 [860/2306] Loss: 0.2074
+  Ep 9 [880/2306] Loss: 0.4575
+  Ep 9 [900/2306] Loss: 0.0000
+  Ep 9 [920/2306] Loss: 0.0000
+  Ep 9 [940/2306] Loss: 0.5000
+  Ep 9 [960/2306] Loss: 0.0000
+  Ep 9 [980/2306] Loss: 0.0000
+  Ep 9 [1000/2306] Loss: 0.0000
+  Ep 9 [1020/2306] Loss: 0.2481
+  Ep 9 [1040/2306] Loss: 0.2774
+  Ep 9 [1060/2306] Loss: 0.3927
+  Ep 9 [1080/2306] Loss: 1.0889
+  Ep 9 [1100/2306] Loss: 0.1507
+  Ep 9 [1120/2306] Loss: 0.5002
+  Ep 9 [1140/2306] Loss: 0.2466
+  Ep 9 [1160/2306] Loss: 0.2323
+  Ep 9 [1180/2306] Loss: 0.7160
+  Ep 9 [1200/2306] Loss: 0.1725
+  Ep 9 [1220/2306] Loss: 1.1595
+  Ep 9 [1240/2306] Loss: 0.7203
+  Ep 9 [1260/2306] Loss: 0.2887
+  Ep 9 [1280/2306] Loss: 0.0000
+  Ep 9 [1300/2306] Loss: 0.0749
+  Ep 9 [1320/2306] Loss: 0.9997
+  Ep 9 [1340/2306] Loss: 0.1302
+  Ep 9 [1360/2306] Loss: 0.0000
+  Ep 9 [1380/2306] Loss: 0.1979
+  Ep 9 [1400/2306] Loss: 0.0000
+  Ep 9 [1420/2306] Loss: 0.7422
+  Ep 9 [1440/2306] Loss: 0.5714
+  Ep 9 [1460/2306] Loss: 1.0113
+  Ep 9 [1480/2306] Loss: 0.0005
+  Ep 9 [1500/2306] Loss: 0.5001
+  Ep 9 [1520/2306] Loss: 0.4131
+  Ep 9 [1540/2306] Loss: 0.7957
+  Ep 9 [1560/2306] Loss: 1.1805
+  Ep 9 [1580/2306] Loss: 0.2449
+  Ep 9 [1600/2306] Loss: 1.0451
+  Ep 9 [1620/2306] Loss: 0.0000
+  Ep 9 [1640/2306] Loss: 0.1765
+  Ep 9 [1660/2306] Loss: 0.5001
+  Ep 9 [1680/2306] Loss: 0.6181
+  Ep 9 [1700/2306] Loss: 0.1250
+  Ep 9 [1720/2306] Loss: 0.5000
+  Ep 9 [1740/2306] Loss: 0.1961
+  Ep 9 [1760/2306] Loss: 0.9022
+  Ep 9 [1780/2306] Loss: 0.0000
+  Ep 9 [1800/2306] Loss: 0.1087
+  Ep 9 [1820/2306] Loss: 0.3449
+  Ep 9 [1840/2306] Loss: 0.1948
+  Ep 9 [1860/2306] Loss: 0.0000
+  Ep 9 [1880/2306] Loss: 1.0001
+  Ep 9 [1900/2306] Loss: 0.0000
+  Ep 9 [1920/2306] Loss: 0.1612
+  Ep 9 [1940/2306] Loss: 0.1465
+  Ep 9 [1960/2306] Loss: 0.6381
+  Ep 9 [1980/2306] Loss: 0.5404
+  Ep 9 [2000/2306] Loss: 0.8014
+  Ep 9 [2020/2306] Loss: 0.8077
+  Ep 9 [2040/2306] Loss: 0.2084
+  Ep 9 [2060/2306] Loss: 0.6354
+  Ep 9 [2080/2306] Loss: 0.1541
+  Ep 9 [2100/2306] Loss: 0.1552
+  Ep 9 [2120/2306] Loss: 0.6863
+  Ep 9 [2140/2306] Loss: 0.4630
+  Ep 9 [2160/2306] Loss: 0.6106
+  Ep 9 [2180/2306] Loss: 0.0000
+  Ep 9 [2200/2306] Loss: 0.1745
+  Ep 9 [2220/2306] Loss: 0.4815
+  Ep 9 [2240/2306] Loss: 0.5000
+  Ep 9 [2260/2306] Loss: 0.3143
+  Ep 9 [2280/2306] Loss: 0.0000
+  Ep 9 [2300/2306] Loss: 0.6596
+Ep 9 Avg Loss: 0.4039
+Ep 9 Val Dice: 0.6313 | Total Pred Pixels: 380655
+  Ep 10 [20/2306] Loss: 1.4076
+  Ep 10 [40/2306] Loss: 0.3779
+  Ep 10 [60/2306] Loss: 0.7974
+  Ep 10 [80/2306] Loss: 1.2247
+  Ep 10 [100/2306] Loss: 0.0000
+  Ep 10 [120/2306] Loss: 0.1521
+  Ep 10 [140/2306] Loss: 0.0000
+  Ep 10 [160/2306] Loss: 0.3979
+  Ep 10 [180/2306] Loss: 0.0861
+  Ep 10 [200/2306] Loss: 0.2408
+  Ep 10 [220/2306] Loss: 0.0828
+  Ep 10 [240/2306] Loss: 0.5000
+  Ep 10 [260/2306] Loss: 0.5001
+  Ep 10 [280/2306] Loss: 1.0001
+  Ep 10 [300/2306] Loss: 0.2576
+  Ep 10 [320/2306] Loss: 0.0000
+  Ep 10 [340/2306] Loss: 0.8535
+  Ep 10 [360/2306] Loss: 0.0000
+  Ep 10 [380/2306] Loss: 1.4392
+  Ep 10 [400/2306] Loss: 1.0000
+  Ep 10 [420/2306] Loss: 0.2997
+  Ep 10 [440/2306] Loss: 0.6898
+  Ep 10 [460/2306] Loss: 0.2046
+  Ep 10 [480/2306] Loss: 0.7447
+  Ep 10 [500/2306] Loss: 0.5000
+  Ep 10 [520/2306] Loss: 0.8805
+  Ep 10 [540/2306] Loss: 0.2767
+  Ep 10 [560/2306] Loss: 0.8481
+  Ep 10 [580/2306] Loss: 0.7884
+  Ep 10 [600/2306] Loss: 0.2662
+  Ep 10 [620/2306] Loss: 0.2045
+  Ep 10 [640/2306] Loss: 0.5177
+  Ep 10 [660/2306] Loss: 0.5000
+  Ep 10 [680/2306] Loss: 0.0000
+  Ep 10 [700/2306] Loss: 0.8170
+  Ep 10 [720/2306] Loss: 0.1040
+  Ep 10 [740/2306] Loss: 0.2944
+  Ep 10 [760/2306] Loss: 0.0000
+  Ep 10 [780/2306] Loss: 0.0000
+  Ep 10 [800/2306] Loss: 0.5000
+  Ep 10 [820/2306] Loss: 0.1576
+  Ep 10 [840/2306] Loss: 0.4066
+  Ep 10 [860/2306] Loss: 0.6950
+  Ep 10 [880/2306] Loss: 0.5226
+  Ep 10 [900/2306] Loss: 0.3382
+  Ep 10 [920/2306] Loss: 0.3666
+  Ep 10 [940/2306] Loss: 0.2176
+  Ep 10 [960/2306] Loss: 0.2166
+  Ep 10 [980/2306] Loss: 0.3440
+  Ep 10 [1000/2306] Loss: 0.8765
+  Ep 10 [1020/2306] Loss: 0.1977
+  Ep 10 [1040/2306] Loss: 0.3116
+  Ep 10 [1060/2306] Loss: 0.4564
+  Ep 10 [1080/2306] Loss: 0.2234
+  Ep 10 [1100/2306] Loss: 0.0000
+  Ep 10 [1120/2306] Loss: 0.1459
+  Ep 10 [1140/2306] Loss: 0.0000
+  Ep 10 [1160/2306] Loss: 0.3265
+  Ep 10 [1180/2306] Loss: 0.8380
+  Ep 10 [1200/2306] Loss: 0.6428
+  Ep 10 [1220/2306] Loss: 0.0943
+  Ep 10 [1240/2306] Loss: 0.8078
+  Ep 10 [1260/2306] Loss: 0.5435
+  Ep 10 [1280/2306] Loss: 0.7881
+  Ep 10 [1300/2306] Loss: 0.3964
+  Ep 10 [1320/2306] Loss: 0.5702
+  Ep 10 [1340/2306] Loss: 0.6263
+  Ep 10 [1360/2306] Loss: 0.5266
+  Ep 10 [1380/2306] Loss: 0.0000
+  Ep 10 [1400/2306] Loss: 0.0000
+  Ep 10 [1420/2306] Loss: 0.0904
+  Ep 10 [1440/2306] Loss: 0.1407
+  Ep 10 [1460/2306] Loss: 0.2158
+  Ep 10 [1480/2306] Loss: 0.6184
+  Ep 10 [1500/2306] Loss: 0.7394
+  Ep 10 [1520/2306] Loss: 0.7549
+  Ep 10 [1540/2306] Loss: 0.3344
+  Ep 10 [1560/2306] Loss: 0.4596
+  Ep 10 [1580/2306] Loss: 0.7335
+  Ep 10 [1600/2306] Loss: 0.0000
+  Ep 10 [1620/2306] Loss: 0.4550
+  Ep 10 [1640/2306] Loss: 0.5000
+  Ep 10 [1660/2306] Loss: 0.6056
+  Ep 10 [1680/2306] Loss: 0.5000
+  Ep 10 [1700/2306] Loss: 0.0000
+  Ep 10 [1720/2306] Loss: 1.1306
+  Ep 10 [1740/2306] Loss: 0.7534
+  Ep 10 [1760/2306] Loss: 0.5000
+  Ep 10 [1780/2306] Loss: 0.2829
+  Ep 10 [1800/2306] Loss: 0.6142
+  Ep 10 [1820/2306] Loss: 0.6043
+  Ep 10 [1840/2306] Loss: 0.2664
+  Ep 10 [1860/2306] Loss: 0.8485
+  Ep 10 [1880/2306] Loss: 0.0744
+  Ep 10 [1900/2306] Loss: 0.0000
+  Ep 10 [1920/2306] Loss: 0.8642
+  Ep 10 [1940/2306] Loss: 0.5002
+  Ep 10 [1960/2306] Loss: 0.6169
+  Ep 10 [1980/2306] Loss: 1.0877
+  Ep 10 [2000/2306] Loss: 0.5983
+  Ep 10 [2020/2306] Loss: 0.6671
+  Ep 10 [2040/2306] Loss: 0.1235
+  Ep 10 [2060/2306] Loss: 0.6148
+  Ep 10 [2080/2306] Loss: 0.1515
+  Ep 10 [2100/2306] Loss: 0.2502
+  Ep 10 [2120/2306] Loss: 0.0000
+  Ep 10 [2140/2306] Loss: 0.5001
+  Ep 10 [2160/2306] Loss: 0.0785
+  Ep 10 [2180/2306] Loss: 0.1209
+  Ep 10 [2200/2306] Loss: 0.3051
+  Ep 10 [2220/2306] Loss: 0.2564
+  Ep 10 [2240/2306] Loss: 0.0000
+  Ep 10 [2260/2306] Loss: 0.0000
+  Ep 10 [2280/2306] Loss: 0.1023
+  Ep 10 [2300/2306] Loss: 0.3339
+Ep 10 Avg Loss: 0.4105
+Ep 10 Val Dice: 0.6103 | Total Pred Pixels: 403278
+  Ep 11 [20/2306] Loss: 0.0000
+  Ep 11 [40/2306] Loss: 0.5001
+  Ep 11 [60/2306] Loss: 0.5099
+  Ep 11 [80/2306] Loss: 0.5782
+  Ep 11 [100/2306] Loss: 0.0799
+  Ep 11 [120/2306] Loss: 0.9531
+  Ep 11 [140/2306] Loss: 0.1730
+  Ep 11 [160/2306] Loss: 0.1452
+  Ep 11 [180/2306] Loss: 0.0000
+  Ep 11 [200/2306] Loss: 0.2617
+  Ep 11 [220/2306] Loss: 0.3706
+  Ep 11 [240/2306] Loss: 0.6413
+  Ep 11 [260/2306] Loss: 0.4341
+  Ep 11 [280/2306] Loss: 0.4292
+  Ep 11 [300/2306] Loss: 0.3207
+  Ep 11 [320/2306] Loss: 0.6293
+  Ep 11 [340/2306] Loss: 0.0001
+  Ep 11 [360/2306] Loss: 0.7517
+  Ep 11 [380/2306] Loss: 0.8042
+  Ep 11 [400/2306] Loss: 0.7489
+  Ep 11 [420/2306] Loss: 0.1262
+  Ep 11 [440/2306] Loss: 0.1584
+  Ep 11 [460/2306] Loss: 0.5200
+  Ep 11 [480/2306] Loss: 0.2346
+  Ep 11 [500/2306] Loss: 0.9329
+  Ep 11 [520/2306] Loss: 0.5001
+  Ep 11 [540/2306] Loss: 0.8248
+  Ep 11 [560/2306] Loss: 0.0650
+  Ep 11 [580/2306] Loss: 0.8762
+  Ep 11 [600/2306] Loss: 0.5002
+  Ep 11 [620/2306] Loss: 0.0000
+  Ep 11 [640/2306] Loss: 0.0000
+  Ep 11 [660/2306] Loss: 0.0001
+  Ep 11 [680/2306] Loss: 0.1485
+  Ep 11 [700/2306] Loss: 0.5640
+  Ep 11 [720/2306] Loss: 0.3330
+  Ep 11 [740/2306] Loss: 0.1110
+  Ep 11 [760/2306] Loss: 0.0000
+  Ep 11 [780/2306] Loss: 1.5042
+  Ep 11 [800/2306] Loss: 0.2108
+  Ep 11 [820/2306] Loss: 0.1027
+  Ep 11 [840/2306] Loss: 0.3323
+  Ep 11 [860/2306] Loss: 0.1741
+  Ep 11 [880/2306] Loss: 0.5016
+  Ep 11 [900/2306] Loss: 0.0000
+  Ep 11 [920/2306] Loss: 0.0000
+  Ep 11 [940/2306] Loss: 0.1025
+  Ep 11 [960/2306] Loss: 0.0948
+  Ep 11 [980/2306] Loss: 0.3099
+  Ep 11 [1000/2306] Loss: 0.1098
+  Ep 11 [1020/2306] Loss: 0.0000
+  Ep 11 [1040/2306] Loss: 1.1909
+  Ep 11 [1060/2306] Loss: 0.1552
+  Ep 11 [1080/2306] Loss: 0.7252
+  Ep 11 [1100/2306] Loss: 0.7932
+  Ep 11 [1120/2306] Loss: 1.0422
+  Ep 11 [1140/2306] Loss: 0.2375
+  Ep 11 [1160/2306] Loss: 0.2558
+  Ep 11 [1180/2306] Loss: 0.1325
+  Ep 11 [1200/2306] Loss: 0.5004
+  Ep 11 [1220/2306] Loss: 0.2385
+  Ep 11 [1240/2306] Loss: 0.2975
+  Ep 11 [1260/2306] Loss: 0.7428
+  Ep 11 [1280/2306] Loss: 0.6781
+  Ep 11 [1300/2306] Loss: 1.0001
+  Ep 11 [1320/2306] Loss: 0.5000
+  Ep 11 [1340/2306] Loss: 0.0001
+  Ep 11 [1360/2306] Loss: 0.2529
+  Ep 11 [1380/2306] Loss: 0.3374
+  Ep 11 [1400/2306] Loss: 0.3077
+  Ep 11 [1420/2306] Loss: 0.5358
+  Ep 11 [1440/2306] Loss: 1.0879
+  Ep 11 [1460/2306] Loss: 0.1490
+  Ep 11 [1480/2306] Loss: 0.0000
+  Ep 11 [1500/2306] Loss: 0.0000
+  Ep 11 [1520/2306] Loss: 0.0668
+  Ep 11 [1540/2306] Loss: 0.1831
+  Ep 11 [1560/2306] Loss: 0.7105
+  Ep 11 [1580/2306] Loss: 0.2516
+  Ep 11 [1600/2306] Loss: 1.1107
+  Ep 11 [1620/2306] Loss: 0.5960
+  Ep 11 [1640/2306] Loss: 1.0037
+  Ep 11 [1660/2306] Loss: 0.0825
+  Ep 11 [1680/2306] Loss: 0.1399
+  Ep 11 [1700/2306] Loss: 0.0000
+  Ep 11 [1720/2306] Loss: 0.4287
+  Ep 11 [1740/2306] Loss: 0.5000
+  Ep 11 [1760/2306] Loss: 1.0001
+  Ep 11 [1780/2306] Loss: 0.0844
+  Ep 11 [1800/2306] Loss: 0.5000
+  Ep 11 [1820/2306] Loss: 1.0142
+  Ep 11 [1840/2306] Loss: 1.0661
+  Ep 11 [1860/2306] Loss: 0.2865
+  Ep 11 [1880/2306] Loss: 0.0000
+  Ep 11 [1900/2306] Loss: 0.7722
+  Ep 11 [1920/2306] Loss: 0.0948
+  Ep 11 [1940/2306] Loss: 1.1417
+  Ep 11 [1960/2306] Loss: 0.4006
+  Ep 11 [1980/2306] Loss: 0.2880
+  Ep 11 [2000/2306] Loss: 0.4557
+  Ep 11 [2020/2306] Loss: 0.7232
+  Ep 11 [2040/2306] Loss: 0.1660
+  Ep 11 [2060/2306] Loss: 0.1786
+  Ep 11 [2080/2306] Loss: 0.1595
+  Ep 11 [2100/2306] Loss: 0.5004
+  Ep 11 [2120/2306] Loss: 0.6337
+  Ep 11 [2140/2306] Loss: 0.5000
+  Ep 11 [2160/2306] Loss: 0.7063
+  Ep 11 [2180/2306] Loss: 0.7446
+  Ep 11 [2200/2306] Loss: 0.4429
+  Ep 11 [2220/2306] Loss: 0.0000
+  Ep 11 [2240/2306] Loss: 0.5001
+  Ep 11 [2260/2306] Loss: 0.0726
+  Ep 11 [2280/2306] Loss: 0.4282
+  Ep 11 [2300/2306] Loss: 0.0000
+Ep 11 Avg Loss: 0.3814
+Ep 11 Val Dice: 0.6518 | Total Pred Pixels: 167818
+  >>> New Best Model (Dice: 0.6518)
+  Ep 12 [20/2306] Loss: 0.1120
+  Ep 12 [40/2306] Loss: 0.0935
+  Ep 12 [60/2306] Loss: 0.0000
+  Ep 12 [80/2306] Loss: 0.0001
+  Ep 12 [100/2306] Loss: 0.4282
+  Ep 12 [120/2306] Loss: 0.3930
+  Ep 12 [140/2306] Loss: 0.0000
+  Ep 12 [160/2306] Loss: 0.3224
+  Ep 12 [180/2306] Loss: 0.4372
+  Ep 12 [200/2306] Loss: 0.4018
+  Ep 12 [220/2306] Loss: 0.5667
+  Ep 12 [240/2306] Loss: 0.6613
+  Ep 12 [260/2306] Loss: 0.2910
+  Ep 12 [280/2306] Loss: 0.5001
+  Ep 12 [300/2306] Loss: 0.4828
+  Ep 12 [320/2306] Loss: 0.4112
+  Ep 12 [340/2306] Loss: 0.4163
+  Ep 12 [360/2306] Loss: 0.6678
+  Ep 12 [380/2306] Loss: 0.4437
+  Ep 12 [400/2306] Loss: 0.2173
+  Ep 12 [420/2306] Loss: 0.5001
+  Ep 12 [440/2306] Loss: 0.2550
+  Ep 12 [460/2306] Loss: 0.1456
+  Ep 12 [480/2306] Loss: 0.1343
+  Ep 12 [500/2306] Loss: 0.2549
+  Ep 12 [520/2306] Loss: 0.9895
+  Ep 12 [540/2306] Loss: 0.4684
+  Ep 12 [560/2306] Loss: 0.0753
+  Ep 12 [580/2306] Loss: 0.6416
+  Ep 12 [600/2306] Loss: 0.3400
+  Ep 12 [620/2306] Loss: 0.2359
+  Ep 12 [640/2306] Loss: 0.6629
+  Ep 12 [660/2306] Loss: 0.3902
+  Ep 12 [680/2306] Loss: 0.3317
+  Ep 12 [700/2306] Loss: 0.0000
+  Ep 12 [720/2306] Loss: 0.8212
+  Ep 12 [740/2306] Loss: 0.6719
+  Ep 12 [760/2306] Loss: 0.7088
+  Ep 12 [780/2306] Loss: 0.7465
+  Ep 12 [800/2306] Loss: 0.3353
+  Ep 12 [820/2306] Loss: 0.2784
+  Ep 12 [840/2306] Loss: 0.9428
+  Ep 12 [860/2306] Loss: 0.0000
+  Ep 12 [880/2306] Loss: 0.4648
+  Ep 12 [900/2306] Loss: 0.9066
+  Ep 12 [920/2306] Loss: 0.0000
+  Ep 12 [940/2306] Loss: 0.2853
+  Ep 12 [960/2306] Loss: 0.0000
+  Ep 12 [980/2306] Loss: 0.1930
+  Ep 12 [1000/2306] Loss: 0.0000
+  Ep 12 [1020/2306] Loss: 0.0728
+  Ep 12 [1040/2306] Loss: 0.3680
+  Ep 12 [1060/2306] Loss: 0.5000
+  Ep 12 [1080/2306] Loss: 0.3299
+  Ep 12 [1100/2306] Loss: 1.2286
+  Ep 12 [1120/2306] Loss: 0.3425
+  Ep 12 [1140/2306] Loss: 0.0000
+  Ep 12 [1160/2306] Loss: 0.5712
+  Ep 12 [1180/2306] Loss: 0.6756
+  Ep 12 [1200/2306] Loss: 0.5483
+  Ep 12 [1220/2306] Loss: 0.5002
+  Ep 12 [1240/2306] Loss: 0.0000
+  Ep 12 [1260/2306] Loss: 0.0000
+  Ep 12 [1280/2306] Loss: 0.3636
+  Ep 12 [1300/2306] Loss: 0.1386
+  Ep 12 [1320/2306] Loss: 0.5001
+  Ep 12 [1340/2306] Loss: 0.7335
+  Ep 12 [1360/2306] Loss: 0.5001
+  Ep 12 [1380/2306] Loss: 0.4506
+  Ep 12 [1400/2306] Loss: 0.4972
+  Ep 12 [1420/2306] Loss: 0.0770
+  Ep 12 [1440/2306] Loss: 0.0000
+  Ep 12 [1460/2306] Loss: 0.5000
+  Ep 12 [1480/2306] Loss: 0.0000
+  Ep 12 [1500/2306] Loss: 0.0849
+  Ep 12 [1520/2306] Loss: 0.9237
+  Ep 12 [1540/2306] Loss: 0.3707
+  Ep 12 [1560/2306] Loss: 0.0640
+  Ep 12 [1580/2306] Loss: 0.6502
+  Ep 12 [1600/2306] Loss: 0.2569
+  Ep 12 [1620/2306] Loss: 0.2806
+  Ep 12 [1640/2306] Loss: 0.5000
+  Ep 12 [1660/2306] Loss: 0.5000
+  Ep 12 [1680/2306] Loss: 1.0008
+  Ep 12 [1700/2306] Loss: 0.0592
+  Ep 12 [1720/2306] Loss: 0.0000
+  Ep 12 [1740/2306] Loss: 0.5001
+  Ep 12 [1760/2306] Loss: 0.1130
+  Ep 12 [1780/2306] Loss: 0.0000
+  Ep 12 [1800/2306] Loss: 0.4997
+  Ep 12 [1820/2306] Loss: 0.2231
+  Ep 12 [1840/2306] Loss: 0.0000
+  Ep 12 [1860/2306] Loss: 0.1893
+  Ep 12 [1880/2306] Loss: 0.6063
+  Ep 12 [1900/2306] Loss: 0.3744
+  Ep 12 [1920/2306] Loss: 0.5000
+  Ep 12 [1940/2306] Loss: 0.8607
+  Ep 12 [1960/2306] Loss: 0.4173
+  Ep 12 [1980/2306] Loss: 0.1983
+  Ep 12 [2000/2306] Loss: 1.1593
+  Ep 12 [2020/2306] Loss: 0.3301
+  Ep 12 [2040/2306] Loss: 0.0573
+  Ep 12 [2060/2306] Loss: 0.0000
+  Ep 12 [2080/2306] Loss: 0.0927
+  Ep 12 [2100/2306] Loss: 0.0626
+  Ep 12 [2120/2306] Loss: 0.0000
+  Ep 12 [2140/2306] Loss: 0.5490
+  Ep 12 [2160/2306] Loss: 0.0000
+  Ep 12 [2180/2306] Loss: 0.0710
+  Ep 12 [2200/2306] Loss: 0.9536
+  Ep 12 [2220/2306] Loss: 0.3031
+  Ep 12 [2240/2306] Loss: 0.8302
+  Ep 12 [2260/2306] Loss: 0.0000
+  Ep 12 [2280/2306] Loss: 0.7898
+  Ep 12 [2300/2306] Loss: 0.0000
+Ep 12 Avg Loss: 0.3747
+Ep 12 Val Dice: 0.6144 | Total Pred Pixels: 387659
+  Ep 13 [20/2306] Loss: 0.0000
+  Ep 13 [40/2306] Loss: 0.0712
+  Ep 13 [60/2306] Loss: 0.0984
+  Ep 13 [80/2306] Loss: 0.3630
+  Ep 13 [100/2306] Loss: 0.5000
+  Ep 13 [120/2306] Loss: 0.3583
+  Ep 13 [140/2306] Loss: 1.7654
+  Ep 13 [160/2306] Loss: 0.4619
+  Ep 13 [180/2306] Loss: 0.0000
+  Ep 13 [200/2306] Loss: 0.0000
+  Ep 13 [220/2306] Loss: 0.3660
+  Ep 13 [240/2306] Loss: 0.2002
+  Ep 13 [260/2306] Loss: 0.1463
+  Ep 13 [280/2306] Loss: 0.3373
+  Ep 13 [300/2306] Loss: 0.4319
+  Ep 13 [320/2306] Loss: 0.8028
+  Ep 13 [340/2306] Loss: 0.1213
+  Ep 13 [360/2306] Loss: 0.3336
+  Ep 13 [380/2306] Loss: 0.3009
+  Ep 13 [400/2306] Loss: 0.1391
+  Ep 13 [420/2306] Loss: 0.0779
+  Ep 13 [440/2306] Loss: 0.3865
+  Ep 13 [460/2306] Loss: 0.0000
+  Ep 13 [480/2306] Loss: 0.1310
+  Ep 13 [500/2306] Loss: 0.6764
+  Ep 13 [520/2306] Loss: 0.7164
+  Ep 13 [540/2306] Loss: 0.1380
+  Ep 13 [560/2306] Loss: 0.0000
+  Ep 13 [580/2306] Loss: 0.0000
+  Ep 13 [600/2306] Loss: 0.1157
+  Ep 13 [620/2306] Loss: 0.2087
+  Ep 13 [640/2306] Loss: 0.2353
+  Ep 13 [660/2306] Loss: 0.1080
+  Ep 13 [680/2306] Loss: 0.0843
+  Ep 13 [700/2306] Loss: 0.3583
+  Ep 13 [720/2306] Loss: 0.2215
+  Ep 13 [740/2306] Loss: 0.2081
+  Ep 13 [760/2306] Loss: 0.0000
+  Ep 13 [780/2306] Loss: 0.5000
+  Ep 13 [800/2306] Loss: 0.1003
+  Ep 13 [820/2306] Loss: 0.0000
+  Ep 13 [840/2306] Loss: 0.3571
+  Ep 13 [860/2306] Loss: 0.2773
+  Ep 13 [880/2306] Loss: 0.1294
+  Ep 13 [900/2306] Loss: 0.5047
+  Ep 13 [920/2306] Loss: 0.0001
+  Ep 13 [940/2306] Loss: 0.5792
+  Ep 13 [960/2306] Loss: 0.0000
+  Ep 13 [980/2306] Loss: 0.0000
+  Ep 13 [1000/2306] Loss: 0.6331
+  Ep 13 [1020/2306] Loss: 1.2593
+  Ep 13 [1040/2306] Loss: 0.1441
+  Ep 13 [1060/2306] Loss: 0.5464
+  Ep 13 [1080/2306] Loss: 0.2772
+  Ep 13 [1100/2306] Loss: 0.0000
+  Ep 13 [1120/2306] Loss: 0.1159
+  Ep 13 [1140/2306] Loss: 0.3149
+  Ep 13 [1160/2306] Loss: 0.5000
+  Ep 13 [1180/2306] Loss: 0.2086
+  Ep 13 [1200/2306] Loss: 0.0000
+  Ep 13 [1220/2306] Loss: 0.0000
+  Ep 13 [1240/2306] Loss: 0.0001
+  Ep 13 [1260/2306] Loss: 0.0001
+  Ep 13 [1280/2306] Loss: 0.2886
+  Ep 13 [1300/2306] Loss: 0.0000
+  Ep 13 [1320/2306] Loss: 0.1952
+  Ep 13 [1340/2306] Loss: 0.1732
+  Ep 13 [1360/2306] Loss: 0.8148
+  Ep 13 [1380/2306] Loss: 0.0000
+  Ep 13 [1400/2306] Loss: 1.1611
+  Ep 13 [1420/2306] Loss: 0.5001
+  Ep 13 [1440/2306] Loss: 0.1269
+  Ep 13 [1460/2306] Loss: 0.1864
+  Ep 13 [1480/2306] Loss: 0.1201
+  Ep 13 [1500/2306] Loss: 0.0002
+  Ep 13 [1520/2306] Loss: 0.4105
+  Ep 13 [1540/2306] Loss: 0.0000
+  Ep 13 [1560/2306] Loss: 0.1673
+  Ep 13 [1580/2306] Loss: 1.3759
+  Ep 13 [1600/2306] Loss: 0.1261
+  Ep 13 [1620/2306] Loss: 0.7002
+  Ep 13 [1640/2306] Loss: 0.2490
+  Ep 13 [1660/2306] Loss: 0.5647
+  Ep 13 [1680/2306] Loss: 0.5000
+  Ep 13 [1700/2306] Loss: 0.1571
+  Ep 13 [1720/2306] Loss: 0.5000
+  Ep 13 [1740/2306] Loss: 0.5514
+  Ep 13 [1760/2306] Loss: 0.7393
+  Ep 13 [1780/2306] Loss: 0.3722
+  Ep 13 [1800/2306] Loss: 0.5000
+  Ep 13 [1820/2306] Loss: 0.6439
+  Ep 13 [1840/2306] Loss: 0.6642
+  Ep 13 [1860/2306] Loss: 0.3775
+  Ep 13 [1880/2306] Loss: 0.1265
+  Ep 13 [1900/2306] Loss: 0.0000
+  Ep 13 [1920/2306] Loss: 0.1032
+  Ep 13 [1940/2306] Loss: 0.1095
+  Ep 13 [1960/2306] Loss: 0.0000
+  Ep 13 [1980/2306] Loss: 0.0000
+  Ep 13 [2000/2306] Loss: 0.1152
+  Ep 13 [2020/2306] Loss: 1.1479
+  Ep 13 [2040/2306] Loss: 0.3686
+  Ep 13 [2060/2306] Loss: 0.1276
+  Ep 13 [2080/2306] Loss: 0.2101
+  Ep 13 [2100/2306] Loss: 0.3028
+  Ep 13 [2120/2306] Loss: 0.0000
+  Ep 13 [2140/2306] Loss: 0.5531
+  Ep 13 [2160/2306] Loss: 1.0028
+  Ep 13 [2180/2306] Loss: 0.2468
+  Ep 13 [2200/2306] Loss: 0.0000
+  Ep 13 [2220/2306] Loss: 0.5855
+  Ep 13 [2240/2306] Loss: 0.0000
+  Ep 13 [2260/2306] Loss: 0.6844
+  Ep 13 [2280/2306] Loss: 0.3057
+  Ep 13 [2300/2306] Loss: 1.2641
+Ep 13 Avg Loss: 0.3689
+Ep 13 Val Dice: 0.6245 | Total Pred Pixels: 332678
+  Ep 14 [20/2306] Loss: 0.6524
+  Ep 14 [40/2306] Loss: 0.0005
+  Ep 14 [60/2306] Loss: 0.0000
+  Ep 14 [80/2306] Loss: 0.6629
+  Ep 14 [100/2306] Loss: 0.3548
+  Ep 14 [120/2306] Loss: 1.5262
+  Ep 14 [140/2306] Loss: 0.5000
+  Ep 14 [160/2306] Loss: 0.1974
+  Ep 14 [180/2306] Loss: 0.9394
+  Ep 14 [200/2306] Loss: 0.5000
+  Ep 14 [220/2306] Loss: 0.2874
+  Ep 14 [240/2306] Loss: 0.5000
+  Ep 14 [260/2306] Loss: 0.2025
+  Ep 14 [280/2306] Loss: 0.1323
+  Ep 14 [300/2306] Loss: 0.0000
+  Ep 14 [320/2306] Loss: 0.0914
+  Ep 14 [340/2306] Loss: 0.2703
+  Ep 14 [360/2306] Loss: 0.0000
+  Ep 14 [380/2306] Loss: 0.0845
+  Ep 14 [400/2306] Loss: 0.0000
+  Ep 14 [420/2306] Loss: 0.5057
+  Ep 14 [440/2306] Loss: 0.0877
+  Ep 14 [460/2306] Loss: 0.6562
+  Ep 14 [480/2306] Loss: 0.5000
+  Ep 14 [500/2306] Loss: 0.1879
+  Ep 14 [520/2306] Loss: 0.0832
+  Ep 14 [540/2306] Loss: 0.0000
+  Ep 14 [560/2306] Loss: 0.0973
+  Ep 14 [580/2306] Loss: 0.0000
+  Ep 14 [600/2306] Loss: 0.8466
+  Ep 14 [620/2306] Loss: 1.2106
+  Ep 14 [640/2306] Loss: 0.1091
+  Ep 14 [660/2306] Loss: 0.3951
+  Ep 14 [680/2306] Loss: 0.4987
+  Ep 14 [700/2306] Loss: 0.1919
+  Ep 14 [720/2306] Loss: 0.0001
+  Ep 14 [740/2306] Loss: 0.1016
+  Ep 14 [760/2306] Loss: 0.2863
+  Ep 14 [780/2306] Loss: 0.5715
+  Ep 14 [800/2306] Loss: 0.7179
+  Ep 14 [820/2306] Loss: 0.1074
+  Ep 14 [840/2306] Loss: 1.0004
+  Ep 14 [860/2306] Loss: 1.5491
+  Ep 14 [880/2306] Loss: 0.5802
+  Ep 14 [900/2306] Loss: 0.0782
+  Ep 14 [920/2306] Loss: 0.0853
+  Ep 14 [940/2306] Loss: 0.1497
+  Ep 14 [960/2306] Loss: 0.5000
+  Ep 14 [980/2306] Loss: 0.1962
+  Ep 14 [1000/2306] Loss: 0.4116
+  Ep 14 [1020/2306] Loss: 0.1336
+  Ep 14 [1040/2306] Loss: 0.5001
+  Ep 14 [1060/2306] Loss: 0.1411
+  Ep 14 [1080/2306] Loss: 0.3650
+  Ep 14 [1100/2306] Loss: 0.4544
+  Ep 14 [1120/2306] Loss: 0.0000
+  Ep 14 [1140/2306] Loss: 0.0000
+  Ep 14 [1160/2306] Loss: 0.0000
+  Ep 14 [1180/2306] Loss: 0.2647
+  Ep 14 [1200/2306] Loss: 0.4443
+  Ep 14 [1220/2306] Loss: 0.0000
+  Ep 14 [1240/2306] Loss: 0.0626
+  Ep 14 [1260/2306] Loss: 0.3997
+  Ep 14 [1280/2306] Loss: 0.5001
+  Ep 14 [1300/2306] Loss: 0.0000
+  Ep 14 [1320/2306] Loss: 0.9240
+  Ep 14 [1340/2306] Loss: 0.5000
+  Ep 14 [1360/2306] Loss: 0.3359
+  Ep 14 [1380/2306] Loss: 0.6786
+  Ep 14 [1400/2306] Loss: 0.1155
+  Ep 14 [1420/2306] Loss: 0.3979
+  Ep 14 [1440/2306] Loss: 0.1928
+  Ep 14 [1460/2306] Loss: 0.2801
+  Ep 14 [1480/2306] Loss: 0.5000
+  Ep 14 [1500/2306] Loss: 0.1372
+  Ep 14 [1520/2306] Loss: 0.1669
+  Ep 14 [1540/2306] Loss: 0.0002
+  Ep 14 [1560/2306] Loss: 0.3019
+  Ep 14 [1580/2306] Loss: 0.4663
+  Ep 14 [1600/2306] Loss: 0.0000
+  Ep 14 [1620/2306] Loss: 0.1511
+  Ep 14 [1640/2306] Loss: 0.0000
+  Ep 14 [1660/2306] Loss: 0.5733
+  Ep 14 [1680/2306] Loss: 0.2897
+  Ep 14 [1700/2306] Loss: 0.0000
+  Ep 14 [1720/2306] Loss: 0.3248
+  Ep 14 [1740/2306] Loss: 0.1869
+  Ep 14 [1760/2306] Loss: 0.2721
+  Ep 14 [1780/2306] Loss: 0.1897
+  Ep 14 [1800/2306] Loss: 0.1615
+  Ep 14 [1820/2306] Loss: 0.1346
+  Ep 14 [1840/2306] Loss: 0.5001
+  Ep 14 [1860/2306] Loss: 0.6762
+  Ep 14 [1880/2306] Loss: 0.8832
+  Ep 14 [1900/2306] Loss: 0.6861
+  Ep 14 [1920/2306] Loss: 0.0000
+  Ep 14 [1940/2306] Loss: 1.0003
+  Ep 14 [1960/2306] Loss: 0.0000
+  Ep 14 [1980/2306] Loss: 0.5738
+  Ep 14 [2000/2306] Loss: 0.1904
+  Ep 14 [2020/2306] Loss: 0.1644
+  Ep 14 [2040/2306] Loss: 0.2480
+  Ep 14 [2060/2306] Loss: 0.0947
+  Ep 14 [2080/2306] Loss: 0.4786
+  Ep 14 [2100/2306] Loss: 0.6267
+  Ep 14 [2120/2306] Loss: 0.1825
+  Ep 14 [2140/2306] Loss: 0.0000
+  Ep 14 [2160/2306] Loss: 0.0000
+  Ep 14 [2180/2306] Loss: 0.1297
+  Ep 14 [2200/2306] Loss: 0.1388
+  Ep 14 [2220/2306] Loss: 0.1047
+  Ep 14 [2240/2306] Loss: 0.1677
+  Ep 14 [2260/2306] Loss: 0.1855
+  Ep 14 [2280/2306] Loss: 1.4807
+  Ep 14 [2300/2306] Loss: 0.0000
+Ep 14 Avg Loss: 0.3693
+Ep 14 Val Dice: 0.6397 | Total Pred Pixels: 193923
+  Ep 15 [20/2306] Loss: 1.5021
+  Ep 15 [40/2306] Loss: 0.0000
+  Ep 15 [60/2306] Loss: 0.5000
+  Ep 15 [80/2306] Loss: 0.0770
+  Ep 15 [100/2306] Loss: 0.1132
+  Ep 15 [120/2306] Loss: 0.5000
+  Ep 15 [140/2306] Loss: 0.0000
+  Ep 15 [160/2306] Loss: 0.2643
+  Ep 15 [180/2306] Loss: 0.3390
+  Ep 15 [200/2306] Loss: 0.1311
+  Ep 15 [220/2306] Loss: 0.2301
+  Ep 15 [240/2306] Loss: 0.5000
+  Ep 15 [260/2306] Loss: 0.5833
+  Ep 15 [280/2306] Loss: 0.7785
+  Ep 15 [300/2306] Loss: 0.4139
+  Ep 15 [320/2306] Loss: 0.1088
+  Ep 15 [340/2306] Loss: 0.1814
+  Ep 15 [360/2306] Loss: 0.2381
+  Ep 15 [380/2306] Loss: 0.3147
+  Ep 15 [400/2306] Loss: 0.3456
+  Ep 15 [420/2306] Loss: 0.0000
+  Ep 15 [440/2306] Loss: 0.2802
+  Ep 15 [460/2306] Loss: 0.7428
+  Ep 15 [480/2306] Loss: 0.1890
+  Ep 15 [500/2306] Loss: 0.0000
+  Ep 15 [520/2306] Loss: 0.6806
+  Ep 15 [540/2306] Loss: 0.8118
+  Ep 15 [560/2306] Loss: 0.7614
+  Ep 15 [580/2306] Loss: 0.0000
+  Ep 15 [600/2306] Loss: 0.8318
+  Ep 15 [620/2306] Loss: 0.5001
+  Ep 15 [640/2306] Loss: 0.5426
+  Ep 15 [660/2306] Loss: 0.1961
+  Ep 15 [680/2306] Loss: 0.2417
+  Ep 15 [700/2306] Loss: 0.3673
+  Ep 15 [720/2306] Loss: 0.9217
+  Ep 15 [740/2306] Loss: 1.0000
+  Ep 15 [760/2306] Loss: 0.5000
+  Ep 15 [780/2306] Loss: 0.0000
+  Ep 15 [800/2306] Loss: 0.5000
+  Ep 15 [820/2306] Loss: 0.1088
+  Ep 15 [840/2306] Loss: 0.2442
+  Ep 15 [860/2306] Loss: 0.7374
+  Ep 15 [880/2306] Loss: 0.3048
+  Ep 15 [900/2306] Loss: 0.1907
+  Ep 15 [920/2306] Loss: 1.1476
+  Ep 15 [940/2306] Loss: 0.4338
+  Ep 15 [960/2306] Loss: 0.7643
+  Ep 15 [980/2306] Loss: 0.1025
+  Ep 15 [1000/2306] Loss: 0.1983
+  Ep 15 [1020/2306] Loss: 0.3773
+  Ep 15 [1040/2306] Loss: 0.5944
+  Ep 15 [1060/2306] Loss: 0.6328
+  Ep 15 [1080/2306] Loss: 0.5000
+  Ep 15 [1100/2306] Loss: 0.5549
+  Ep 15 [1120/2306] Loss: 0.0000
+  Ep 15 [1140/2306] Loss: 0.2521
+  Ep 15 [1160/2306] Loss: 1.0000
+  Ep 15 [1180/2306] Loss: 0.1802
+  Ep 15 [1200/2306] Loss: 0.4984
+  Ep 15 [1220/2306] Loss: 0.9342
+  Ep 15 [1240/2306] Loss: 0.0000
+  Ep 15 [1260/2306] Loss: 0.0987
+  Ep 15 [1280/2306] Loss: 0.2767
+  Ep 15 [1300/2306] Loss: 0.7885
+  Ep 15 [1320/2306] Loss: 0.0800
+  Ep 15 [1340/2306] Loss: 0.0604
+  Ep 15 [1360/2306] Loss: 0.2287
+  Ep 15 [1380/2306] Loss: 0.7557
+  Ep 15 [1400/2306] Loss: 0.2219
+  Ep 15 [1420/2306] Loss: 0.5000
+  Ep 15 [1440/2306] Loss: 0.1520
+  Ep 15 [1460/2306] Loss: 0.7385
+  Ep 15 [1480/2306] Loss: 0.6589
+  Ep 15 [1500/2306] Loss: 0.0997
+  Ep 15 [1520/2306] Loss: 0.1864
+  Ep 15 [1540/2306] Loss: 0.5000
+  Ep 15 [1560/2306] Loss: 0.1040
+  Ep 15 [1580/2306] Loss: 0.3740
+  Ep 15 [1600/2306] Loss: 0.2361
+  Ep 15 [1620/2306] Loss: 0.8823
+  Ep 15 [1640/2306] Loss: 0.3664
+  Ep 15 [1660/2306] Loss: 1.2335
+  Ep 15 [1680/2306] Loss: 0.1399
+  Ep 15 [1700/2306] Loss: 0.4449
+  Ep 15 [1720/2306] Loss: 0.4517
+  Ep 15 [1740/2306] Loss: 0.0945
+  Ep 15 [1760/2306] Loss: 0.5000
+  Ep 15 [1780/2306] Loss: 1.0948
+  Ep 15 [1800/2306] Loss: 0.1842
+  Ep 15 [1820/2306] Loss: 0.3688
+  Ep 15 [1840/2306] Loss: 0.8611
+  Ep 15 [1860/2306] Loss: 0.0000
+  Ep 15 [1880/2306] Loss: 0.8203
+  Ep 15 [1900/2306] Loss: 0.2904
+  Ep 15 [1920/2306] Loss: 0.4508
+  Ep 15 [1940/2306] Loss: 0.0000
+  Ep 15 [1960/2306] Loss: 0.1051
+  Ep 15 [1980/2306] Loss: 0.2142
+  Ep 15 [2000/2306] Loss: 0.5001
+  Ep 15 [2020/2306] Loss: 0.2493
+  Ep 15 [2040/2306] Loss: 0.0000
+  Ep 15 [2060/2306] Loss: 0.5793
+  Ep 15 [2080/2306] Loss: 0.0000
+  Ep 15 [2100/2306] Loss: 0.7124
+  Ep 15 [2120/2306] Loss: 0.5008
+  Ep 15 [2140/2306] Loss: 0.1806
+  Ep 15 [2160/2306] Loss: 0.1622
+  Ep 15 [2180/2306] Loss: 0.1307
+  Ep 15 [2200/2306] Loss: 0.6669
+  Ep 15 [2220/2306] Loss: 0.4938
+  Ep 15 [2240/2306] Loss: 0.6451
+  Ep 15 [2260/2306] Loss: 0.0000
+  Ep 15 [2280/2306] Loss: 0.1239
+  Ep 15 [2300/2306] Loss: 0.5000
+Ep 15 Avg Loss: 0.3778
+Ep 15 Val Dice: 0.6286 | Total Pred Pixels: 375420
+  Ep 16 [20/2306] Loss: 0.6320
+  Ep 16 [40/2306] Loss: 0.0000
+  Ep 16 [60/2306] Loss: 0.2036
+  Ep 16 [80/2306] Loss: 0.4134
+  Ep 16 [100/2306] Loss: 0.8333
+  Ep 16 [120/2306] Loss: 0.7690
+  Ep 16 [140/2306] Loss: 0.7449
+  Ep 16 [160/2306] Loss: 0.2128
+  Ep 16 [180/2306] Loss: 0.3060
+  Ep 16 [200/2306] Loss: 0.9995
+  Ep 16 [220/2306] Loss: 0.2048
+  Ep 16 [240/2306] Loss: 1.3133
+  Ep 16 [260/2306] Loss: 0.2958
+  Ep 16 [280/2306] Loss: 1.0987
+  Ep 16 [300/2306] Loss: 0.6230
+  Ep 16 [320/2306] Loss: 0.1995
+  Ep 16 [340/2306] Loss: 1.0623
+  Ep 16 [360/2306] Loss: 0.5512
+  Ep 16 [380/2306] Loss: 0.2501
+  Ep 16 [400/2306] Loss: 0.2535
+  Ep 16 [420/2306] Loss: 0.1594
+  Ep 16 [440/2306] Loss: 0.5726
+  Ep 16 [460/2306] Loss: 0.1697
+  Ep 16 [480/2306] Loss: 0.9831
+  Ep 16 [500/2306] Loss: 0.0000
+  Ep 16 [520/2306] Loss: 0.1595
+  Ep 16 [540/2306] Loss: 0.0000
+  Ep 16 [560/2306] Loss: 0.5993
+  Ep 16 [580/2306] Loss: 0.4639
+  Ep 16 [600/2306] Loss: 0.6218
+  Ep 16 [620/2306] Loss: 0.8802
+  Ep 16 [640/2306] Loss: 0.0000
+  Ep 16 [660/2306] Loss: 0.5641
+  Ep 16 [680/2306] Loss: 0.0706
+  Ep 16 [700/2306] Loss: 0.6700
+  Ep 16 [720/2306] Loss: 0.3957
+  Ep 16 [740/2306] Loss: 0.0000
+  Ep 16 [760/2306] Loss: 0.5000
+  Ep 16 [780/2306] Loss: 0.2210
+  Ep 16 [800/2306] Loss: 0.3449
+  Ep 16 [820/2306] Loss: 0.3570
+  Ep 16 [840/2306] Loss: 0.3629
+  Ep 16 [860/2306] Loss: 1.2140
+  Ep 16 [880/2306] Loss: 0.4236
+  Ep 16 [900/2306] Loss: 0.5001
+  Ep 16 [920/2306] Loss: 0.0000
+  Ep 16 [940/2306] Loss: 1.0879
+  Ep 16 [960/2306] Loss: 0.2367
+  Ep 16 [980/2306] Loss: 0.5000
+  Ep 16 [1000/2306] Loss: 0.6407
+  Ep 16 [1020/2306] Loss: 0.0000
+  Ep 16 [1040/2306] Loss: 0.4458
+  Ep 16 [1060/2306] Loss: 0.2872
+  Ep 16 [1080/2306] Loss: 0.5983
+  Ep 16 [1100/2306] Loss: 0.0480
+  Ep 16 [1120/2306] Loss: 1.0000
+  Ep 16 [1140/2306] Loss: 0.1174
+  Ep 16 [1160/2306] Loss: 0.2542
+  Ep 16 [1180/2306] Loss: 0.4321
+  Ep 16 [1200/2306] Loss: 0.0388
+  Ep 16 [1220/2306] Loss: 0.0000
+  Ep 16 [1240/2306] Loss: 0.1659
+  Ep 16 [1260/2306] Loss: 0.6746
+  Ep 16 [1280/2306] Loss: 0.7493
+  Ep 16 [1300/2306] Loss: 0.3787
+  Ep 16 [1320/2306] Loss: 0.0000
+  Ep 16 [1340/2306] Loss: 0.4736
+  Ep 16 [1360/2306] Loss: 0.4834
+  Ep 16 [1380/2306] Loss: 0.3069
+  Ep 16 [1400/2306] Loss: 0.5000
+  Ep 16 [1420/2306] Loss: 0.6356
+  Ep 16 [1440/2306] Loss: 0.9022
+  Ep 16 [1460/2306] Loss: 0.6371
+  Ep 16 [1480/2306] Loss: 0.7362
+  Ep 16 [1500/2306] Loss: 0.5000
+  Ep 16 [1520/2306] Loss: 0.2114
+  Ep 16 [1540/2306] Loss: 0.1127
+  Ep 16 [1560/2306] Loss: 0.0000
+  Ep 16 [1580/2306] Loss: 0.6379
+  Ep 16 [1600/2306] Loss: 0.5022
+  Ep 16 [1620/2306] Loss: 0.1562
+  Ep 16 [1640/2306] Loss: 0.0577
+  Ep 16 [1660/2306] Loss: 0.0000
+  Ep 16 [1680/2306] Loss: 0.5000
+  Ep 16 [1700/2306] Loss: 1.0389
+  Ep 16 [1720/2306] Loss: 0.0000
+  Ep 16 [1740/2306] Loss: 0.8582
+  Ep 16 [1760/2306] Loss: 0.1101
+  Ep 16 [1780/2306] Loss: 0.0000
+  Ep 16 [1800/2306] Loss: 0.2970
+  Ep 16 [1820/2306] Loss: 0.3298
+  Ep 16 [1840/2306] Loss: 0.6434
+  Ep 16 [1860/2306] Loss: 0.5616
+  Ep 16 [1880/2306] Loss: 0.6591
+  Ep 16 [1900/2306] Loss: 0.6472
+  Ep 16 [1920/2306] Loss: 0.1091
+  Ep 16 [1940/2306] Loss: 0.8266
+  Ep 16 [1960/2306] Loss: 0.0000
+  Ep 16 [1980/2306] Loss: 0.5935
+  Ep 16 [2000/2306] Loss: 0.4182
+  Ep 16 [2020/2306] Loss: 0.1601
+  Ep 16 [2040/2306] Loss: 0.3345
+  Ep 16 [2060/2306] Loss: 0.4413
+  Ep 16 [2080/2306] Loss: 0.2543
+  Ep 16 [2100/2306] Loss: 0.0000
+  Ep 16 [2120/2306] Loss: 0.9096
+  Ep 16 [2140/2306] Loss: 0.0000
+  Ep 16 [2160/2306] Loss: 0.1906
+  Ep 16 [2180/2306] Loss: 0.5431
+  Ep 16 [2200/2306] Loss: 0.6778
+  Ep 16 [2220/2306] Loss: 0.5655
+  Ep 16 [2240/2306] Loss: 0.7688
+  Ep 16 [2260/2306] Loss: 0.0000
+  Ep 16 [2280/2306] Loss: 0.0000
+  Ep 16 [2300/2306] Loss: 0.0900
+Ep 16 Avg Loss: 0.3786
+Ep 16 Val Dice: 0.6006 | Total Pred Pixels: 416239
+  Ep 17 [20/2306] Loss: 0.2749
+  Ep 17 [40/2306] Loss: 0.1290
+  Ep 17 [60/2306] Loss: 0.0756
+  Ep 17 [80/2306] Loss: 0.8062
+  Ep 17 [100/2306] Loss: 0.4319
+  Ep 17 [120/2306] Loss: 0.0000
+  Ep 17 [140/2306] Loss: 0.4369
+  Ep 17 [160/2306] Loss: 0.6852
+  Ep 17 [180/2306] Loss: 0.0000
+  Ep 17 [200/2306] Loss: 0.1671
+  Ep 17 [220/2306] Loss: 0.3549
+  Ep 17 [240/2306] Loss: 0.7612
+  Ep 17 [260/2306] Loss: 0.1000
+  Ep 17 [280/2306] Loss: 0.4828
+  Ep 17 [300/2306] Loss: 0.4036
+  Ep 17 [320/2306] Loss: 0.6007
+  Ep 17 [340/2306] Loss: 0.0000
+  Ep 17 [360/2306] Loss: 0.5869
+  Ep 17 [380/2306] Loss: 0.5000
+  Ep 17 [400/2306] Loss: 0.5000
+  Ep 17 [420/2306] Loss: 0.3881
+  Ep 17 [440/2306] Loss: 0.0000
+  Ep 17 [460/2306] Loss: 0.1383
+  Ep 17 [480/2306] Loss: 0.6861
+  Ep 17 [500/2306] Loss: 0.9771
+  Ep 17 [520/2306] Loss: 0.0000
+  Ep 17 [540/2306] Loss: 0.5004
+  Ep 17 [560/2306] Loss: 0.8079
+  Ep 17 [580/2306] Loss: 0.1160
+  Ep 17 [600/2306] Loss: 1.0012
+  Ep 17 [620/2306] Loss: 0.1135
+  Ep 17 [640/2306] Loss: 0.6508
+  Ep 17 [660/2306] Loss: 0.2784
+  Ep 17 [680/2306] Loss: 0.0703
+  Ep 17 [700/2306] Loss: 0.5019
+  Ep 17 [720/2306] Loss: 1.1243
+  Ep 17 [740/2306] Loss: 0.4299
+  Ep 17 [760/2306] Loss: 0.8099
+  Ep 17 [780/2306] Loss: 0.2465
+  Ep 17 [800/2306] Loss: 0.6560
+  Ep 17 [820/2306] Loss: 0.2187
+  Ep 17 [840/2306] Loss: 0.3877
+  Ep 17 [860/2306] Loss: 0.1429
+  Ep 17 [880/2306] Loss: 0.1299
+  Ep 17 [900/2306] Loss: 0.3999
+  Ep 17 [920/2306] Loss: 0.9115
+  Ep 17 [940/2306] Loss: 0.1048
+  Ep 17 [960/2306] Loss: 0.0000
+  Ep 17 [980/2306] Loss: 1.2357
+  Ep 17 [1000/2306] Loss: 0.0696
+  Ep 17 [1020/2306] Loss: 0.5611
+  Ep 17 [1040/2306] Loss: 0.4434
+  Ep 17 [1060/2306] Loss: 0.2273
+  Ep 17 [1080/2306] Loss: 0.1402
+  Ep 17 [1100/2306] Loss: 0.0000
+  Ep 17 [1120/2306] Loss: 0.4572
+  Ep 17 [1140/2306] Loss: 0.2107
+  Ep 17 [1160/2306] Loss: 0.5000
+  Ep 17 [1180/2306] Loss: 0.2471
+  Ep 17 [1200/2306] Loss: 0.5000
+  Ep 17 [1220/2306] Loss: 0.2583
+  Ep 17 [1240/2306] Loss: 0.1533
+  Ep 17 [1260/2306] Loss: 0.1521
+  Ep 17 [1280/2306] Loss: 0.5001
+  Ep 17 [1300/2306] Loss: 0.3956
+  Ep 17 [1320/2306] Loss: 0.6735
+  Ep 17 [1340/2306] Loss: 0.0000
+  Ep 17 [1360/2306] Loss: 0.4955
+  Ep 17 [1380/2306] Loss: 0.7536
+  Ep 17 [1400/2306] Loss: 0.2610
+  Ep 17 [1420/2306] Loss: 0.9083
+  Ep 17 [1440/2306] Loss: 0.5001
+  Ep 17 [1460/2306] Loss: 1.0773
+  Ep 17 [1480/2306] Loss: 0.2406
+  Ep 17 [1500/2306] Loss: 0.0000
+  Ep 17 [1520/2306] Loss: 0.0779
+  Ep 17 [1540/2306] Loss: 0.3833
+  Ep 17 [1560/2306] Loss: 0.0915
+  Ep 17 [1580/2306] Loss: 0.8835
+  Ep 17 [1600/2306] Loss: 0.2318
+  Ep 17 [1620/2306] Loss: 0.1805
+  Ep 17 [1640/2306] Loss: 0.2767
+  Ep 17 [1660/2306] Loss: 0.2748
+  Ep 17 [1680/2306] Loss: 0.2048
+  Ep 17 [1700/2306] Loss: 1.0750
+  Ep 17 [1720/2306] Loss: 0.3503
+  Ep 17 [1740/2306] Loss: 1.0898
+  Ep 17 [1760/2306] Loss: 0.0000
+  Ep 17 [1780/2306] Loss: 0.0000
+  Ep 17 [1800/2306] Loss: 0.5806
+  Ep 17 [1820/2306] Loss: 0.0915
+  Ep 17 [1840/2306] Loss: 0.1534
+  Ep 17 [1860/2306] Loss: 0.2947
+  Ep 17 [1880/2306] Loss: 0.1979
+  Ep 17 [1900/2306] Loss: 0.2077
+  Ep 17 [1920/2306] Loss: 1.1512
+  Ep 17 [1940/2306] Loss: 0.6170
+  Ep 17 [1960/2306] Loss: 0.8406
+  Ep 17 [1980/2306] Loss: 0.0000
+  Ep 17 [2000/2306] Loss: 0.5001
+  Ep 17 [2020/2306] Loss: 0.6947
+  Ep 17 [2040/2306] Loss: 0.5000
+  Ep 17 [2060/2306] Loss: 0.1726
+  Ep 17 [2080/2306] Loss: 0.2202
+  Ep 17 [2100/2306] Loss: 1.3952
+  Ep 17 [2120/2306] Loss: 0.6773
+  Ep 17 [2140/2306] Loss: 0.5897
+  Ep 17 [2160/2306] Loss: 0.8861
+  Ep 17 [2180/2306] Loss: 0.0000
+  Ep 17 [2200/2306] Loss: 0.0001
+  Ep 17 [2220/2306] Loss: 0.0000
+  Ep 17 [2240/2306] Loss: 0.2208
+  Ep 17 [2260/2306] Loss: 0.1507
+  Ep 17 [2280/2306] Loss: 0.1906
+  Ep 17 [2300/2306] Loss: 0.0718
+Ep 17 Avg Loss: 0.3672
+Ep 17 Val Dice: 0.5701 | Total Pred Pixels: 430286
+  Ep 18 [20/2306] Loss: 0.0970
+  Ep 18 [40/2306] Loss: 0.0000
+  Ep 18 [60/2306] Loss: 1.3788
+  Ep 18 [80/2306] Loss: 1.1929
+  Ep 18 [100/2306] Loss: 0.8023
+  Ep 18 [120/2306] Loss: 0.6688
+  Ep 18 [140/2306] Loss: 0.3635
+  Ep 18 [160/2306] Loss: 0.1609
+  Ep 18 [180/2306] Loss: 0.1182
+  Ep 18 [200/2306] Loss: 0.5329
+  Ep 18 [220/2306] Loss: 0.1653
+  Ep 18 [240/2306] Loss: 0.0000
+  Ep 18 [260/2306] Loss: 0.4386
+  Ep 18 [280/2306] Loss: 0.1450
+  Ep 18 [300/2306] Loss: 0.7984
+  Ep 18 [320/2306] Loss: 0.1329
+  Ep 18 [340/2306] Loss: 0.2771
+  Ep 18 [360/2306] Loss: 1.1343
+  Ep 18 [380/2306] Loss: 0.0000
+  Ep 18 [400/2306] Loss: 0.2399
+  Ep 18 [420/2306] Loss: 0.6685
+  Ep 18 [440/2306] Loss: 0.1799
+  Ep 18 [460/2306] Loss: 0.0000
+  Ep 18 [480/2306] Loss: 0.5001
+  Ep 18 [500/2306] Loss: 0.4050
+  Ep 18 [520/2306] Loss: 0.7102
+  Ep 18 [540/2306] Loss: 0.1969
+  Ep 18 [560/2306] Loss: 0.0000
+  Ep 18 [580/2306] Loss: 0.5000
+  Ep 18 [600/2306] Loss: 0.5865
+  Ep 18 [620/2306] Loss: 1.7481
+  Ep 18 [640/2306] Loss: 0.1656
+  Ep 18 [660/2306] Loss: 0.0907
+  Ep 18 [680/2306] Loss: 0.1312
+  Ep 18 [700/2306] Loss: 0.1506
+  Ep 18 [720/2306] Loss: 0.5000
+  Ep 18 [740/2306] Loss: 0.1059
+  Ep 18 [760/2306] Loss: 0.0000
+  Ep 18 [780/2306] Loss: 0.0000
+  Ep 18 [800/2306] Loss: 0.0000
+  Ep 18 [820/2306] Loss: 0.1670
+  Ep 18 [840/2306] Loss: 0.9552
+  Ep 18 [860/2306] Loss: 0.0000
+  Ep 18 [880/2306] Loss: 0.5000
+  Ep 18 [900/2306] Loss: 0.6696
+  Ep 18 [920/2306] Loss: 0.1457
+  Ep 18 [940/2306] Loss: 0.2651
+  Ep 18 [960/2306] Loss: 0.0000
+  Ep 18 [980/2306] Loss: 0.5001
+  Ep 18 [1000/2306] Loss: 0.5000
+  Ep 18 [1020/2306] Loss: 0.2379
+  Ep 18 [1040/2306] Loss: 0.0813
+  Ep 18 [1060/2306] Loss: 0.1282
+  Ep 18 [1080/2306] Loss: 0.6961
+  Ep 18 [1100/2306] Loss: 0.6118
+  Ep 18 [1120/2306] Loss: 0.0000
+  Ep 18 [1140/2306] Loss: 0.8632
+  Ep 18 [1160/2306] Loss: 0.0000
+  Ep 18 [1180/2306] Loss: 0.9485
+  Ep 18 [1200/2306] Loss: 1.2969
+  Ep 18 [1220/2306] Loss: 1.0000
+  Ep 18 [1240/2306] Loss: 1.2331
+  Ep 18 [1260/2306] Loss: 0.7362
+  Ep 18 [1280/2306] Loss: 0.4996
+  Ep 18 [1300/2306] Loss: 0.3845
+  Ep 18 [1320/2306] Loss: 0.2040
+  Ep 18 [1340/2306] Loss: 0.7234
+  Ep 18 [1360/2306] Loss: 0.5288
+  Ep 18 [1380/2306] Loss: 0.2455
+  Ep 18 [1400/2306] Loss: 0.5002
+  Ep 18 [1420/2306] Loss: 0.5000
+  Ep 18 [1440/2306] Loss: 0.3090
+  Ep 18 [1460/2306] Loss: 0.0000
+  Ep 18 [1480/2306] Loss: 0.0000
+  Ep 18 [1500/2306] Loss: 0.5468
+  Ep 18 [1520/2306] Loss: 0.9341
+  Ep 18 [1540/2306] Loss: 0.0000
+  Ep 18 [1560/2306] Loss: 1.0854
+  Ep 18 [1580/2306] Loss: 0.6950
+  Ep 18 [1600/2306] Loss: 0.5000
+  Ep 18 [1620/2306] Loss: 0.7926
+  Ep 18 [1640/2306] Loss: 0.6451
+  Ep 18 [1660/2306] Loss: 0.1629
+  Ep 18 [1680/2306] Loss: 0.1034
+  Ep 18 [1700/2306] Loss: 0.0000
+  Ep 18 [1720/2306] Loss: 0.5001
+  Ep 18 [1740/2306] Loss: 0.7742
+  Ep 18 [1760/2306] Loss: 0.0993
+  Ep 18 [1780/2306] Loss: 0.2114
+  Ep 18 [1800/2306] Loss: 0.0552
+  Ep 18 [1820/2306] Loss: 0.3564
+  Ep 18 [1840/2306] Loss: 0.0000
+  Ep 18 [1860/2306] Loss: 0.0001
+  Ep 18 [1880/2306] Loss: 0.0006
+  Ep 18 [1900/2306] Loss: 0.0000
+  Ep 18 [1920/2306] Loss: 0.1784
+  Ep 18 [1940/2306] Loss: 0.3799
+  Ep 18 [1960/2306] Loss: 0.4011
+  Ep 18 [1980/2306] Loss: 0.2229
+  Ep 18 [2000/2306] Loss: 0.0000
+  Ep 18 [2020/2306] Loss: 0.5150
+  Ep 18 [2040/2306] Loss: 0.6566
+  Ep 18 [2060/2306] Loss: 0.1703
+  Ep 18 [2080/2306] Loss: 0.2700
+  Ep 18 [2100/2306] Loss: 0.9382
+  Ep 18 [2120/2306] Loss: 0.0000
+  Ep 18 [2140/2306] Loss: 0.0691
+  Ep 18 [2160/2306] Loss: 1.1740
+  Ep 18 [2180/2306] Loss: 0.0000
+  Ep 18 [2200/2306] Loss: 0.1053
+  Ep 18 [2220/2306] Loss: 0.2727
+  Ep 18 [2240/2306] Loss: 0.5901
+  Ep 18 [2260/2306] Loss: 0.0926
+  Ep 18 [2280/2306] Loss: 0.5000
+  Ep 18 [2300/2306] Loss: 0.2501
+Ep 18 Avg Loss: 0.3910
+Ep 18 Val Dice: 0.5909 | Total Pred Pixels: 440560
+  Ep 19 [20/2306] Loss: 0.7952
+  Ep 19 [40/2306] Loss: 0.5316
+  Ep 19 [60/2306] Loss: 0.0000
+  Ep 19 [80/2306] Loss: 0.9829
+  Ep 19 [100/2306] Loss: 0.3376
+  Ep 19 [120/2306] Loss: 0.0000
+  Ep 19 [140/2306] Loss: 0.2496
+  Ep 19 [160/2306] Loss: 0.5003
+  Ep 19 [180/2306] Loss: 0.0590
+  Ep 19 [200/2306] Loss: 0.6828
+  Ep 19 [220/2306] Loss: 0.0736
+  Ep 19 [240/2306] Loss: 0.5000
+  Ep 19 [260/2306] Loss: 0.1314
+  Ep 19 [280/2306] Loss: 0.0000
+  Ep 19 [300/2306] Loss: 0.1027
+  Ep 19 [320/2306] Loss: 0.0000
+  Ep 19 [340/2306] Loss: 0.4200
+  Ep 19 [360/2306] Loss: 0.5512
+  Ep 19 [380/2306] Loss: 0.0576
+  Ep 19 [400/2306] Loss: 0.1974
+  Ep 19 [420/2306] Loss: 0.1472
+  Ep 19 [440/2306] Loss: 0.0000
+  Ep 19 [460/2306] Loss: 0.0873
+  Ep 19 [480/2306] Loss: 0.6097
+  Ep 19 [500/2306] Loss: 0.3718
+  Ep 19 [520/2306] Loss: 0.7140
+  Ep 19 [540/2306] Loss: 0.2042
+  Ep 19 [560/2306] Loss: 0.0000
+  Ep 19 [580/2306] Loss: 0.0521
+  Ep 19 [600/2306] Loss: 0.6662
+  Ep 19 [620/2306] Loss: 1.2447
+  Ep 19 [640/2306] Loss: 0.9323
+  Ep 19 [660/2306] Loss: 0.2569
+  Ep 19 [680/2306] Loss: 0.0000
+  Ep 19 [700/2306] Loss: 0.5218
+  Ep 19 [720/2306] Loss: 0.5000
+  Ep 19 [740/2306] Loss: 0.4897
+  Ep 19 [760/2306] Loss: 0.5002
+  Ep 19 [780/2306] Loss: 0.3058
+  Ep 19 [800/2306] Loss: 0.1268
+  Ep 19 [820/2306] Loss: 0.3535
+  Ep 19 [840/2306] Loss: 0.5000
+  Ep 19 [860/2306] Loss: 0.1083
+  Ep 19 [880/2306] Loss: 0.0726
+  Ep 19 [900/2306] Loss: 0.9902
+  Ep 19 [920/2306] Loss: 0.8773
+  Ep 19 [940/2306] Loss: 0.1307
+  Ep 19 [960/2306] Loss: 0.2402
+  Ep 19 [980/2306] Loss: 0.1496
+  Ep 19 [1000/2306] Loss: 0.8519
+  Ep 19 [1020/2306] Loss: 0.4573
+  Ep 19 [1040/2306] Loss: 0.3595
+  Ep 19 [1060/2306] Loss: 0.4685
+  Ep 19 [1080/2306] Loss: 0.0000
+  Ep 19 [1100/2306] Loss: 0.4578
+  Ep 19 [1120/2306] Loss: 0.0716
+  Ep 19 [1140/2306] Loss: 0.1879
+  Ep 19 [1160/2306] Loss: 1.1394
+  Ep 19 [1180/2306] Loss: 0.3979
+  Ep 19 [1200/2306] Loss: 0.7498
+  Ep 19 [1220/2306] Loss: 0.6750
+  Ep 19 [1240/2306] Loss: 0.6671
+  Ep 19 [1260/2306] Loss: 0.5000
+  Ep 19 [1280/2306] Loss: 0.2214
+  Ep 19 [1300/2306] Loss: 0.1229
+  Ep 19 [1320/2306] Loss: 0.1684
+  Ep 19 [1340/2306] Loss: 0.5104
+  Ep 19 [1360/2306] Loss: 0.7561
+  Ep 19 [1380/2306] Loss: 0.3568
+  Ep 19 [1400/2306] Loss: 0.0599
+  Ep 19 [1420/2306] Loss: 0.0000
+  Ep 19 [1440/2306] Loss: 0.1675
+  Ep 19 [1460/2306] Loss: 0.1225
+  Ep 19 [1480/2306] Loss: 0.1868
+  Ep 19 [1500/2306] Loss: 0.0000
+  Ep 19 [1520/2306] Loss: 0.6923
+  Ep 19 [1540/2306] Loss: 0.3117
+  Ep 19 [1560/2306] Loss: 0.5001
+  Ep 19 [1580/2306] Loss: 0.1399
+  Ep 19 [1600/2306] Loss: 0.8137
+  Ep 19 [1620/2306] Loss: 0.2563
+  Ep 19 [1640/2306] Loss: 0.5131
+  Ep 19 [1660/2306] Loss: 0.2785
+  Ep 19 [1680/2306] Loss: 0.0000
+  Ep 19 [1700/2306] Loss: 0.1206
+  Ep 19 [1720/2306] Loss: 0.0000
+  Ep 19 [1740/2306] Loss: 0.0000
+  Ep 19 [1760/2306] Loss: 0.2652
+  Ep 19 [1780/2306] Loss: 0.0000
+  Ep 19 [1800/2306] Loss: 0.7989
+  Ep 19 [1820/2306] Loss: 0.0591
+  Ep 19 [1840/2306] Loss: 0.0000
+  Ep 19 [1860/2306] Loss: 0.1688
+  Ep 19 [1880/2306] Loss: 0.3646
+  Ep 19 [1900/2306] Loss: 0.0000
+  Ep 19 [1920/2306] Loss: 1.1980
+  Ep 19 [1940/2306] Loss: 0.2432
+  Ep 19 [1960/2306] Loss: 0.8850
+  Ep 19 [1980/2306] Loss: 0.5002
+  Ep 19 [2000/2306] Loss: 0.7190
+  Ep 19 [2020/2306] Loss: 0.4545
+  Ep 19 [2040/2306] Loss: 0.0000
+  Ep 19 [2060/2306] Loss: 0.0000
+  Ep 19 [2080/2306] Loss: 0.5000
+  Ep 19 [2100/2306] Loss: 0.5001
+  Ep 19 [2120/2306] Loss: 0.6135
+  Ep 19 [2140/2306] Loss: 0.7746
+  Ep 19 [2160/2306] Loss: 1.5238
+  Ep 19 [2180/2306] Loss: 1.0533
+  Ep 19 [2200/2306] Loss: 0.5000
+  Ep 19 [2220/2306] Loss: 0.5001
+  Ep 19 [2240/2306] Loss: 0.0000
+  Ep 19 [2260/2306] Loss: 0.7136
+  Ep 19 [2280/2306] Loss: 0.4082
+  Ep 19 [2300/2306] Loss: 0.3552
+Ep 19 Avg Loss: 0.3679
+Ep 19 Val Dice: 0.6459 | Total Pred Pixels: 307785
+  Ep 20 [20/2306] Loss: 0.0000
+  Ep 20 [40/2306] Loss: 0.2648
+  Ep 20 [60/2306] Loss: 0.7109
+  Ep 20 [80/2306] Loss: 0.2306
+  Ep 20 [100/2306] Loss: 0.0000
+  Ep 20 [120/2306] Loss: 0.0832
+  Ep 20 [140/2306] Loss: 0.3160
+  Ep 20 [160/2306] Loss: 0.5787
+  Ep 20 [180/2306] Loss: 0.8216
+  Ep 20 [200/2306] Loss: 0.2079
+  Ep 20 [220/2306] Loss: 0.1387
+  Ep 20 [240/2306] Loss: 0.7337
+  Ep 20 [260/2306] Loss: 0.1439
+  Ep 20 [280/2306] Loss: 0.2495
+  Ep 20 [300/2306] Loss: 0.1532
+  Ep 20 [320/2306] Loss: 0.8337
+  Ep 20 [340/2306] Loss: 0.1647
+  Ep 20 [360/2306] Loss: 0.0816
+  Ep 20 [380/2306] Loss: 0.1602
+  Ep 20 [400/2306] Loss: 0.1223
+  Ep 20 [420/2306] Loss: 0.4061
+  Ep 20 [440/2306] Loss: 0.3076
+  Ep 20 [460/2306] Loss: 0.0730
+  Ep 20 [480/2306] Loss: 0.0000
+  Ep 20 [500/2306] Loss: 0.2651
+  Ep 20 [520/2306] Loss: 0.0000
+  Ep 20 [540/2306] Loss: 0.0000
+  Ep 20 [560/2306] Loss: 0.0000
+  Ep 20 [580/2306] Loss: 0.6161
+  Ep 20 [600/2306] Loss: 0.0000
+  Ep 20 [620/2306] Loss: 0.5000
+  Ep 20 [640/2306] Loss: 0.0046
+  Ep 20 [660/2306] Loss: 1.5220
+  Ep 20 [680/2306] Loss: 0.1050
+  Ep 20 [700/2306] Loss: 0.0000
+  Ep 20 [720/2306] Loss: 0.7276
+  Ep 20 [740/2306] Loss: 0.2478
+  Ep 20 [760/2306] Loss: 0.0000
+  Ep 20 [780/2306] Loss: 0.1137
+  Ep 20 [800/2306] Loss: 0.6378
+  Ep 20 [820/2306] Loss: 0.2207
+  Ep 20 [840/2306] Loss: 0.1382
+  Ep 20 [860/2306] Loss: 0.0000
+  Ep 20 [880/2306] Loss: 0.7892
+  Ep 20 [900/2306] Loss: 0.3742
+  Ep 20 [920/2306] Loss: 0.3302
+  Ep 20 [940/2306] Loss: 0.3855
+  Ep 20 [960/2306] Loss: 0.3264
+  Ep 20 [980/2306] Loss: 0.9671
+  Ep 20 [1000/2306] Loss: 0.0000
+  Ep 20 [1020/2306] Loss: 0.6462
+  Ep 20 [1040/2306] Loss: 0.0314
+  Ep 20 [1060/2306] Loss: 0.9771
+  Ep 20 [1080/2306] Loss: 0.0000
+  Ep 20 [1100/2306] Loss: 0.2296
+  Ep 20 [1120/2306] Loss: 0.1310
+  Ep 20 [1140/2306] Loss: 1.0000
+  Ep 20 [1160/2306] Loss: 0.8377
+  Ep 20 [1180/2306] Loss: 0.5000
+  Ep 20 [1200/2306] Loss: 0.1456
+  Ep 20 [1220/2306] Loss: 0.7909
+  Ep 20 [1240/2306] Loss: 0.3493
+  Ep 20 [1260/2306] Loss: 0.0000
+  Ep 20 [1280/2306] Loss: 0.3264
+  Ep 20 [1300/2306] Loss: 1.0869
+  Ep 20 [1320/2306] Loss: 0.7981
+  Ep 20 [1340/2306] Loss: 0.3692
+  Ep 20 [1360/2306] Loss: 1.0757
+  Ep 20 [1380/2306] Loss: 0.7445
+  Ep 20 [1400/2306] Loss: 0.6496
+  Ep 20 [1420/2306] Loss: 0.5000
+  Ep 20 [1440/2306] Loss: 0.0623
+  Ep 20 [1460/2306] Loss: 0.6473
+  Ep 20 [1480/2306] Loss: 0.3637
+  Ep 20 [1500/2306] Loss: 0.0000
+  Ep 20 [1520/2306] Loss: 0.6111
+  Ep 20 [1540/2306] Loss: 0.0000
+  Ep 20 [1560/2306] Loss: 0.0000
+  Ep 20 [1580/2306] Loss: 0.7539
+  Ep 20 [1600/2306] Loss: 0.4638
+  Ep 20 [1620/2306] Loss: 0.1779
+  Ep 20 [1640/2306] Loss: 0.0000
+  Ep 20 [1660/2306] Loss: 0.0726
+  Ep 20 [1680/2306] Loss: 0.0000
+  Ep 20 [1700/2306] Loss: 0.5672
+  Ep 20 [1720/2306] Loss: 0.5000
+  Ep 20 [1740/2306] Loss: 0.1071
+  Ep 20 [1760/2306] Loss: 0.5000
+  Ep 20 [1780/2306] Loss: 0.0906
+  Ep 20 [1800/2306] Loss: 0.3918
+  Ep 20 [1820/2306] Loss: 1.5183
+  Ep 20 [1840/2306] Loss: 0.5907
+  Ep 20 [1860/2306] Loss: 0.3750
+  Ep 20 [1880/2306] Loss: 0.2390
+  Ep 20 [1900/2306] Loss: 0.6810
+  Ep 20 [1920/2306] Loss: 0.0000
+  Ep 20 [1940/2306] Loss: 0.1336
+  Ep 20 [1960/2306] Loss: 0.3686
+  Ep 20 [1980/2306] Loss: 1.0000
+  Ep 20 [2000/2306] Loss: 0.0000
+  Ep 20 [2020/2306] Loss: 0.0000
+  Ep 20 [2040/2306] Loss: 0.5720
+  Ep 20 [2060/2306] Loss: 0.1246
+  Ep 20 [2080/2306] Loss: 0.5001
+  Ep 20 [2100/2306] Loss: 0.1422
+  Ep 20 [2120/2306] Loss: 0.0000
+  Ep 20 [2140/2306] Loss: 0.2554
+  Ep 20 [2160/2306] Loss: 0.6564
+  Ep 20 [2180/2306] Loss: 0.1692
+  Ep 20 [2200/2306] Loss: 0.0000
+  Ep 20 [2220/2306] Loss: 0.5000
+  Ep 20 [2240/2306] Loss: 0.5000
+  Ep 20 [2260/2306] Loss: 0.3021
+  Ep 20 [2280/2306] Loss: 0.0000
+  Ep 20 [2300/2306] Loss: 0.1998
+Ep 20 Avg Loss: 0.3660
+Ep 20 Val Dice: 0.5798 | Total Pred Pixels: 638293
+  Ep 21 [20/2306] Loss: 0.3240
+  Ep 21 [40/2306] Loss: 0.0341
+  Ep 21 [60/2306] Loss: 0.0000
+  Ep 21 [80/2306] Loss: 0.2851
+  Ep 21 [100/2306] Loss: 0.0000
+  Ep 21 [120/2306] Loss: 0.4067
+  Ep 21 [140/2306] Loss: 0.0000
+  Ep 21 [160/2306] Loss: 0.3732
+  Ep 21 [180/2306] Loss: 0.6644
+  Ep 21 [200/2306] Loss: 0.3045
+  Ep 21 [220/2306] Loss: 0.0000
+  Ep 21 [240/2306] Loss: 0.0864
+  Ep 21 [260/2306] Loss: 0.2965
+  Ep 21 [280/2306] Loss: 0.0000
+  Ep 21 [300/2306] Loss: 0.6045
+  Ep 21 [320/2306] Loss: 0.2355
+  Ep 21 [340/2306] Loss: 0.3698
+  Ep 21 [360/2306] Loss: 0.1768
+  Ep 21 [380/2306] Loss: 0.0002
+  Ep 21 [400/2306] Loss: 0.1427
+  Ep 21 [420/2306] Loss: 0.5000
+  Ep 21 [440/2306] Loss: 0.1036
+  Ep 21 [460/2306] Loss: 0.1014
+  Ep 21 [480/2306] Loss: 0.5000
+  Ep 21 [500/2306] Loss: 0.0787
+  Ep 21 [520/2306] Loss: 0.5000
+  Ep 21 [540/2306] Loss: 0.0947
+  Ep 21 [560/2306] Loss: 0.0965
+  Ep 21 [580/2306] Loss: 0.3359
+  Ep 21 [600/2306] Loss: 0.2147
+  Ep 21 [620/2306] Loss: 0.5000
+  Ep 21 [640/2306] Loss: 0.1787
+  Ep 21 [660/2306] Loss: 0.5352
+  Ep 21 [680/2306] Loss: 0.5000
+  Ep 21 [700/2306] Loss: 0.0572
+  Ep 21 [720/2306] Loss: 0.3842
+  Ep 21 [740/2306] Loss: 0.0807
+  Ep 21 [760/2306] Loss: 0.0000
+  Ep 21 [780/2306] Loss: 0.6022
+  Ep 21 [800/2306] Loss: 0.6126
+  Ep 21 [820/2306] Loss: 0.7283
+  Ep 21 [840/2306] Loss: 0.0000
+  Ep 21 [860/2306] Loss: 0.2616
+  Ep 21 [880/2306] Loss: 0.1710
+  Ep 21 [900/2306] Loss: 0.0829
+  Ep 21 [920/2306] Loss: 0.7286
+  Ep 21 [940/2306] Loss: 0.5119
+  Ep 21 [960/2306] Loss: 1.0009
+  Ep 21 [980/2306] Loss: 0.0000
+  Ep 21 [1000/2306] Loss: 0.5370
+  Ep 21 [1020/2306] Loss: 0.5924
+  Ep 21 [1040/2306] Loss: 0.5000
+  Ep 21 [1060/2306] Loss: 0.1096
+  Ep 21 [1080/2306] Loss: 0.2285
+  Ep 21 [1100/2306] Loss: 0.7274
+  Ep 21 [1120/2306] Loss: 0.3424
+  Ep 21 [1140/2306] Loss: 0.3664
+  Ep 21 [1160/2306] Loss: 0.1177
+  Ep 21 [1180/2306] Loss: 0.6578
+  Ep 21 [1200/2306] Loss: 0.7895
+  Ep 21 [1220/2306] Loss: 0.8024
+  Ep 21 [1240/2306] Loss: 0.7876
+  Ep 21 [1260/2306] Loss: 0.7825
+  Ep 21 [1280/2306] Loss: 0.3664
+  Ep 21 [1300/2306] Loss: 0.1540
+  Ep 21 [1320/2306] Loss: 0.0000
+  Ep 21 [1340/2306] Loss: 0.0641
+  Ep 21 [1360/2306] Loss: 0.6192
+  Ep 21 [1380/2306] Loss: 0.2422
+  Ep 21 [1400/2306] Loss: 0.1428
+  Ep 21 [1420/2306] Loss: 0.0000
+  Ep 21 [1440/2306] Loss: 0.4015
+  Ep 21 [1460/2306] Loss: 0.9897
+  Ep 21 [1480/2306] Loss: 0.5000
+  Ep 21 [1500/2306] Loss: 0.1239
+  Ep 21 [1520/2306] Loss: 0.1611
+  Ep 21 [1540/2306] Loss: 0.1050
+  Ep 21 [1560/2306] Loss: 0.5377
+  Ep 21 [1580/2306] Loss: 0.1551
+  Ep 21 [1600/2306] Loss: 0.1194
+  Ep 21 [1620/2306] Loss: 0.6957
+  Ep 21 [1640/2306] Loss: 0.1493
+  Ep 21 [1660/2306] Loss: 0.0000
+  Ep 21 [1680/2306] Loss: 0.0000
+  Ep 21 [1700/2306] Loss: 0.7370
+  Ep 21 [1720/2306] Loss: 0.3155
+  Ep 21 [1740/2306] Loss: 0.6432
+  Ep 21 [1760/2306] Loss: 0.3416
+  Ep 21 [1780/2306] Loss: 0.1959
+  Ep 21 [1800/2306] Loss: 0.7160
+  Ep 21 [1820/2306] Loss: 0.1157
+  Ep 21 [1840/2306] Loss: 0.2677
+  Ep 21 [1860/2306] Loss: 0.0000
+  Ep 21 [1880/2306] Loss: 0.1302
+  Ep 21 [1900/2306] Loss: 0.1420
+  Ep 21 [1920/2306] Loss: 0.9641
+  Ep 21 [1940/2306] Loss: 0.0000
+  Ep 21 [1960/2306] Loss: 0.0000
+  Ep 21 [1980/2306] Loss: 0.0000
+  Ep 21 [2000/2306] Loss: 0.1220
+  Ep 21 [2020/2306] Loss: 0.2339
+  Ep 21 [2040/2306] Loss: 0.0001
+  Ep 21 [2060/2306] Loss: 0.0000
+  Ep 21 [2080/2306] Loss: 0.2196
+  Ep 21 [2100/2306] Loss: 0.5001
+  Ep 21 [2120/2306] Loss: 1.0001
+  Ep 21 [2140/2306] Loss: 0.5108
+  Ep 21 [2160/2306] Loss: 0.6896
+  Ep 21 [2180/2306] Loss: 0.4123
+  Ep 21 [2200/2306] Loss: 0.0000
+  Ep 21 [2220/2306] Loss: 0.6335
+  Ep 21 [2240/2306] Loss: 0.5000
+  Ep 21 [2260/2306] Loss: 0.0000
+  Ep 21 [2280/2306] Loss: 0.0000
+  Ep 21 [2300/2306] Loss: 0.1855
+Ep 21 Avg Loss: 0.3487
+Ep 21 Val Dice: 0.6320 | Total Pred Pixels: 307899
+  Ep 22 [20/2306] Loss: 0.9690
+  Ep 22 [40/2306] Loss: 0.6927
+  Ep 22 [60/2306] Loss: 0.5503
+  Ep 22 [80/2306] Loss: 0.0000
+  Ep 22 [100/2306] Loss: 0.0739
+  Ep 22 [120/2306] Loss: 0.5494
+  Ep 22 [140/2306] Loss: 0.7126
+  Ep 22 [160/2306] Loss: 0.0000
+  Ep 22 [180/2306] Loss: 0.1623
+  Ep 22 [200/2306] Loss: 0.3210
+  Ep 22 [220/2306] Loss: 0.1044
+  Ep 22 [240/2306] Loss: 0.0000
+  Ep 22 [260/2306] Loss: 0.3405
+  Ep 22 [280/2306] Loss: 0.1962
+  Ep 22 [300/2306] Loss: 0.3450
+  Ep 22 [320/2306] Loss: 0.0000
+  Ep 22 [340/2306] Loss: 0.0000
+  Ep 22 [360/2306] Loss: 0.5000
+  Ep 22 [380/2306] Loss: 0.0000
+  Ep 22 [400/2306] Loss: 0.5060
+  Ep 22 [420/2306] Loss: 0.7894
+  Ep 22 [440/2306] Loss: 0.0000
+  Ep 22 [460/2306] Loss: 0.2692
+  Ep 22 [480/2306] Loss: 0.1865
+  Ep 22 [500/2306] Loss: 0.0000
+  Ep 22 [520/2306] Loss: 0.7667
+  Ep 22 [540/2306] Loss: 0.7953
+  Ep 22 [560/2306] Loss: 0.1665
+  Ep 22 [580/2306] Loss: 0.3227
+  Ep 22 [600/2306] Loss: 0.2532
+  Ep 22 [620/2306] Loss: 0.0679
+  Ep 22 [640/2306] Loss: 0.7913
+  Ep 22 [660/2306] Loss: 0.0000
+  Ep 22 [680/2306] Loss: 0.1401
+  Ep 22 [700/2306] Loss: 0.5757
+  Ep 22 [720/2306] Loss: 0.1520
+  Ep 22 [740/2306] Loss: 0.8111
+  Ep 22 [760/2306] Loss: 0.5358
+  Ep 22 [780/2306] Loss: 0.0886
+  Ep 22 [800/2306] Loss: 0.0001
+  Ep 22 [820/2306] Loss: 0.3545
+  Ep 22 [840/2306] Loss: 0.7169
+  Ep 22 [860/2306] Loss: 0.2740
+  Ep 22 [880/2306] Loss: 0.8575
+  Ep 22 [900/2306] Loss: 1.0000
+  Ep 22 [920/2306] Loss: 0.2520
+  Ep 22 [940/2306] Loss: 0.5006
+  Ep 22 [960/2306] Loss: 0.3180
+  Ep 22 [980/2306] Loss: 0.0000
+  Ep 22 [1000/2306] Loss: 1.2736
+  Ep 22 [1020/2306] Loss: 0.0000
+  Ep 22 [1040/2306] Loss: 0.1393
+  Ep 22 [1060/2306] Loss: 0.6594
+  Ep 22 [1080/2306] Loss: 0.0000
+  Ep 22 [1100/2306] Loss: 0.3702
+  Ep 22 [1120/2306] Loss: 0.3653
+  Ep 22 [1140/2306] Loss: 0.1604
+  Ep 22 [1160/2306] Loss: 0.1721
+  Ep 22 [1180/2306] Loss: 0.5000
+  Ep 22 [1200/2306] Loss: 1.4177
+  Ep 22 [1220/2306] Loss: 0.0590
+  Ep 22 [1240/2306] Loss: 0.6812
+  Ep 22 [1260/2306] Loss: 0.0000
+  Ep 22 [1280/2306] Loss: 0.4092
+  Ep 22 [1300/2306] Loss: 0.2364
+  Ep 22 [1320/2306] Loss: 0.5000
+  Ep 22 [1340/2306] Loss: 0.0789
+  Ep 22 [1360/2306] Loss: 0.8966
+  Ep 22 [1380/2306] Loss: 0.1708
+  Ep 22 [1400/2306] Loss: 0.0000
+  Ep 22 [1420/2306] Loss: 0.2188
+  Ep 22 [1440/2306] Loss: 0.0000
+  Ep 22 [1460/2306] Loss: 0.2092
+  Ep 22 [1480/2306] Loss: 0.0000
+  Ep 22 [1500/2306] Loss: 0.0921
+  Ep 22 [1520/2306] Loss: 0.0000
+  Ep 22 [1540/2306] Loss: 0.5002
+  Ep 22 [1560/2306] Loss: 0.5001
+  Ep 22 [1580/2306] Loss: 0.0000
+  Ep 22 [1600/2306] Loss: 0.0917
+  Ep 22 [1620/2306] Loss: 0.0954
+  Ep 22 [1640/2306] Loss: 0.2105
+  Ep 22 [1660/2306] Loss: 0.1382
+  Ep 22 [1680/2306] Loss: 0.0000
+  Ep 22 [1700/2306] Loss: 0.3450
+  Ep 22 [1720/2306] Loss: 0.1315
+  Ep 22 [1740/2306] Loss: 0.0000
+  Ep 22 [1760/2306] Loss: 0.3101
+  Ep 22 [1780/2306] Loss: 0.0013
+  Ep 22 [1800/2306] Loss: 0.2219
+  Ep 22 [1820/2306] Loss: 0.3542
+  Ep 22 [1840/2306] Loss: 0.1544
+  Ep 22 [1860/2306] Loss: 0.8164
+  Ep 22 [1880/2306] Loss: 0.0000
+  Ep 22 [1900/2306] Loss: 0.6336
+  Ep 22 [1920/2306] Loss: 0.6832
+  Ep 22 [1940/2306] Loss: 0.0466
+  Ep 22 [1960/2306] Loss: 0.0000
+  Ep 22 [1980/2306] Loss: 0.5673
+  Ep 22 [2000/2306] Loss: 0.5550
+  Ep 22 [2020/2306] Loss: 0.3402
+  Ep 22 [2040/2306] Loss: 0.5000
+  Ep 22 [2060/2306] Loss: 0.0634
+  Ep 22 [2080/2306] Loss: 0.6253
+  Ep 22 [2100/2306] Loss: 1.0254
+  Ep 22 [2120/2306] Loss: 0.6438
+  Ep 22 [2140/2306] Loss: 0.5000
+  Ep 22 [2160/2306] Loss: 0.0835
+  Ep 22 [2180/2306] Loss: 0.0000
+  Ep 22 [2200/2306] Loss: 1.1795
+  Ep 22 [2220/2306] Loss: 0.1122
+  Ep 22 [2240/2306] Loss: 0.1285
+  Ep 22 [2260/2306] Loss: 0.0000
+  Ep 22 [2280/2306] Loss: 0.4854
+  Ep 22 [2300/2306] Loss: 0.5000
+Ep 22 Avg Loss: 0.3448
+Ep 22 Val Dice: 0.6371 | Total Pred Pixels: 269952
+  Ep 23 [20/2306] Loss: 0.2307
+  Ep 23 [40/2306] Loss: 0.2910
+  Ep 23 [60/2306] Loss: 0.0580
+  Ep 23 [80/2306] Loss: 0.1690
+  Ep 23 [100/2306] Loss: 0.5847
+  Ep 23 [120/2306] Loss: 0.0000
+  Ep 23 [140/2306] Loss: 0.0000
+  Ep 23 [160/2306] Loss: 0.0624
+  Ep 23 [180/2306] Loss: 0.6930
+  Ep 23 [200/2306] Loss: 0.5000
+  Ep 23 [220/2306] Loss: 0.0000
+  Ep 23 [240/2306] Loss: 0.3720
+  Ep 23 [260/2306] Loss: 0.1983
+  Ep 23 [280/2306] Loss: 0.0952
+  Ep 23 [300/2306] Loss: 0.8688
+  Ep 23 [320/2306] Loss: 0.0000
+  Ep 23 [340/2306] Loss: 0.2068
+  Ep 23 [360/2306] Loss: 1.0011
+  Ep 23 [380/2306] Loss: 0.6569
+  Ep 23 [400/2306] Loss: 1.0379
+  Ep 23 [420/2306] Loss: 0.2419
+  Ep 23 [440/2306] Loss: 0.3177
+  Ep 23 [460/2306] Loss: 0.1638
+  Ep 23 [480/2306] Loss: 0.3576
+  Ep 23 [500/2306] Loss: 0.5000
+  Ep 23 [520/2306] Loss: 0.0000
+  Ep 23 [540/2306] Loss: 0.0000
+  Ep 23 [560/2306] Loss: 0.6583
+  Ep 23 [580/2306] Loss: 0.1058
+  Ep 23 [600/2306] Loss: 0.0000
+  Ep 23 [620/2306] Loss: 0.2392
+  Ep 23 [640/2306] Loss: 0.1533
+  Ep 23 [660/2306] Loss: 0.0680
+  Ep 23 [680/2306] Loss: 0.0000
+  Ep 23 [700/2306] Loss: 0.0459
+  Ep 23 [720/2306] Loss: 0.0975
+  Ep 23 [740/2306] Loss: 0.6547
+  Ep 23 [760/2306] Loss: 0.1821
+  Ep 23 [780/2306] Loss: 0.0000
+  Ep 23 [800/2306] Loss: 0.0699
+  Ep 23 [820/2306] Loss: 0.6592
+  Ep 23 [840/2306] Loss: 0.0475
+  Ep 23 [860/2306] Loss: 0.4855
+  Ep 23 [880/2306] Loss: 0.4979
+  Ep 23 [900/2306] Loss: 0.1117
+  Ep 23 [920/2306] Loss: 0.1557
+  Ep 23 [940/2306] Loss: 1.0572
+  Ep 23 [960/2306] Loss: 0.4442
+  Ep 23 [980/2306] Loss: 0.0000
+  Ep 23 [1000/2306] Loss: 0.5000
+  Ep 23 [1020/2306] Loss: 0.6289
+  Ep 23 [1040/2306] Loss: 1.6585
+  Ep 23 [1060/2306] Loss: 0.3971
+  Ep 23 [1080/2306] Loss: 0.4089
+  Ep 23 [1100/2306] Loss: 0.1768
+  Ep 23 [1120/2306] Loss: 0.1915
+  Ep 23 [1140/2306] Loss: 0.5001
+  Ep 23 [1160/2306] Loss: 0.0000
+  Ep 23 [1180/2306] Loss: 0.3180
+  Ep 23 [1200/2306] Loss: 0.6649
+  Ep 23 [1220/2306] Loss: 0.1126
+  Ep 23 [1240/2306] Loss: 0.3366
+  Ep 23 [1260/2306] Loss: 0.1229
+  Ep 23 [1280/2306] Loss: 0.0000
+  Ep 23 [1300/2306] Loss: 0.1463
+  Ep 23 [1320/2306] Loss: 0.7272
+  Ep 23 [1340/2306] Loss: 1.0643
+  Ep 23 [1360/2306] Loss: 0.6840
+  Ep 23 [1380/2306] Loss: 0.7083
+  Ep 23 [1400/2306] Loss: 0.3764
+  Ep 23 [1420/2306] Loss: 0.7369
+  Ep 23 [1440/2306] Loss: 0.0000
+  Ep 23 [1460/2306] Loss: 0.0929
+  Ep 23 [1480/2306] Loss: 0.1169
+  Ep 23 [1500/2306] Loss: 0.1471
+  Ep 23 [1520/2306] Loss: 0.5000
+  Ep 23 [1540/2306] Loss: 0.1708
+  Ep 23 [1560/2306] Loss: 0.0000
+  Ep 23 [1580/2306] Loss: 0.2975
+  Ep 23 [1600/2306] Loss: 0.0790
+  Ep 23 [1620/2306] Loss: 0.1399
+  Ep 23 [1640/2306] Loss: 0.5560
+  Ep 23 [1660/2306] Loss: 0.8794
+  Ep 23 [1680/2306] Loss: 0.0840
+  Ep 23 [1700/2306] Loss: 0.2719
+  Ep 23 [1720/2306] Loss: 0.2940
+  Ep 23 [1740/2306] Loss: 0.2728
+  Ep 23 [1760/2306] Loss: 0.4148
+  Ep 23 [1780/2306] Loss: 0.1065
+  Ep 23 [1800/2306] Loss: 0.1127
+  Ep 23 [1820/2306] Loss: 0.3288
+  Ep 23 [1840/2306] Loss: 0.4472
+  Ep 23 [1860/2306] Loss: 0.2892
+  Ep 23 [1880/2306] Loss: 0.6981
+  Ep 23 [1900/2306] Loss: 0.0984
+  Ep 23 [1920/2306] Loss: 0.0943
+  Ep 23 [1940/2306] Loss: 0.5257
+  Ep 23 [1960/2306] Loss: 0.1734
+  Ep 23 [1980/2306] Loss: 0.6383
+  Ep 23 [2000/2306] Loss: 0.1679
+  Ep 23 [2020/2306] Loss: 0.5042
+  Ep 23 [2040/2306] Loss: 0.0000
+  Ep 23 [2060/2306] Loss: 0.5885
+  Ep 23 [2080/2306] Loss: 0.0000
+  Ep 23 [2100/2306] Loss: 0.3851
+  Ep 23 [2120/2306] Loss: 0.6289
+  Ep 23 [2140/2306] Loss: 0.6267
+  Ep 23 [2160/2306] Loss: 0.2464
+  Ep 23 [2180/2306] Loss: 0.5710
+  Ep 23 [2200/2306] Loss: 0.0660
+  Ep 23 [2220/2306] Loss: 0.4279
+  Ep 23 [2240/2306] Loss: 0.5000
+  Ep 23 [2260/2306] Loss: 0.2582
+  Ep 23 [2280/2306] Loss: 0.6820
+  Ep 23 [2300/2306] Loss: 0.2122
+Ep 23 Avg Loss: 0.3615
+Ep 23 Val Dice: 0.6340 | Total Pred Pixels: 338744
+  Ep 24 [20/2306] Loss: 0.3576
+  Ep 24 [40/2306] Loss: 0.1018
+  Ep 24 [60/2306] Loss: 0.7187
+  Ep 24 [80/2306] Loss: 0.0654
+  Ep 24 [100/2306] Loss: 0.0836
+  Ep 24 [120/2306] Loss: 0.1719
+  Ep 24 [140/2306] Loss: 0.5875
+  Ep 24 [160/2306] Loss: 0.8660
+  Ep 24 [180/2306] Loss: 0.5000
+  Ep 24 [200/2306] Loss: 0.6969
+  Ep 24 [220/2306] Loss: 0.1215
+  Ep 24 [240/2306] Loss: 0.7334
+  Ep 24 [260/2306] Loss: 0.0898
+  Ep 24 [280/2306] Loss: 0.7103
+  Ep 24 [300/2306] Loss: 0.5000
+  Ep 24 [320/2306] Loss: 0.1110
+  Ep 24 [340/2306] Loss: 1.0278
+  Ep 24 [360/2306] Loss: 0.1449
+  Ep 24 [380/2306] Loss: 0.8079
+  Ep 24 [400/2306] Loss: 0.1053
+  Ep 24 [420/2306] Loss: 0.3844
+  Ep 24 [440/2306] Loss: 0.2118
+  Ep 24 [460/2306] Loss: 0.4239
+  Ep 24 [480/2306] Loss: 0.0961
+  Ep 24 [500/2306] Loss: 0.0642
+  Ep 24 [520/2306] Loss: 0.1298
+  Ep 24 [540/2306] Loss: 0.0000
+  Ep 24 [560/2306] Loss: 0.0000
+  Ep 24 [580/2306] Loss: 0.2231
+  Ep 24 [600/2306] Loss: 0.0000
+  Ep 24 [620/2306] Loss: 0.4721
+  Ep 24 [640/2306] Loss: 0.5886
+  Ep 24 [660/2306] Loss: 0.4638
+  Ep 24 [680/2306] Loss: 0.2932
+  Ep 24 [700/2306] Loss: 0.5000
+  Ep 24 [720/2306] Loss: 0.5001
+  Ep 24 [740/2306] Loss: 0.1136
+  Ep 24 [760/2306] Loss: 0.5000
+  Ep 24 [780/2306] Loss: 0.8093
+  Ep 24 [800/2306] Loss: 0.5765
+  Ep 24 [820/2306] Loss: 0.3474
+  Ep 24 [840/2306] Loss: 0.3803
+  Ep 24 [860/2306] Loss: 0.1393
+  Ep 24 [880/2306] Loss: 0.3153
+  Ep 24 [900/2306] Loss: 0.1537
+  Ep 24 [920/2306] Loss: 0.1076
+  Ep 24 [940/2306] Loss: 0.0927
+  Ep 24 [960/2306] Loss: 0.1114
+  Ep 24 [980/2306] Loss: 0.7988
+  Ep 24 [1000/2306] Loss: 0.5237
+  Ep 24 [1020/2306] Loss: 0.0000
+  Ep 24 [1040/2306] Loss: 0.0000
+  Ep 24 [1060/2306] Loss: 0.3124
+  Ep 24 [1080/2306] Loss: 0.7769
+  Ep 24 [1100/2306] Loss: 0.7919
+  Ep 24 [1120/2306] Loss: 0.1589
+  Ep 24 [1140/2306] Loss: 0.6289
+  Ep 24 [1160/2306] Loss: 0.6029
+  Ep 24 [1180/2306] Loss: 0.6928
+  Ep 24 [1200/2306] Loss: 0.1376
+  Ep 24 [1220/2306] Loss: 0.0000
+  Ep 24 [1240/2306] Loss: 0.9909
+  Ep 24 [1260/2306] Loss: 0.6915
+  Ep 24 [1280/2306] Loss: 0.0000
+  Ep 24 [1300/2306] Loss: 0.0688
+  Ep 24 [1320/2306] Loss: 0.6087
+  Ep 24 [1340/2306] Loss: 0.2807
+  Ep 24 [1360/2306] Loss: 0.5000
+  Ep 24 [1380/2306] Loss: 0.2048
+  Ep 24 [1400/2306] Loss: 0.3696
+  Ep 24 [1420/2306] Loss: 0.6236
+  Ep 24 [1440/2306] Loss: 0.0000
+  Ep 24 [1460/2306] Loss: 0.4549
+  Ep 24 [1480/2306] Loss: 0.2820
+  Ep 24 [1500/2306] Loss: 0.0724
+  Ep 24 [1520/2306] Loss: 0.0000
+  Ep 24 [1540/2306] Loss: 0.6056
+  Ep 24 [1560/2306] Loss: 0.0000
+  Ep 24 [1580/2306] Loss: 0.1083
+  Ep 24 [1600/2306] Loss: 0.0000
+  Ep 24 [1620/2306] Loss: 0.9907
+  Ep 24 [1640/2306] Loss: 0.0000
+  Ep 24 [1660/2306] Loss: 0.6323
+  Ep 24 [1680/2306] Loss: 0.2320
+  Ep 24 [1700/2306] Loss: 0.1476
+  Ep 24 [1720/2306] Loss: 0.3183
+  Ep 24 [1740/2306] Loss: 0.2596
+  Ep 24 [1760/2306] Loss: 0.1529
+  Ep 24 [1780/2306] Loss: 0.0000
+  Ep 24 [1800/2306] Loss: 0.5775
+  Ep 24 [1820/2306] Loss: 0.5000
+  Ep 24 [1840/2306] Loss: 0.7658
+  Ep 24 [1860/2306] Loss: 0.0753
+  Ep 24 [1880/2306] Loss: 0.2050
+  Ep 24 [1900/2306] Loss: 0.5183
+  Ep 24 [1920/2306] Loss: 0.7977
+  Ep 24 [1940/2306] Loss: 0.6435
+  Ep 24 [1960/2306] Loss: 0.0000
+  Ep 24 [1980/2306] Loss: 0.3153
+  Ep 24 [2000/2306] Loss: 0.4060
+  Ep 24 [2020/2306] Loss: 0.0000
+  Ep 24 [2040/2306] Loss: 0.2053
+  Ep 24 [2060/2306] Loss: 0.1951
+  Ep 24 [2080/2306] Loss: 0.0000
+  Ep 24 [2100/2306] Loss: 0.2437
+  Ep 24 [2120/2306] Loss: 0.1043
+  Ep 24 [2140/2306] Loss: 0.1120
+  Ep 24 [2160/2306] Loss: 0.1297
+  Ep 24 [2180/2306] Loss: 0.6233
+  Ep 24 [2200/2306] Loss: 0.0000
+  Ep 24 [2220/2306] Loss: 0.0000
+  Ep 24 [2240/2306] Loss: 0.5000
+  Ep 24 [2260/2306] Loss: 0.3401
+  Ep 24 [2280/2306] Loss: 0.4242
+  Ep 24 [2300/2306] Loss: 0.0001
+Ep 24 Avg Loss: 0.3637
+Ep 24 Val Dice: 0.4885 | Total Pred Pixels: 450670
+  Ep 25 [20/2306] Loss: 0.0001
+  Ep 25 [40/2306] Loss: 0.1753
+  Ep 25 [60/2306] Loss: 0.6162
+  Ep 25 [80/2306] Loss: 0.0000
+  Ep 25 [100/2306] Loss: 0.4544
+  Ep 25 [120/2306] Loss: 0.2519
+  Ep 25 [140/2306] Loss: 0.5635
+  Ep 25 [160/2306] Loss: 0.2796
+  Ep 25 [180/2306] Loss: 0.3677
+  Ep 25 [200/2306] Loss: 0.5321
+  Ep 25 [220/2306] Loss: 0.1054
+  Ep 25 [240/2306] Loss: 0.6805
+  Ep 25 [260/2306] Loss: 0.0000
+  Ep 25 [280/2306] Loss: 1.1662
+  Ep 25 [300/2306] Loss: 0.4778
+  Ep 25 [320/2306] Loss: 0.5637
+  Ep 25 [340/2306] Loss: 0.5924
+  Ep 25 [360/2306] Loss: 0.5232
+  Ep 25 [380/2306] Loss: 0.6004
+  Ep 25 [400/2306] Loss: 0.1625
+  Ep 25 [420/2306] Loss: 0.0000
+  Ep 25 [440/2306] Loss: 0.8621
+  Ep 25 [460/2306] Loss: 0.1685
+  Ep 25 [480/2306] Loss: 0.5000
+  Ep 25 [500/2306] Loss: 0.5000
+  Ep 25 [520/2306] Loss: 0.0001
+  Ep 25 [540/2306] Loss: 0.0867
+  Ep 25 [560/2306] Loss: 0.0000
+  Ep 25 [580/2306] Loss: 0.8995
+  Ep 25 [600/2306] Loss: 0.1074
+  Ep 25 [620/2306] Loss: 0.7729
+  Ep 25 [640/2306] Loss: 0.5000
+  Ep 25 [660/2306] Loss: 0.0000
+  Ep 25 [680/2306] Loss: 1.2784
+  Ep 25 [700/2306] Loss: 0.0000
+  Ep 25 [720/2306] Loss: 0.5909
+  Ep 25 [740/2306] Loss: 0.0925
+  Ep 25 [760/2306] Loss: 0.6182
+  Ep 25 [780/2306] Loss: 0.1371
+  Ep 25 [800/2306] Loss: 0.0683
+  Ep 25 [820/2306] Loss: 0.4662
+  Ep 25 [840/2306] Loss: 0.1480
+  Ep 25 [860/2306] Loss: 0.0919
+  Ep 25 [880/2306] Loss: 0.5921
+  Ep 25 [900/2306] Loss: 1.2933
+  Ep 25 [920/2306] Loss: 0.1142
+  Ep 25 [940/2306] Loss: 1.0735
+  Ep 25 [960/2306] Loss: 0.2235
+  Ep 25 [980/2306] Loss: 0.2138
+  Ep 25 [1000/2306] Loss: 0.6745
+  Ep 25 [1020/2306] Loss: 1.0001
+  Ep 25 [1040/2306] Loss: 0.7344
+  Ep 25 [1060/2306] Loss: 0.6733
+  Ep 25 [1080/2306] Loss: 0.8095
+  Ep 25 [1100/2306] Loss: 0.0000
+  Ep 25 [1120/2306] Loss: 0.4074
+  Ep 25 [1140/2306] Loss: 0.0000
+  Ep 25 [1160/2306] Loss: 0.2529
+  Ep 25 [1180/2306] Loss: 0.6030
+  Ep 25 [1200/2306] Loss: 0.0746
+  Ep 25 [1220/2306] Loss: 0.0000
+  Ep 25 [1240/2306] Loss: 1.0430
+  Ep 25 [1260/2306] Loss: 1.1334
+  Ep 25 [1280/2306] Loss: 0.1338
+  Ep 25 [1300/2306] Loss: 0.6322
+  Ep 25 [1320/2306] Loss: 0.7177
+  Ep 25 [1340/2306] Loss: 0.3966
+  Ep 25 [1360/2306] Loss: 0.1185
+  Ep 25 [1380/2306] Loss: 0.7609
+  Ep 25 [1400/2306] Loss: 0.1672
+  Ep 25 [1420/2306] Loss: 0.5000
+  Ep 25 [1440/2306] Loss: 0.1734
+  Ep 25 [1460/2306] Loss: 0.1367
+  Ep 25 [1480/2306] Loss: 0.5169
+  Ep 25 [1500/2306] Loss: 0.8272
+  Ep 25 [1520/2306] Loss: 0.2195
+  Ep 25 [1540/2306] Loss: 0.1027
+  Ep 25 [1560/2306] Loss: 0.5000
+  Ep 25 [1580/2306] Loss: 0.0000
+  Ep 25 [1600/2306] Loss: 0.4339
+  Ep 25 [1620/2306] Loss: 0.1451
+  Ep 25 [1640/2306] Loss: 0.3724
+  Ep 25 [1660/2306] Loss: 1.0053
+  Ep 25 [1680/2306] Loss: 0.7514
+  Ep 25 [1700/2306] Loss: 0.6640
+  Ep 25 [1720/2306] Loss: 0.6022
+  Ep 25 [1740/2306] Loss: 0.0386
+  Ep 25 [1760/2306] Loss: 0.0000
+  Ep 25 [1780/2306] Loss: 0.3855
+  Ep 25 [1800/2306] Loss: 0.8105
+  Ep 25 [1820/2306] Loss: 0.5000
+  Ep 25 [1840/2306] Loss: 0.0000
+  Ep 25 [1860/2306] Loss: 0.0000
+  Ep 25 [1880/2306] Loss: 1.0411
+  Ep 25 [1900/2306] Loss: 0.0686
+  Ep 25 [1920/2306] Loss: 0.0000
+  Ep 25 [1940/2306] Loss: 0.0558
+  Ep 25 [1960/2306] Loss: 0.1134
+  Ep 25 [1980/2306] Loss: 0.3501
+  Ep 25 [2000/2306] Loss: 0.2935
+  Ep 25 [2020/2306] Loss: 0.5000
+  Ep 25 [2040/2306] Loss: 0.1261
+  Ep 25 [2060/2306] Loss: 0.8356
+  Ep 25 [2080/2306] Loss: 0.5000
+  Ep 25 [2100/2306] Loss: 0.0712
+  Ep 25 [2120/2306] Loss: 0.0759
+  Ep 25 [2140/2306] Loss: 0.0000
+  Ep 25 [2160/2306] Loss: 0.1435
+  Ep 25 [2180/2306] Loss: 0.2825
+  Ep 25 [2200/2306] Loss: 0.7914
+  Ep 25 [2220/2306] Loss: 0.0000
+  Ep 25 [2240/2306] Loss: 0.0005
+  Ep 25 [2260/2306] Loss: 1.1035
+  Ep 25 [2280/2306] Loss: 0.4196
+  Ep 25 [2300/2306] Loss: 0.0000
+Ep 25 Avg Loss: 0.3757
+Ep 25 Val Dice: 0.6341 | Total Pred Pixels: 388287
+  Ep 26 [20/2306] Loss: 0.4466
+  Ep 26 [40/2306] Loss: 0.0866
+  Ep 26 [60/2306] Loss: 0.0000
+  Ep 26 [80/2306] Loss: 0.3922
+  Ep 26 [100/2306] Loss: 0.2960
+  Ep 26 [120/2306] Loss: 0.3871
+  Ep 26 [140/2306] Loss: 0.1550
+  Ep 26 [160/2306] Loss: 0.5365
+  Ep 26 [180/2306] Loss: 0.8816
+  Ep 26 [200/2306] Loss: 0.2570
+  Ep 26 [220/2306] Loss: 0.2888
+  Ep 26 [240/2306] Loss: 1.1129
+  Ep 26 [260/2306] Loss: 0.1447
+  Ep 26 [280/2306] Loss: 0.1780
+  Ep 26 [300/2306] Loss: 0.0000
+  Ep 26 [320/2306] Loss: 0.8517
+  Ep 26 [340/2306] Loss: 0.5309
+  Ep 26 [360/2306] Loss: 0.0984
+  Ep 26 [380/2306] Loss: 1.1493
+  Ep 26 [400/2306] Loss: 0.0000
+  Ep 26 [420/2306] Loss: 0.1899
+  Ep 26 [440/2306] Loss: 0.0000
+  Ep 26 [460/2306] Loss: 0.5832
+  Ep 26 [480/2306] Loss: 0.1297
+  Ep 26 [500/2306] Loss: 0.0000
+  Ep 26 [520/2306] Loss: 0.9531
+  Ep 26 [540/2306] Loss: 0.5001
+  Ep 26 [560/2306] Loss: 0.1827
+  Ep 26 [580/2306] Loss: 0.0000
+  Ep 26 [600/2306] Loss: 0.6560
+  Ep 26 [620/2306] Loss: 0.2328
+  Ep 26 [640/2306] Loss: 0.2744
+  Ep 26 [660/2306] Loss: 0.2776
+  Ep 26 [680/2306] Loss: 0.0000
+  Ep 26 [700/2306] Loss: 0.8778
+  Ep 26 [720/2306] Loss: 0.3710
+  Ep 26 [740/2306] Loss: 1.1482
+  Ep 26 [760/2306] Loss: 0.1092
+  Ep 26 [780/2306] Loss: 0.5000
+  Ep 26 [800/2306] Loss: 1.0000
+  Ep 26 [820/2306] Loss: 0.2764
+  Ep 26 [840/2306] Loss: 0.9854
+  Ep 26 [860/2306] Loss: 0.5003
+  Ep 26 [880/2306] Loss: 0.5001
+  Ep 26 [900/2306] Loss: 0.0000
+  Ep 26 [920/2306] Loss: 0.2557
+  Ep 26 [940/2306] Loss: 0.2310
+  Ep 26 [960/2306] Loss: 0.6195
+  Ep 26 [980/2306] Loss: 0.0000
+  Ep 26 [1000/2306] Loss: 0.0955
+  Ep 26 [1020/2306] Loss: 0.6523
+  Ep 26 [1040/2306] Loss: 0.1121
+  Ep 26 [1060/2306] Loss: 0.1810
+  Ep 26 [1080/2306] Loss: 0.1070
+  Ep 26 [1100/2306] Loss: 0.1068
+  Ep 26 [1120/2306] Loss: 0.5214
+  Ep 26 [1140/2306] Loss: 0.2166
+  Ep 26 [1160/2306] Loss: 0.0000
+  Ep 26 [1180/2306] Loss: 0.0000
+  Ep 26 [1200/2306] Loss: 0.5001
+  Ep 26 [1220/2306] Loss: 0.0855
+  Ep 26 [1240/2306] Loss: 0.5000
+  Ep 26 [1260/2306] Loss: 0.2887
+  Ep 26 [1280/2306] Loss: 0.1397
+  Ep 26 [1300/2306] Loss: 1.1405
+  Ep 26 [1320/2306] Loss: 0.3212
+  Ep 26 [1340/2306] Loss: 0.3637
+  Ep 26 [1360/2306] Loss: 0.5344
+  Ep 26 [1380/2306] Loss: 0.5000
+  Ep 26 [1400/2306] Loss: 0.4826
+  Ep 26 [1420/2306] Loss: 0.3176
+  Ep 26 [1440/2306] Loss: 0.2895
+  Ep 26 [1460/2306] Loss: 0.7299
+  Ep 26 [1480/2306] Loss: 0.2668
+  Ep 26 [1500/2306] Loss: 0.5000
+  Ep 26 [1520/2306] Loss: 0.6085
+  Ep 26 [1540/2306] Loss: 0.2746
+  Ep 26 [1560/2306] Loss: 0.0000
+  Ep 26 [1580/2306] Loss: 0.2552
+  Ep 26 [1600/2306] Loss: 0.5001
+  Ep 26 [1620/2306] Loss: 0.0000
+  Ep 26 [1640/2306] Loss: 0.4916
+  Ep 26 [1660/2306] Loss: 0.0000
+  Ep 26 [1680/2306] Loss: 0.5201
+  Ep 26 [1700/2306] Loss: 0.9606
+  Ep 26 [1720/2306] Loss: 0.0854
+  Ep 26 [1740/2306] Loss: 0.1145
+  Ep 26 [1760/2306] Loss: 0.3059
+  Ep 26 [1780/2306] Loss: 0.0000
+  Ep 26 [1800/2306] Loss: 0.2026
+  Ep 26 [1820/2306] Loss: 0.2895
+  Ep 26 [1840/2306] Loss: 0.0000
+  Ep 26 [1860/2306] Loss: 0.6156
+  Ep 26 [1880/2306] Loss: 0.0000
+  Ep 26 [1900/2306] Loss: 0.5800
+  Ep 26 [1920/2306] Loss: 0.2672
+  Ep 26 [1940/2306] Loss: 0.1585
+  Ep 26 [1960/2306] Loss: 0.0000
+  Ep 26 [1980/2306] Loss: 0.4040
+  Ep 26 [2000/2306] Loss: 0.5001
+  Ep 26 [2020/2306] Loss: 0.0000
+  Ep 26 [2040/2306] Loss: 0.0029
+  Ep 26 [2060/2306] Loss: 0.6867
+  Ep 26 [2080/2306] Loss: 0.5000
+  Ep 26 [2100/2306] Loss: 0.5001
+  Ep 26 [2120/2306] Loss: 0.2780
+  Ep 26 [2140/2306] Loss: 0.3472
+  Ep 26 [2160/2306] Loss: 0.9353
+  Ep 26 [2180/2306] Loss: 0.0000
+  Ep 26 [2200/2306] Loss: 0.0631
+  Ep 26 [2220/2306] Loss: 0.2952
+  Ep 26 [2240/2306] Loss: 0.0823
+  Ep 26 [2260/2306] Loss: 0.1292
+  Ep 26 [2280/2306] Loss: 0.0417
+  Ep 26 [2300/2306] Loss: 0.5000
+Ep 26 Avg Loss: 0.3542
+Ep 26 Val Dice: 0.6210 | Total Pred Pixels: 331952
+  Ep 27 [20/2306] Loss: 0.3756
+  Ep 27 [40/2306] Loss: 0.1291
+  Ep 27 [60/2306] Loss: 0.3512
+  Ep 27 [80/2306] Loss: 0.7005
+  Ep 27 [100/2306] Loss: 0.3096
+  Ep 27 [120/2306] Loss: 0.1665
+  Ep 27 [140/2306] Loss: 0.1197
+  Ep 27 [160/2306] Loss: 0.5884
+  Ep 27 [180/2306] Loss: 0.0789
+  Ep 27 [200/2306] Loss: 0.3466
+  Ep 27 [220/2306] Loss: 0.9023
+  Ep 27 [240/2306] Loss: 0.0000
+  Ep 27 [260/2306] Loss: 0.0000
+  Ep 27 [280/2306] Loss: 0.6612
+  Ep 27 [300/2306] Loss: 0.3244
+  Ep 27 [320/2306] Loss: 0.7546
+  Ep 27 [340/2306] Loss: 0.8214
+  Ep 27 [360/2306] Loss: 0.3644
+  Ep 27 [380/2306] Loss: 0.0000
+  Ep 27 [400/2306] Loss: 0.0000
+  Ep 27 [420/2306] Loss: 0.6012
+  Ep 27 [440/2306] Loss: 1.4004
+  Ep 27 [460/2306] Loss: 1.0000
+  Ep 27 [480/2306] Loss: 0.4412
+  Ep 27 [500/2306] Loss: 0.2634
+  Ep 27 [520/2306] Loss: 0.4229
+  Ep 27 [540/2306] Loss: 0.6660
+  Ep 27 [560/2306] Loss: 0.3021
+  Ep 27 [580/2306] Loss: 0.6620
+  Ep 27 [600/2306] Loss: 0.0000
+  Ep 27 [620/2306] Loss: 0.2326
+  Ep 27 [640/2306] Loss: 0.0000
+  Ep 27 [660/2306] Loss: 0.5743
+  Ep 27 [680/2306] Loss: 0.1764
+  Ep 27 [700/2306] Loss: 0.2063
+  Ep 27 [720/2306] Loss: 0.0700
+  Ep 27 [740/2306] Loss: 0.7738
+  Ep 27 [760/2306] Loss: 0.6562
+  Ep 27 [780/2306] Loss: 0.6367
+  Ep 27 [800/2306] Loss: 0.7823
+  Ep 27 [820/2306] Loss: 1.0251
+  Ep 27 [840/2306] Loss: 0.1172
+  Ep 27 [860/2306] Loss: 0.0000
+  Ep 27 [880/2306] Loss: 0.7450
+  Ep 27 [900/2306] Loss: 0.7098
+  Ep 27 [920/2306] Loss: 0.7671
+  Ep 27 [940/2306] Loss: 0.6192
+  Ep 27 [960/2306] Loss: 0.4088
+  Ep 27 [980/2306] Loss: 0.2959
+  Ep 27 [1000/2306] Loss: 0.0817
+  Ep 27 [1020/2306] Loss: 0.0000
+  Ep 27 [1040/2306] Loss: 0.0000
+  Ep 27 [1060/2306] Loss: 0.6880
+  Ep 27 [1080/2306] Loss: 0.2426
+  Ep 27 [1100/2306] Loss: 0.5000
+  Ep 27 [1120/2306] Loss: 0.0000
+  Ep 27 [1140/2306] Loss: 0.5003
+  Ep 27 [1160/2306] Loss: 0.0593
+  Ep 27 [1180/2306] Loss: 1.1538
+  Ep 27 [1200/2306] Loss: 0.0000
+  Ep 27 [1220/2306] Loss: 0.4433
+  Ep 27 [1240/2306] Loss: 0.2484
+  Ep 27 [1260/2306] Loss: 0.0974
+  Ep 27 [1280/2306] Loss: 0.2858
+  Ep 27 [1300/2306] Loss: 0.1268
+  Ep 27 [1320/2306] Loss: 0.4140
+  Ep 27 [1340/2306] Loss: 0.3377
+  Ep 27 [1360/2306] Loss: 0.0000
+  Ep 27 [1380/2306] Loss: 1.4433
+  Ep 27 [1400/2306] Loss: 0.1461
+  Ep 27 [1420/2306] Loss: 0.5014
+  Ep 27 [1440/2306] Loss: 0.4675
+  Ep 27 [1460/2306] Loss: 0.4709
+  Ep 27 [1480/2306] Loss: 0.4145
+  Ep 27 [1500/2306] Loss: 0.0000
+  Ep 27 [1520/2306] Loss: 0.5000
+  Ep 27 [1540/2306] Loss: 0.5030
+  Ep 27 [1560/2306] Loss: 0.2792
+  Ep 27 [1580/2306] Loss: 0.0666
+  Ep 27 [1600/2306] Loss: 0.8455
+  Ep 27 [1620/2306] Loss: 0.4191
+  Ep 27 [1640/2306] Loss: 0.6266
+  Ep 27 [1660/2306] Loss: 0.5097
+  Ep 27 [1680/2306] Loss: 0.5278
+  Ep 27 [1700/2306] Loss: 0.0872
+  Ep 27 [1720/2306] Loss: 0.5000
+  Ep 27 [1740/2306] Loss: 0.5667
+  Ep 27 [1760/2306] Loss: 0.1629
+  Ep 27 [1780/2306] Loss: 0.2578
+  Ep 27 [1800/2306] Loss: 0.0544
+  Ep 27 [1820/2306] Loss: 0.2465
+  Ep 27 [1840/2306] Loss: 0.0766
+  Ep 27 [1860/2306] Loss: 0.0000
+  Ep 27 [1880/2306] Loss: 0.7727
+  Ep 27 [1900/2306] Loss: 0.3539
+  Ep 27 [1920/2306] Loss: 0.0000
+  Ep 27 [1940/2306] Loss: 0.0000
+  Ep 27 [1960/2306] Loss: 1.0001
+  Ep 27 [1980/2306] Loss: 0.2140
+  Ep 27 [2000/2306] Loss: 0.0704
+  Ep 27 [2020/2306] Loss: 1.0788
+  Ep 27 [2040/2306] Loss: 0.2785
+  Ep 27 [2060/2306] Loss: 1.0908
+  Ep 27 [2080/2306] Loss: 0.2230
+  Ep 27 [2100/2306] Loss: 0.0000
+  Ep 27 [2120/2306] Loss: 0.4482
+  Ep 27 [2140/2306] Loss: 0.9474
+  Ep 27 [2160/2306] Loss: 0.1227
+  Ep 27 [2180/2306] Loss: 0.3801
+  Ep 27 [2200/2306] Loss: 0.9826
+  Ep 27 [2220/2306] Loss: 0.0000
+  Ep 27 [2240/2306] Loss: 0.2305
+  Ep 27 [2260/2306] Loss: 0.0000
+  Ep 27 [2280/2306] Loss: 0.5000
+  Ep 27 [2300/2306] Loss: 0.2320
+Ep 27 Avg Loss: 0.3495
+Ep 27 Val Dice: 0.6654 | Total Pred Pixels: 251623
+  >>> New Best Model (Dice: 0.6654)
+  Ep 28 [20/2306] Loss: 0.3315
+  Ep 28 [40/2306] Loss: 0.5112
+  Ep 28 [60/2306] Loss: 0.1685
+  Ep 28 [80/2306] Loss: 0.1482
+  Ep 28 [100/2306] Loss: 0.0000
+  Ep 28 [120/2306] Loss: 0.2641
+  Ep 28 [140/2306] Loss: 0.5010
+  Ep 28 [160/2306] Loss: 0.1053
+  Ep 28 [180/2306] Loss: 0.1203
+  Ep 28 [200/2306] Loss: 0.0000
+  Ep 28 [220/2306] Loss: 0.0000
+  Ep 28 [240/2306] Loss: 0.3436
+  Ep 28 [260/2306] Loss: 1.0451
+  Ep 28 [280/2306] Loss: 0.1566
+  Ep 28 [300/2306] Loss: 0.1470
+  Ep 28 [320/2306] Loss: 0.5811
+  Ep 28 [340/2306] Loss: 0.0000
+  Ep 28 [360/2306] Loss: 0.0465
+  Ep 28 [380/2306] Loss: 0.5000
+  Ep 28 [400/2306] Loss: 0.0000
+  Ep 28 [420/2306] Loss: 0.7775
+  Ep 28 [440/2306] Loss: 0.1035
+  Ep 28 [460/2306] Loss: 0.0000
+  Ep 28 [480/2306] Loss: 0.7654
+  Ep 28 [500/2306] Loss: 0.2916
+  Ep 28 [520/2306] Loss: 0.0000
+  Ep 28 [540/2306] Loss: 0.1198
+  Ep 28 [560/2306] Loss: 0.1477
+  Ep 28 [580/2306] Loss: 0.5283
+  Ep 28 [600/2306] Loss: 0.0000
+  Ep 28 [620/2306] Loss: 0.0000
+  Ep 28 [640/2306] Loss: 0.1176
+  Ep 28 [660/2306] Loss: 1.3114
+  Ep 28 [680/2306] Loss: 0.3363
+  Ep 28 [700/2306] Loss: 0.2514
+  Ep 28 [720/2306] Loss: 0.4058
+  Ep 28 [740/2306] Loss: 0.4800
+  Ep 28 [760/2306] Loss: 0.2132
+  Ep 28 [780/2306] Loss: 0.1705
+  Ep 28 [800/2306] Loss: 0.4219
+  Ep 28 [820/2306] Loss: 1.0001
+  Ep 28 [840/2306] Loss: 0.1120
+  Ep 28 [860/2306] Loss: 0.2517
+  Ep 28 [880/2306] Loss: 0.0761
+  Ep 28 [900/2306] Loss: 0.5646
+  Ep 28 [920/2306] Loss: 0.5000
+  Ep 28 [940/2306] Loss: 0.6215
+  Ep 28 [960/2306] Loss: 0.0000
+  Ep 28 [980/2306] Loss: 0.2696
+  Ep 28 [1000/2306] Loss: 0.0439
+  Ep 28 [1020/2306] Loss: 0.2621
+  Ep 28 [1040/2306] Loss: 0.5000
+  Ep 28 [1060/2306] Loss: 0.0000
+  Ep 28 [1080/2306] Loss: 0.6478
+  Ep 28 [1100/2306] Loss: 0.3694
+  Ep 28 [1120/2306] Loss: 0.2367
+  Ep 28 [1140/2306] Loss: 0.3073
+  Ep 28 [1160/2306] Loss: 0.5000
+  Ep 28 [1180/2306] Loss: 0.1536
+  Ep 28 [1200/2306] Loss: 0.0000
+  Ep 28 [1220/2306] Loss: 0.0000
+  Ep 28 [1240/2306] Loss: 0.6651
+  Ep 28 [1260/2306] Loss: 0.5927
+  Ep 28 [1280/2306] Loss: 0.3327
+  Ep 28 [1300/2306] Loss: 0.0968
+  Ep 28 [1320/2306] Loss: 0.7290
+  Ep 28 [1340/2306] Loss: 0.0000
+  Ep 28 [1360/2306] Loss: 0.4553
+  Ep 28 [1380/2306] Loss: 0.5008
+  Ep 28 [1400/2306] Loss: 0.6554
+  Ep 28 [1420/2306] Loss: 0.3288
+  Ep 28 [1440/2306] Loss: 0.0000
+  Ep 28 [1460/2306] Loss: 0.5739
+  Ep 28 [1480/2306] Loss: 0.6061
+  Ep 28 [1500/2306] Loss: 0.1681
+  Ep 28 [1520/2306] Loss: 0.2774
+  Ep 28 [1540/2306] Loss: 0.3030
+  Ep 28 [1560/2306] Loss: 0.0000
+  Ep 28 [1580/2306] Loss: 0.1986
+  Ep 28 [1600/2306] Loss: 0.2538
+  Ep 28 [1620/2306] Loss: 0.1715
+  Ep 28 [1640/2306] Loss: 0.9760
+  Ep 28 [1660/2306] Loss: 0.1276
+  Ep 28 [1680/2306] Loss: 0.1104
+  Ep 28 [1700/2306] Loss: 0.5000
+  Ep 28 [1720/2306] Loss: 0.0000
+  Ep 28 [1740/2306] Loss: 0.0940
+  Ep 28 [1760/2306] Loss: 0.7424
+  Ep 28 [1780/2306] Loss: 1.1711
+  Ep 28 [1800/2306] Loss: 0.2138
+  Ep 28 [1820/2306] Loss: 0.4322
+  Ep 28 [1840/2306] Loss: 0.5964
+  Ep 28 [1860/2306] Loss: 0.2409
+  Ep 28 [1880/2306] Loss: 0.1143
+  Ep 28 [1900/2306] Loss: 0.0000
+  Ep 28 [1920/2306] Loss: 0.2503
+  Ep 28 [1940/2306] Loss: 0.3054
+  Ep 28 [1960/2306] Loss: 1.0833
+  Ep 28 [1980/2306] Loss: 0.9267
+  Ep 28 [2000/2306] Loss: 0.5000
+  Ep 28 [2020/2306] Loss: 0.6717
+  Ep 28 [2040/2306] Loss: 0.3176
+  Ep 28 [2060/2306] Loss: 0.3236
+  Ep 28 [2080/2306] Loss: 0.0737
+  Ep 28 [2100/2306] Loss: 1.1642
+  Ep 28 [2120/2306] Loss: 0.3791
+  Ep 28 [2140/2306] Loss: 0.3281
+  Ep 28 [2160/2306] Loss: 0.0740
+  Ep 28 [2180/2306] Loss: 0.1696
+  Ep 28 [2200/2306] Loss: 0.2347
+  Ep 28 [2220/2306] Loss: 0.3753
+  Ep 28 [2240/2306] Loss: 0.0000
+  Ep 28 [2260/2306] Loss: 0.7348
+  Ep 28 [2280/2306] Loss: 0.6017
+  Ep 28 [2300/2306] Loss: 0.0000
+Ep 28 Avg Loss: 0.3429
+Ep 28 Val Dice: 0.6103 | Total Pred Pixels: 462043
+  Ep 29 [20/2306] Loss: 0.5000
+  Ep 29 [40/2306] Loss: 0.0931
+  Ep 29 [60/2306] Loss: 0.1328
+  Ep 29 [80/2306] Loss: 0.2666
+  Ep 29 [100/2306] Loss: 0.5432
+  Ep 29 [120/2306] Loss: 0.4351
+  Ep 29 [140/2306] Loss: 0.1367
+  Ep 29 [160/2306] Loss: 0.5001
+  Ep 29 [180/2306] Loss: 0.3568
+  Ep 29 [200/2306] Loss: 0.6882
+  Ep 29 [220/2306] Loss: 0.1975
+  Ep 29 [240/2306] Loss: 0.5796
+  Ep 29 [260/2306] Loss: 0.6195
+  Ep 29 [280/2306] Loss: 0.0000
+  Ep 29 [300/2306] Loss: 0.1026
+  Ep 29 [320/2306] Loss: 0.5061
+  Ep 29 [340/2306] Loss: 0.1803
+  Ep 29 [360/2306] Loss: 0.0890
+  Ep 29 [380/2306] Loss: 0.9654
+  Ep 29 [400/2306] Loss: 0.4491
+  Ep 29 [420/2306] Loss: 0.0000
+  Ep 29 [440/2306] Loss: 0.1766
+  Ep 29 [460/2306] Loss: 0.1568
+  Ep 29 [480/2306] Loss: 0.4259
+  Ep 29 [500/2306] Loss: 0.5002
+  Ep 29 [520/2306] Loss: 0.1032
+  Ep 29 [540/2306] Loss: 0.2233
+  Ep 29 [560/2306] Loss: 0.1407
+  Ep 29 [580/2306] Loss: 0.0710
+  Ep 29 [600/2306] Loss: 0.2579
+  Ep 29 [620/2306] Loss: 0.7301
+  Ep 29 [640/2306] Loss: 0.5000
+  Ep 29 [660/2306] Loss: 0.1752
+  Ep 29 [680/2306] Loss: 0.2557
+  Ep 29 [700/2306] Loss: 1.4771
+  Ep 29 [720/2306] Loss: 0.0000
+  Ep 29 [740/2306] Loss: 1.0000
+  Ep 29 [760/2306] Loss: 0.2768
+  Ep 29 [780/2306] Loss: 0.1756
+  Ep 29 [800/2306] Loss: 1.2013
+  Ep 29 [820/2306] Loss: 0.3412
+  Ep 29 [840/2306] Loss: 0.0971
+  Ep 29 [860/2306] Loss: 0.1929
+  Ep 29 [880/2306] Loss: 0.6122
+  Ep 29 [900/2306] Loss: 0.2706
+  Ep 29 [920/2306] Loss: 0.5535
+  Ep 29 [940/2306] Loss: 0.0000
+  Ep 29 [960/2306] Loss: 0.2194
+  Ep 29 [980/2306] Loss: 0.3359
+  Ep 29 [1000/2306] Loss: 1.0490
+  Ep 29 [1020/2306] Loss: 0.6637
+  Ep 29 [1040/2306] Loss: 1.2723
+  Ep 29 [1060/2306] Loss: 0.0000
+  Ep 29 [1080/2306] Loss: 0.8142
+  Ep 29 [1100/2306] Loss: 0.0000
+  Ep 29 [1120/2306] Loss: 0.0673
+  Ep 29 [1140/2306] Loss: 0.0000
+  Ep 29 [1160/2306] Loss: 0.3374
+  Ep 29 [1180/2306] Loss: 0.1403
+  Ep 29 [1200/2306] Loss: 0.0000
+  Ep 29 [1220/2306] Loss: 0.4186
+  Ep 29 [1240/2306] Loss: 0.3388
+  Ep 29 [1260/2306] Loss: 0.6670
+  Ep 29 [1280/2306] Loss: 0.2630
+  Ep 29 [1300/2306] Loss: 0.5000
+  Ep 29 [1320/2306] Loss: 0.0795
+  Ep 29 [1340/2306] Loss: 0.4201
+  Ep 29 [1360/2306] Loss: 0.7731
+  Ep 29 [1380/2306] Loss: 0.5843
+  Ep 29 [1400/2306] Loss: 0.0676
+  Ep 29 [1420/2306] Loss: 0.5001
+  Ep 29 [1440/2306] Loss: 0.1114
+  Ep 29 [1460/2306] Loss: 0.0000
+  Ep 29 [1480/2306] Loss: 0.9064
+  Ep 29 [1500/2306] Loss: 0.5458
+  Ep 29 [1520/2306] Loss: 0.1437
+  Ep 29 [1540/2306] Loss: 0.2250
+  Ep 29 [1560/2306] Loss: 0.3380
+  Ep 29 [1580/2306] Loss: 0.1367
+  Ep 29 [1600/2306] Loss: 0.3537
+  Ep 29 [1620/2306] Loss: 0.4062
+  Ep 29 [1640/2306] Loss: 0.1589
+  Ep 29 [1660/2306] Loss: 0.0000
+  Ep 29 [1680/2306] Loss: 0.1772
+  Ep 29 [1700/2306] Loss: 0.7456
+  Ep 29 [1720/2306] Loss: 0.0683
+  Ep 29 [1740/2306] Loss: 0.1365
+  Ep 29 [1760/2306] Loss: 0.4392
+  Ep 29 [1780/2306] Loss: 0.7281
+  Ep 29 [1800/2306] Loss: 0.1470
+  Ep 29 [1820/2306] Loss: 0.0966
+  Ep 29 [1840/2306] Loss: 0.5000
+  Ep 29 [1860/2306] Loss: 0.3404
+  Ep 29 [1880/2306] Loss: 0.1802
+  Ep 29 [1900/2306] Loss: 0.0000
+  Ep 29 [1920/2306] Loss: 0.1884
+  Ep 29 [1940/2306] Loss: 0.0000
+  Ep 29 [1960/2306] Loss: 0.2648
+  Ep 29 [1980/2306] Loss: 0.1754
+  Ep 29 [2000/2306] Loss: 0.0000
+  Ep 29 [2020/2306] Loss: 0.3833
+  Ep 29 [2040/2306] Loss: 0.4767
+  Ep 29 [2060/2306] Loss: 0.4518
+  Ep 29 [2080/2306] Loss: 0.5938
+  Ep 29 [2100/2306] Loss: 0.6176
+  Ep 29 [2120/2306] Loss: 0.9620
+  Ep 29 [2140/2306] Loss: 0.4717
+  Ep 29 [2160/2306] Loss: 0.5000
+  Ep 29 [2180/2306] Loss: 0.9663
+  Ep 29 [2200/2306] Loss: 0.1464
+  Ep 29 [2220/2306] Loss: 0.1085
+  Ep 29 [2240/2306] Loss: 0.0939
+  Ep 29 [2260/2306] Loss: 0.0000
+  Ep 29 [2280/2306] Loss: 0.5000
+  Ep 29 [2300/2306] Loss: 0.6243
+Ep 29 Avg Loss: 0.3504
+Ep 29 Val Dice: 0.5671 | Total Pred Pixels: 615079
+  Ep 30 [20/2306] Loss: 0.0702
+  Ep 30 [40/2306] Loss: 0.0000
+  Ep 30 [60/2306] Loss: 0.1624
+  Ep 30 [80/2306] Loss: 0.1209
+  Ep 30 [100/2306] Loss: 0.4479
+  Ep 30 [120/2306] Loss: 0.5000
+  Ep 30 [140/2306] Loss: 0.5000
+  Ep 30 [160/2306] Loss: 0.0000
+  Ep 30 [180/2306] Loss: 0.0000
+  Ep 30 [200/2306] Loss: 0.6485
+  Ep 30 [220/2306] Loss: 0.0000
+  Ep 30 [240/2306] Loss: 1.0022
+  Ep 30 [260/2306] Loss: 0.1291
+  Ep 30 [280/2306] Loss: 0.9305
+  Ep 30 [300/2306] Loss: 0.4264
+  Ep 30 [320/2306] Loss: 0.1949
+  Ep 30 [340/2306] Loss: 0.1131
+  Ep 30 [360/2306] Loss: 0.2115
+  Ep 30 [380/2306] Loss: 0.6154
+  Ep 30 [400/2306] Loss: 0.0412
+  Ep 30 [420/2306] Loss: 0.0000
+  Ep 30 [440/2306] Loss: 0.2627
+  Ep 30 [460/2306] Loss: 0.0000
+  Ep 30 [480/2306] Loss: 1.1248
+  Ep 30 [500/2306] Loss: 0.0000
+  Ep 30 [520/2306] Loss: 0.1073
+  Ep 30 [540/2306] Loss: 0.0000
+  Ep 30 [560/2306] Loss: 0.5894
+  Ep 30 [580/2306] Loss: 0.6098
+  Ep 30 [600/2306] Loss: 0.1955
+  Ep 30 [620/2306] Loss: 0.2177
+  Ep 30 [640/2306] Loss: 0.3388
+  Ep 30 [660/2306] Loss: 0.6068
+  Ep 30 [680/2306] Loss: 0.0000
+  Ep 30 [700/2306] Loss: 0.0000
+  Ep 30 [720/2306] Loss: 0.5460
+  Ep 30 [740/2306] Loss: 0.6647
+  Ep 30 [760/2306] Loss: 0.0977
+  Ep 30 [780/2306] Loss: 0.1808
+  Ep 30 [800/2306] Loss: 0.1190
+  Ep 30 [820/2306] Loss: 0.0972
+  Ep 30 [840/2306] Loss: 0.0000
+  Ep 30 [860/2306] Loss: 0.0000
+  Ep 30 [880/2306] Loss: 0.5712
+  Ep 30 [900/2306] Loss: 0.3035
+  Ep 30 [920/2306] Loss: 0.3383
+  Ep 30 [940/2306] Loss: 0.5000
+  Ep 30 [960/2306] Loss: 0.4162
+  Ep 30 [980/2306] Loss: 0.2399
+  Ep 30 [1000/2306] Loss: 0.0000
+  Ep 30 [1020/2306] Loss: 0.1773
+  Ep 30 [1040/2306] Loss: 0.8478
+  Ep 30 [1060/2306] Loss: 0.0643
+  Ep 30 [1080/2306] Loss: 0.0000
+  Ep 30 [1100/2306] Loss: 0.2021
+  Ep 30 [1120/2306] Loss: 0.0672
+  Ep 30 [1140/2306] Loss: 0.0003
+  Ep 30 [1160/2306] Loss: 0.0000
+  Ep 30 [1180/2306] Loss: 0.0990
+  Ep 30 [1200/2306] Loss: 0.9158
+  Ep 30 [1220/2306] Loss: 0.5001
+  Ep 30 [1240/2306] Loss: 0.3103
+  Ep 30 [1260/2306] Loss: 0.4970
+  Ep 30 [1280/2306] Loss: 0.5873
+  Ep 30 [1300/2306] Loss: 0.7443
+  Ep 30 [1320/2306] Loss: 0.1201
+  Ep 30 [1340/2306] Loss: 0.6788
+  Ep 30 [1360/2306] Loss: 0.2032
+  Ep 30 [1380/2306] Loss: 0.2252
+  Ep 30 [1400/2306] Loss: 0.1532
+  Ep 30 [1420/2306] Loss: 0.1684
+  Ep 30 [1440/2306] Loss: 0.8264
+  Ep 30 [1460/2306] Loss: 0.0000
+  Ep 30 [1480/2306] Loss: 0.0093
+  Ep 30 [1500/2306] Loss: 0.0000
+  Ep 30 [1520/2306] Loss: 0.1500
+  Ep 30 [1540/2306] Loss: 0.4562
+  Ep 30 [1560/2306] Loss: 0.1408
+  Ep 30 [1580/2306] Loss: 1.0347
+  Ep 30 [1600/2306] Loss: 1.2509
+  Ep 30 [1620/2306] Loss: 0.1248
+  Ep 30 [1640/2306] Loss: 0.0813
+  Ep 30 [1660/2306] Loss: 0.5000
+  Ep 30 [1680/2306] Loss: 0.3244
+  Ep 30 [1700/2306] Loss: 0.5000
+  Ep 30 [1720/2306] Loss: 1.2113
+  Ep 30 [1740/2306] Loss: 0.0966
+  Ep 30 [1760/2306] Loss: 0.0914
+  Ep 30 [1780/2306] Loss: 0.1552
+  Ep 30 [1800/2306] Loss: 0.1790
+  Ep 30 [1820/2306] Loss: 0.7709
+  Ep 30 [1840/2306] Loss: 0.1826
+  Ep 30 [1860/2306] Loss: 0.3005
+  Ep 30 [1880/2306] Loss: 0.3127
+  Ep 30 [1900/2306] Loss: 0.0585
+  Ep 30 [1920/2306] Loss: 0.2479
+  Ep 30 [1940/2306] Loss: 0.5000
+  Ep 30 [1960/2306] Loss: 0.3906
+  Ep 30 [1980/2306] Loss: 0.8936
+  Ep 30 [2000/2306] Loss: 1.0044
+  Ep 30 [2020/2306] Loss: 0.2148
+  Ep 30 [2040/2306] Loss: 1.0149
+  Ep 30 [2060/2306] Loss: 0.4871
+  Ep 30 [2080/2306] Loss: 0.0000
+  Ep 30 [2100/2306] Loss: 0.0000
+  Ep 30 [2120/2306] Loss: 0.1000
+  Ep 30 [2140/2306] Loss: 0.0587
+  Ep 30 [2160/2306] Loss: 0.0000
+  Ep 30 [2180/2306] Loss: 0.5000
+  Ep 30 [2200/2306] Loss: 0.2026
+  Ep 30 [2220/2306] Loss: 0.9343
+  Ep 30 [2240/2306] Loss: 0.2049
+  Ep 30 [2260/2306] Loss: 0.0962
+  Ep 30 [2280/2306] Loss: 0.1906
+  Ep 30 [2300/2306] Loss: 0.5000
+Ep 30 Avg Loss: 0.3477
+Ep 30 Val Dice: 0.6133 | Total Pred Pixels: 335634
+  Ep 31 [20/2306] Loss: 0.0686
+  Ep 31 [40/2306] Loss: 0.5346
+  Ep 31 [60/2306] Loss: 0.1178
+  Ep 31 [80/2306] Loss: 0.1653
+  Ep 31 [100/2306] Loss: 0.8624
+  Ep 31 [120/2306] Loss: 1.0221
+  Ep 31 [140/2306] Loss: 1.1858
+  Ep 31 [160/2306] Loss: 0.5274
+  Ep 31 [180/2306] Loss: 0.0761
+  Ep 31 [200/2306] Loss: 0.1082
+  Ep 31 [220/2306] Loss: 0.0000
+  Ep 31 [240/2306] Loss: 0.0994
+  Ep 31 [260/2306] Loss: 0.1832
+  Ep 31 [280/2306] Loss: 0.4972
+  Ep 31 [300/2306] Loss: 0.3404
+  Ep 31 [320/2306] Loss: 0.1113
+  Ep 31 [340/2306] Loss: 0.4468
+  Ep 31 [360/2306] Loss: 1.0874
+  Ep 31 [380/2306] Loss: 0.2001
+  Ep 31 [400/2306] Loss: 0.1350
+  Ep 31 [420/2306] Loss: 0.0551
+  Ep 31 [440/2306] Loss: 0.6245
+  Ep 31 [460/2306] Loss: 0.5931
+  Ep 31 [480/2306] Loss: 0.4120
+  Ep 31 [500/2306] Loss: 0.5490
+  Ep 31 [520/2306] Loss: 0.5001
+  Ep 31 [540/2306] Loss: 0.4346
+  Ep 31 [560/2306] Loss: 0.2972
+  Ep 31 [580/2306] Loss: 0.5000
+  Ep 31 [600/2306] Loss: 0.0001
+  Ep 31 [620/2306] Loss: 0.1264
+  Ep 31 [640/2306] Loss: 0.4085
+  Ep 31 [660/2306] Loss: 0.4065
+  Ep 31 [680/2306] Loss: 0.3188
+  Ep 31 [700/2306] Loss: 1.0001
+  Ep 31 [720/2306] Loss: 0.0000
+  Ep 31 [740/2306] Loss: 0.4462
+  Ep 31 [760/2306] Loss: 0.0000
+  Ep 31 [780/2306] Loss: 0.1537
+  Ep 31 [800/2306] Loss: 0.1879
+  Ep 31 [820/2306] Loss: 0.3532
+  Ep 31 [840/2306] Loss: 0.2346
+  Ep 31 [860/2306] Loss: 1.0002
+  Ep 31 [880/2306] Loss: 0.1033
+  Ep 31 [900/2306] Loss: 0.4340
+  Ep 31 [920/2306] Loss: 0.9278
+  Ep 31 [940/2306] Loss: 0.3024
+  Ep 31 [960/2306] Loss: 0.0000
+  Ep 31 [980/2306] Loss: 0.2709
+  Ep 31 [1000/2306] Loss: 0.6789
+  Ep 31 [1020/2306] Loss: 0.0944
+  Ep 31 [1040/2306] Loss: 0.5000
+  Ep 31 [1060/2306] Loss: 0.4012
+  Ep 31 [1080/2306] Loss: 0.0000
+  Ep 31 [1100/2306] Loss: 0.3479
+  Ep 31 [1120/2306] Loss: 0.0637
+  Ep 31 [1140/2306] Loss: 0.4660
+  Ep 31 [1160/2306] Loss: 0.6913
+  Ep 31 [1180/2306] Loss: 1.1501
+  Ep 31 [1200/2306] Loss: 1.0003
+  Ep 31 [1220/2306] Loss: 0.6817
+  Ep 31 [1240/2306] Loss: 0.6130
+  Ep 31 [1260/2306] Loss: 0.4903
+  Ep 31 [1280/2306] Loss: 0.1639
+  Ep 31 [1300/2306] Loss: 0.2104
+  Ep 31 [1320/2306] Loss: 0.4827
+  Ep 31 [1340/2306] Loss: 0.4016
+  Ep 31 [1360/2306] Loss: 0.0994
+  Ep 31 [1380/2306] Loss: 0.0000
+  Ep 31 [1400/2306] Loss: 1.0507
+  Ep 31 [1420/2306] Loss: 0.4594
+  Ep 31 [1440/2306] Loss: 0.5643
+  Ep 31 [1460/2306] Loss: 0.3034
+  Ep 31 [1480/2306] Loss: 0.0000
+  Ep 31 [1500/2306] Loss: 0.1202
+  Ep 31 [1520/2306] Loss: 0.0000
+  Ep 31 [1540/2306] Loss: 0.2585
+  Ep 31 [1560/2306] Loss: 0.0741
+  Ep 31 [1580/2306] Loss: 0.5993
+  Ep 31 [1600/2306] Loss: 0.3955
+  Ep 31 [1620/2306] Loss: 0.5004
+  Ep 31 [1640/2306] Loss: 0.5013
+  Ep 31 [1660/2306] Loss: 0.1128
+  Ep 31 [1680/2306] Loss: 0.5535
+  Ep 31 [1700/2306] Loss: 0.5000
+  Ep 31 [1720/2306] Loss: 0.0000
+  Ep 31 [1740/2306] Loss: 0.7744
+  Ep 31 [1760/2306] Loss: 0.6403
+  Ep 31 [1780/2306] Loss: 0.7870
+  Ep 31 [1800/2306] Loss: 0.5808
+  Ep 31 [1820/2306] Loss: 0.6720
+  Ep 31 [1840/2306] Loss: 1.0964
+  Ep 31 [1860/2306] Loss: 0.2953
+  Ep 31 [1880/2306] Loss: 0.5427
+  Ep 31 [1900/2306] Loss: 0.0000
+  Ep 31 [1920/2306] Loss: 0.0000
+  Ep 31 [1940/2306] Loss: 0.2702
+  Ep 31 [1960/2306] Loss: 0.1809
+  Ep 31 [1980/2306] Loss: 0.2882
+  Ep 31 [2000/2306] Loss: 0.1523
+  Ep 31 [2020/2306] Loss: 0.6142
+  Ep 31 [2040/2306] Loss: 0.0000
+  Ep 31 [2060/2306] Loss: 0.5696
+  Ep 31 [2080/2306] Loss: 0.0000
+  Ep 31 [2100/2306] Loss: 0.4816
+  Ep 31 [2120/2306] Loss: 0.0588
+  Ep 31 [2140/2306] Loss: 0.1409
+  Ep 31 [2160/2306] Loss: 0.2726
+  Ep 31 [2180/2306] Loss: 0.1779
+  Ep 31 [2200/2306] Loss: 0.3374
+  Ep 31 [2220/2306] Loss: 0.1441
+  Ep 31 [2240/2306] Loss: 0.2083
+  Ep 31 [2260/2306] Loss: 0.6902
+  Ep 31 [2280/2306] Loss: 0.4317
+  Ep 31 [2300/2306] Loss: 0.9395
+Ep 31 Avg Loss: 0.3443
+Ep 31 Val Dice: 0.6141 | Total Pred Pixels: 371530
+  Ep 32 [20/2306] Loss: 0.2233
+  Ep 32 [40/2306] Loss: 0.0000
+  Ep 32 [60/2306] Loss: 0.1293
+  Ep 32 [80/2306] Loss: 0.5505
+  Ep 32 [100/2306] Loss: 0.2779
+  Ep 32 [120/2306] Loss: 0.7781
+  Ep 32 [140/2306] Loss: 0.5798
+  Ep 32 [160/2306] Loss: 0.0000
+  Ep 32 [180/2306] Loss: 0.0000
+  Ep 32 [200/2306] Loss: 0.0938
+  Ep 32 [220/2306] Loss: 0.1130
+  Ep 32 [240/2306] Loss: 0.5000
+  Ep 32 [260/2306] Loss: 0.3587
+  Ep 32 [280/2306] Loss: 0.0794
+  Ep 32 [300/2306] Loss: 0.1521
+  Ep 32 [320/2306] Loss: 0.4997
+  Ep 32 [340/2306] Loss: 0.5524
+  Ep 32 [360/2306] Loss: 0.5666
+  Ep 32 [380/2306] Loss: 0.0000
+  Ep 32 [400/2306] Loss: 0.7769
+  Ep 32 [420/2306] Loss: 0.5757
+  Ep 32 [440/2306] Loss: 0.0000
+  Ep 32 [460/2306] Loss: 0.0000
+  Ep 32 [480/2306] Loss: 0.1142
+  Ep 32 [500/2306] Loss: 0.0000
+  Ep 32 [520/2306] Loss: 0.0000
+  Ep 32 [540/2306] Loss: 0.5660
+  Ep 32 [560/2306] Loss: 0.2356
+  Ep 32 [580/2306] Loss: 0.2169
+  Ep 32 [600/2306] Loss: 0.1259
+  Ep 32 [620/2306] Loss: 0.3239
+  Ep 32 [640/2306] Loss: 0.5000
+  Ep 32 [660/2306] Loss: 0.1372
+  Ep 32 [680/2306] Loss: 0.2289
+  Ep 32 [700/2306] Loss: 0.3881
+  Ep 32 [720/2306] Loss: 0.8427
+  Ep 32 [740/2306] Loss: 1.7483
+  Ep 32 [760/2306] Loss: 0.0000
+  Ep 32 [780/2306] Loss: 0.0866
+  Ep 32 [800/2306] Loss: 0.0000
+  Ep 32 [820/2306] Loss: 0.0000
+  Ep 32 [840/2306] Loss: 0.4956
+  Ep 32 [860/2306] Loss: 0.9999
+  Ep 32 [880/2306] Loss: 0.0000
+  Ep 32 [900/2306] Loss: 0.1034
+  Ep 32 [920/2306] Loss: 0.5930
+  Ep 32 [940/2306] Loss: 0.0552
+  Ep 32 [960/2306] Loss: 0.5524
+  Ep 32 [980/2306] Loss: 1.0611
+  Ep 32 [1000/2306] Loss: 0.3942
+  Ep 32 [1020/2306] Loss: 0.6206
+  Ep 32 [1040/2306] Loss: 0.0000
+  Ep 32 [1060/2306] Loss: 0.1372
+  Ep 32 [1080/2306] Loss: 0.2387
+  Ep 32 [1100/2306] Loss: 0.0000
+  Ep 32 [1120/2306] Loss: 0.2251
+  Ep 32 [1140/2306] Loss: 0.6975
+  Ep 32 [1160/2306] Loss: 0.7483
+  Ep 32 [1180/2306] Loss: 0.3259
+  Ep 32 [1200/2306] Loss: 0.4604
+  Ep 32 [1220/2306] Loss: 0.3493
+  Ep 32 [1240/2306] Loss: 0.8396
+  Ep 32 [1260/2306] Loss: 0.0000
+  Ep 32 [1280/2306] Loss: 0.7642
+  Ep 32 [1300/2306] Loss: 0.0260
+  Ep 32 [1320/2306] Loss: 0.6112
+  Ep 32 [1340/2306] Loss: 0.4600
+  Ep 32 [1360/2306] Loss: 0.1007
+  Ep 32 [1380/2306] Loss: 0.0000
+  Ep 32 [1400/2306] Loss: 0.0933
+  Ep 32 [1420/2306] Loss: 0.3615
+  Ep 32 [1440/2306] Loss: 0.5000
+  Ep 32 [1460/2306] Loss: 0.1782
+  Ep 32 [1480/2306] Loss: 0.6326
+  Ep 32 [1500/2306] Loss: 0.8241
+  Ep 32 [1520/2306] Loss: 0.5879
+  Ep 32 [1540/2306] Loss: 0.5000
+  Ep 32 [1560/2306] Loss: 0.3698
+  Ep 32 [1580/2306] Loss: 0.1081
+  Ep 32 [1600/2306] Loss: 0.0000
+  Ep 32 [1620/2306] Loss: 0.2837
+  Ep 32 [1640/2306] Loss: 0.6080
+  Ep 32 [1660/2306] Loss: 0.5000
+  Ep 32 [1680/2306] Loss: 0.5614
+  Ep 32 [1700/2306] Loss: 0.2235
+  Ep 32 [1720/2306] Loss: 0.5213
+  Ep 32 [1740/2306] Loss: 0.5000
+  Ep 32 [1760/2306] Loss: 0.1189
+  Ep 32 [1780/2306] Loss: 0.2414
+  Ep 32 [1800/2306] Loss: 0.0697
+  Ep 32 [1820/2306] Loss: 0.3138
+  Ep 32 [1840/2306] Loss: 0.4516
+  Ep 32 [1860/2306] Loss: 0.0000
+  Ep 32 [1880/2306] Loss: 1.0995
+  Ep 32 [1900/2306] Loss: 1.0722
+  Ep 32 [1920/2306] Loss: 0.8614
+  Ep 32 [1940/2306] Loss: 0.2386
+  Ep 32 [1960/2306] Loss: 0.0336
+  Ep 32 [1980/2306] Loss: 0.6507
+  Ep 32 [2000/2306] Loss: 0.5208
+  Ep 32 [2020/2306] Loss: 0.0736
+  Ep 32 [2040/2306] Loss: 0.2277
+  Ep 32 [2060/2306] Loss: 0.0000
+  Ep 32 [2080/2306] Loss: 0.6542
+  Ep 32 [2100/2306] Loss: 0.7150
+  Ep 32 [2120/2306] Loss: 0.8951
+  Ep 32 [2140/2306] Loss: 0.2014
+  Ep 32 [2160/2306] Loss: 0.1001
+  Ep 32 [2180/2306] Loss: 0.2405
+  Ep 32 [2200/2306] Loss: 0.5011
+  Ep 32 [2220/2306] Loss: 0.0841
+  Ep 32 [2240/2306] Loss: 0.6536
+  Ep 32 [2260/2306] Loss: 0.5000
+  Ep 32 [2280/2306] Loss: 0.5949
+  Ep 32 [2300/2306] Loss: 0.0000
+Ep 32 Avg Loss: 0.3396
+Ep 32 Val Dice: 0.6251 | Total Pred Pixels: 413599
+  Ep 33 [20/2306] Loss: 0.0000
+  Ep 33 [40/2306] Loss: 0.0950
+  Ep 33 [60/2306] Loss: 0.8723
+  Ep 33 [80/2306] Loss: 0.5000
+  Ep 33 [100/2306] Loss: 0.0000
+  Ep 33 [120/2306] Loss: 0.5003
+  Ep 33 [140/2306] Loss: 0.3328
+  Ep 33 [160/2306] Loss: 1.3920
+  Ep 33 [180/2306] Loss: 0.3258
+  Ep 33 [200/2306] Loss: 0.2527
+  Ep 33 [220/2306] Loss: 0.5000
+  Ep 33 [240/2306] Loss: 0.8438
+  Ep 33 [260/2306] Loss: 0.0000
+  Ep 33 [280/2306] Loss: 0.5400
+  Ep 33 [300/2306] Loss: 0.1068
+  Ep 33 [320/2306] Loss: 0.8649
+  Ep 33 [340/2306] Loss: 0.6179
+  Ep 33 [360/2306] Loss: 0.0850
+  Ep 33 [380/2306] Loss: 0.6528
+  Ep 33 [400/2306] Loss: 0.2583
+  Ep 33 [420/2306] Loss: 0.1838
+  Ep 33 [440/2306] Loss: 0.2184
+  Ep 33 [460/2306] Loss: 0.0648
+  Ep 33 [480/2306] Loss: 0.6513
+  Ep 33 [500/2306] Loss: 0.2420
+  Ep 33 [520/2306] Loss: 0.0000
+  Ep 33 [540/2306] Loss: 0.0000
+  Ep 33 [560/2306] Loss: 0.0000
+  Ep 33 [580/2306] Loss: 0.0000
+  Ep 33 [600/2306] Loss: 0.1913
+  Ep 33 [620/2306] Loss: 0.1757
+  Ep 33 [640/2306] Loss: 0.6165
+  Ep 33 [660/2306] Loss: 0.5001
+  Ep 33 [680/2306] Loss: 0.0000
+  Ep 33 [700/2306] Loss: 0.1500
+  Ep 33 [720/2306] Loss: 0.5000
+  Ep 33 [740/2306] Loss: 0.0000
+  Ep 33 [760/2306] Loss: 1.1945
+  Ep 33 [780/2306] Loss: 0.1044
+  Ep 33 [800/2306] Loss: 0.6130
+  Ep 33 [820/2306] Loss: 0.0000
+  Ep 33 [840/2306] Loss: 0.0000
+  Ep 33 [860/2306] Loss: 0.0889
+  Ep 33 [880/2306] Loss: 1.0004
+  Ep 33 [900/2306] Loss: 0.2730
+  Ep 33 [920/2306] Loss: 0.5000
+  Ep 33 [940/2306] Loss: 0.0000
+  Ep 33 [960/2306] Loss: 0.1463
+  Ep 33 [980/2306] Loss: 0.3231
+  Ep 33 [1000/2306] Loss: 0.5000
+  Ep 33 [1020/2306] Loss: 0.2106
+  Ep 33 [1040/2306] Loss: 0.8260
+  Ep 33 [1060/2306] Loss: 0.0000
+  Ep 33 [1080/2306] Loss: 1.0686
+  Ep 33 [1100/2306] Loss: 0.1076
+  Ep 33 [1120/2306] Loss: 0.5142
+  Ep 33 [1140/2306] Loss: 0.7390
+  Ep 33 [1160/2306] Loss: 0.2655
+  Ep 33 [1180/2306] Loss: 0.5002
+  Ep 33 [1200/2306] Loss: 0.1566
+  Ep 33 [1220/2306] Loss: 0.3949
+  Ep 33 [1240/2306] Loss: 1.3559
+  Ep 33 [1260/2306] Loss: 0.8642
+  Ep 33 [1280/2306] Loss: 0.7153
+  Ep 33 [1300/2306] Loss: 0.2339
+  Ep 33 [1320/2306] Loss: 0.3661
+  Ep 33 [1340/2306] Loss: 0.6667
+  Ep 33 [1360/2306] Loss: 0.0000
+  Ep 33 [1380/2306] Loss: 0.0000
+  Ep 33 [1400/2306] Loss: 0.3858
+  Ep 33 [1420/2306] Loss: 0.0000
+  Ep 33 [1440/2306] Loss: 0.1042
+  Ep 33 [1460/2306] Loss: 0.0000
+  Ep 33 [1480/2306] Loss: 0.5000
+  Ep 33 [1500/2306] Loss: 0.7931
+  Ep 33 [1520/2306] Loss: 0.0000
+  Ep 33 [1540/2306] Loss: 0.6385
+  Ep 33 [1560/2306] Loss: 0.0000
+  Ep 33 [1580/2306] Loss: 0.1308
+  Ep 33 [1600/2306] Loss: 0.1464
+  Ep 33 [1620/2306] Loss: 0.2790
+  Ep 33 [1640/2306] Loss: 0.1429
+  Ep 33 [1660/2306] Loss: 0.7374
+  Ep 33 [1680/2306] Loss: 0.0001
+  Ep 33 [1700/2306] Loss: 0.5579
+  Ep 33 [1720/2306] Loss: 0.5499
+  Ep 33 [1740/2306] Loss: 0.0962
+  Ep 33 [1760/2306] Loss: 0.5251
+  Ep 33 [1780/2306] Loss: 0.5374
+  Ep 33 [1800/2306] Loss: 0.8181
+  Ep 33 [1820/2306] Loss: 0.0000
+  Ep 33 [1840/2306] Loss: 1.0742
+  Ep 33 [1860/2306] Loss: 0.3627
+  Ep 33 [1880/2306] Loss: 0.2611
+  Ep 33 [1900/2306] Loss: 0.0000
+  Ep 33 [1920/2306] Loss: 0.0000
+  Ep 33 [1940/2306] Loss: 1.2641
+  Ep 33 [1960/2306] Loss: 0.3367
+  Ep 33 [1980/2306] Loss: 0.1360
+  Ep 33 [2000/2306] Loss: 0.5000
+  Ep 33 [2020/2306] Loss: 0.3047
+  Ep 33 [2040/2306] Loss: 0.4822
+  Ep 33 [2060/2306] Loss: 0.2116
+  Ep 33 [2080/2306] Loss: 0.0000
+  Ep 33 [2100/2306] Loss: 0.3125
+  Ep 33 [2120/2306] Loss: 0.6285
+  Ep 33 [2140/2306] Loss: 0.2703
+  Ep 33 [2160/2306] Loss: 0.0001
+  Ep 33 [2180/2306] Loss: 0.7368
+  Ep 33 [2200/2306] Loss: 0.7206
+  Ep 33 [2220/2306] Loss: 0.6189
+  Ep 33 [2240/2306] Loss: 0.0707
+  Ep 33 [2260/2306] Loss: 0.0000
+  Ep 33 [2280/2306] Loss: 0.2046
+  Ep 33 [2300/2306] Loss: 0.8568
+Ep 33 Avg Loss: 0.3502
+Ep 33 Val Dice: 0.6386 | Total Pred Pixels: 372436
+  Ep 34 [20/2306] Loss: 0.2126
+  Ep 34 [40/2306] Loss: 1.0365
+  Ep 34 [60/2306] Loss: 0.5315
+  Ep 34 [80/2306] Loss: 0.3214
+  Ep 34 [100/2306] Loss: 0.0000
+  Ep 34 [120/2306] Loss: 0.1632
+  Ep 34 [140/2306] Loss: 0.3364
+  Ep 34 [160/2306] Loss: 0.7243
+  Ep 34 [180/2306] Loss: 0.1124
+  Ep 34 [200/2306] Loss: 0.0000
+  Ep 34 [220/2306] Loss: 0.4370
+  Ep 34 [240/2306] Loss: 0.0000
+  Ep 34 [260/2306] Loss: 0.6915
+  Ep 34 [280/2306] Loss: 0.1732
+  Ep 34 [300/2306] Loss: 0.1111
+  Ep 34 [320/2306] Loss: 0.2279
+  Ep 34 [340/2306] Loss: 0.4524
+  Ep 34 [360/2306] Loss: 0.0643
+  Ep 34 [380/2306] Loss: 0.1954
+  Ep 34 [400/2306] Loss: 0.0000
+  Ep 34 [420/2306] Loss: 0.1521
+  Ep 34 [440/2306] Loss: 0.5001
+  Ep 34 [460/2306] Loss: 0.1188
+  Ep 34 [480/2306] Loss: 0.2598
+  Ep 34 [500/2306] Loss: 0.2972
+  Ep 34 [520/2306] Loss: 0.0000
+  Ep 34 [540/2306] Loss: 0.4112
+  Ep 34 [560/2306] Loss: 0.5000
+  Ep 34 [580/2306] Loss: 0.3010
+  Ep 34 [600/2306] Loss: 0.2203
+  Ep 34 [620/2306] Loss: 0.2933
+  Ep 34 [640/2306] Loss: 0.0000
+  Ep 34 [660/2306] Loss: 0.0000
+  Ep 34 [680/2306] Loss: 0.6698
+  Ep 34 [700/2306] Loss: 0.0000
+  Ep 34 [720/2306] Loss: 0.4033
+  Ep 34 [740/2306] Loss: 0.0408
+  Ep 34 [760/2306] Loss: 0.3434
+  Ep 34 [780/2306] Loss: 0.3197
+  Ep 34 [800/2306] Loss: 0.6262
+  Ep 34 [820/2306] Loss: 0.3009
+  Ep 34 [840/2306] Loss: 0.0935
+  Ep 34 [860/2306] Loss: 0.6475
+  Ep 34 [880/2306] Loss: 0.5000
+  Ep 34 [900/2306] Loss: 0.2065
+  Ep 34 [920/2306] Loss: 0.0910
+  Ep 34 [940/2306] Loss: 0.2772
+  Ep 34 [960/2306] Loss: 0.0600
+  Ep 34 [980/2306] Loss: 0.1666
+  Ep 34 [1000/2306] Loss: 0.4368
+  Ep 34 [1020/2306] Loss: 0.1117
+  Ep 34 [1040/2306] Loss: 0.3356
+  Ep 34 [1060/2306] Loss: 0.5244
+  Ep 34 [1080/2306] Loss: 0.6931
+  Ep 34 [1100/2306] Loss: 0.1683
+  Ep 34 [1120/2306] Loss: 0.0653
+  Ep 34 [1140/2306] Loss: 0.1573
+  Ep 34 [1160/2306] Loss: 0.0000
+  Ep 34 [1180/2306] Loss: 0.0599
+  Ep 34 [1200/2306] Loss: 0.3401
+  Ep 34 [1220/2306] Loss: 0.2770
+  Ep 34 [1240/2306] Loss: 0.3320
+  Ep 34 [1260/2306] Loss: 0.5000
+  Ep 34 [1280/2306] Loss: 0.0000
+  Ep 34 [1300/2306] Loss: 0.0000
+  Ep 34 [1320/2306] Loss: 0.0741
+  Ep 34 [1340/2306] Loss: 0.8990
+  Ep 34 [1360/2306] Loss: 0.1132
+  Ep 34 [1380/2306] Loss: 0.4929
+  Ep 34 [1400/2306] Loss: 0.6518
+  Ep 34 [1420/2306] Loss: 0.4928
+  Ep 34 [1440/2306] Loss: 0.5000
+  Ep 34 [1460/2306] Loss: 0.0882
+  Ep 34 [1480/2306] Loss: 0.6479
+  Ep 34 [1500/2306] Loss: 0.6082
+  Ep 34 [1520/2306] Loss: 0.4297
+  Ep 34 [1540/2306] Loss: 0.2599
+  Ep 34 [1560/2306] Loss: 0.8001
+  Ep 34 [1580/2306] Loss: 0.4831
+  Ep 34 [1600/2306] Loss: 0.4770
+  Ep 34 [1620/2306] Loss: 0.6037
+  Ep 34 [1640/2306] Loss: 0.0615
+  Ep 34 [1660/2306] Loss: 0.2727
+  Ep 34 [1680/2306] Loss: 0.2897
+  Ep 34 [1700/2306] Loss: 0.1743
+  Ep 34 [1720/2306] Loss: 0.3108
+  Ep 34 [1740/2306] Loss: 0.2236
+  Ep 34 [1760/2306] Loss: 0.5670
+  Ep 34 [1780/2306] Loss: 0.5000
+  Ep 34 [1800/2306] Loss: 0.3189
+  Ep 34 [1820/2306] Loss: 0.6524
+  Ep 34 [1840/2306] Loss: 0.6379
+  Ep 34 [1860/2306] Loss: 0.0817
+  Ep 34 [1880/2306] Loss: 0.5000
+  Ep 34 [1900/2306] Loss: 0.1798
+  Ep 34 [1920/2306] Loss: 0.3480
+  Ep 34 [1940/2306] Loss: 0.2910
+  Ep 34 [1960/2306] Loss: 0.1684
+  Ep 34 [1980/2306] Loss: 0.2908
+  Ep 34 [2000/2306] Loss: 0.1831
+  Ep 34 [2020/2306] Loss: 0.3779
+  Ep 34 [2040/2306] Loss: 0.3000
+  Ep 34 [2060/2306] Loss: 0.2389
+  Ep 34 [2080/2306] Loss: 0.5119
+  Ep 34 [2100/2306] Loss: 0.0000
+  Ep 34 [2120/2306] Loss: 0.0000
+  Ep 34 [2140/2306] Loss: 0.1161
+  Ep 34 [2160/2306] Loss: 0.5000
+  Ep 34 [2180/2306] Loss: 0.3528
+  Ep 34 [2200/2306] Loss: 0.5001
+  Ep 34 [2220/2306] Loss: 0.4253
+  Ep 34 [2240/2306] Loss: 0.7222
+  Ep 34 [2260/2306] Loss: 0.1308
+  Ep 34 [2280/2306] Loss: 0.0000
+  Ep 34 [2300/2306] Loss: 0.0872
+Ep 34 Avg Loss: 0.3235
+Ep 34 Val Dice: 0.6221 | Total Pred Pixels: 409637
+  Ep 35 [20/2306] Loss: 0.1291
+  Ep 35 [40/2306] Loss: 0.1023
+  Ep 35 [60/2306] Loss: 0.3114
+  Ep 35 [80/2306] Loss: 0.4166
+  Ep 35 [100/2306] Loss: 0.8995
+  Ep 35 [120/2306] Loss: 0.0000
+  Ep 35 [140/2306] Loss: 0.0000
+  Ep 35 [160/2306] Loss: 1.1636
+  Ep 35 [180/2306] Loss: 0.0000
+  Ep 35 [200/2306] Loss: 0.1546
+  Ep 35 [220/2306] Loss: 1.1963
+  Ep 35 [240/2306] Loss: 0.4238
+  Ep 35 [260/2306] Loss: 0.0000
+  Ep 35 [280/2306] Loss: 1.0565
+  Ep 35 [300/2306] Loss: 0.5768
+  Ep 35 [320/2306] Loss: 0.3443
+  Ep 35 [340/2306] Loss: 0.0000
+  Ep 35 [360/2306] Loss: 0.1060
+  Ep 35 [380/2306] Loss: 0.2773
+  Ep 35 [400/2306] Loss: 0.0000
+  Ep 35 [420/2306] Loss: 0.1157
+  Ep 35 [440/2306] Loss: 0.0000
+  Ep 35 [460/2306] Loss: 0.6679
+  Ep 35 [480/2306] Loss: 0.7824
+  Ep 35 [500/2306] Loss: 0.8651
+  Ep 35 [520/2306] Loss: 0.0928
+  Ep 35 [540/2306] Loss: 0.0756
+  Ep 35 [560/2306] Loss: 0.6393
+  Ep 35 [580/2306] Loss: 0.1805
+  Ep 35 [600/2306] Loss: 0.6116
+  Ep 35 [620/2306] Loss: 0.6058
+  Ep 35 [640/2306] Loss: 0.0000
+  Ep 35 [660/2306] Loss: 0.4238
+  Ep 35 [680/2306] Loss: 0.3756
+  Ep 35 [700/2306] Loss: 0.1111
+  Ep 35 [720/2306] Loss: 0.0770
+  Ep 35 [740/2306] Loss: 0.0000
+  Ep 35 [760/2306] Loss: 0.1777
+  Ep 35 [780/2306] Loss: 0.0778
+  Ep 35 [800/2306] Loss: 0.5000
+  Ep 35 [820/2306] Loss: 0.2856
+  Ep 35 [840/2306] Loss: 0.3798
+  Ep 35 [860/2306] Loss: 0.0000
+  Ep 35 [880/2306] Loss: 0.0995
+  Ep 35 [900/2306] Loss: 0.5534
+  Ep 35 [920/2306] Loss: 0.1325
+  Ep 35 [940/2306] Loss: 0.5540
+  Ep 35 [960/2306] Loss: 0.2980
+  Ep 35 [980/2306] Loss: 0.4192
+  Ep 35 [1000/2306] Loss: 0.0000
+  Ep 35 [1020/2306] Loss: 0.5901
+  Ep 35 [1040/2306] Loss: 0.3779
+  Ep 35 [1060/2306] Loss: 0.0918
+  Ep 35 [1080/2306] Loss: 0.8606
+  Ep 35 [1100/2306] Loss: 0.1576
+  Ep 35 [1120/2306] Loss: 0.1361
+  Ep 35 [1140/2306] Loss: 0.7691
+  Ep 35 [1160/2306] Loss: 0.1225
+  Ep 35 [1180/2306] Loss: 0.2604
+  Ep 35 [1200/2306] Loss: 0.0502
+  Ep 35 [1220/2306] Loss: 0.5001
+  Ep 35 [1240/2306] Loss: 0.2906
+  Ep 35 [1260/2306] Loss: 0.1423
+  Ep 35 [1280/2306] Loss: 0.9037
+  Ep 35 [1300/2306] Loss: 0.5000
+  Ep 35 [1320/2306] Loss: 0.0897
+  Ep 35 [1340/2306] Loss: 0.0000
+  Ep 35 [1360/2306] Loss: 0.1060
+  Ep 35 [1380/2306] Loss: 0.1044
+  Ep 35 [1400/2306] Loss: 0.3669
+  Ep 35 [1420/2306] Loss: 0.8511
+  Ep 35 [1440/2306] Loss: 0.5000
+  Ep 35 [1460/2306] Loss: 0.8754
+  Ep 35 [1480/2306] Loss: 0.1851
+  Ep 35 [1500/2306] Loss: 0.5000
+  Ep 35 [1520/2306] Loss: 0.6476
+  Ep 35 [1540/2306] Loss: 0.3387
+  Ep 35 [1560/2306] Loss: 1.0718
+  Ep 35 [1580/2306] Loss: 0.0000
+  Ep 35 [1600/2306] Loss: 0.8348
+  Ep 35 [1620/2306] Loss: 0.0000
+  Ep 35 [1640/2306] Loss: 0.2440
+  Ep 35 [1660/2306] Loss: 0.0000
+  Ep 35 [1680/2306] Loss: 0.3325
+  Ep 35 [1700/2306] Loss: 0.4638
+  Ep 35 [1720/2306] Loss: 0.4027
+  Ep 35 [1740/2306] Loss: 0.1496
+  Ep 35 [1760/2306] Loss: 0.5001
+  Ep 35 [1780/2306] Loss: 0.0000
+  Ep 35 [1800/2306] Loss: 0.0610
+  Ep 35 [1820/2306] Loss: 0.0000
+  Ep 35 [1840/2306] Loss: 0.0942
+  Ep 35 [1860/2306] Loss: 0.3030
+  Ep 35 [1880/2306] Loss: 0.6430
+  Ep 35 [1900/2306] Loss: 0.5303
+  Ep 35 [1920/2306] Loss: 0.0000
+  Ep 35 [1940/2306] Loss: 0.9516
+  Ep 35 [1960/2306] Loss: 1.0012
+  Ep 35 [1980/2306] Loss: 0.6584
+  Ep 35 [2000/2306] Loss: 0.0000
+  Ep 35 [2020/2306] Loss: 0.5112
+  Ep 35 [2040/2306] Loss: 0.6632
+  Ep 35 [2060/2306] Loss: 0.2937
+  Ep 35 [2080/2306] Loss: 0.0000
+  Ep 35 [2100/2306] Loss: 0.7443
+  Ep 35 [2120/2306] Loss: 0.5909
+  Ep 35 [2140/2306] Loss: 0.5000
+  Ep 35 [2160/2306] Loss: 1.2760
+  Ep 35 [2180/2306] Loss: 0.4372
+  Ep 35 [2200/2306] Loss: 0.2384
+  Ep 35 [2220/2306] Loss: 0.5000
+  Ep 35 [2240/2306] Loss: 0.2140
+  Ep 35 [2260/2306] Loss: 0.1787
+  Ep 35 [2280/2306] Loss: 0.2074
+  Ep 35 [2300/2306] Loss: 0.1588
+Ep 35 Avg Loss: 0.3340
+Ep 35 Val Dice: 0.5836 | Total Pred Pixels: 513251

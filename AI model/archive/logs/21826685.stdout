@@ -1,0 +1,1020 @@
+Activating venv: /home/dem7clj/repos/mirpr/mirpr/bin/activate
+======================================================
+          Project Root: /home/dem7clj/repos/mirpr
+          Job ID: 21826685
+          Python Path: /home/dem7clj/repos/mirpr/mirpr/bin/python
+======================================================
+
+======================================================
+          Configuration (config.py)
+======================================================
+
+import os
+
+# --- PATHS ---
+PROJECT_ROOT = "/home/dem7clj/repos/mirpr"
+# Path to LIDC-IDRI DICOM files (the folder containing patient folders)
+RAW_DICOM_DIR = "/shares/CC_v_Val_FV_Gen3_all/VIDT_DL/data/cnn_training/projects/smart_data_selection/town_signs/mirprfull/LIDC-IDRI"
+
+# Output for Preprocessed NIfTI files
+DATA_ROOT ="/shares/CC_v_Val_FV_Gen3_all/VIDT_DL/data/cnn_training/projects/smart_data_selection/town_signs/preprocessed_output_sota/"
+JSON_PATH = os.path.join(DATA_ROOT, "dataset.json")
+
+# Model Paths
+PRETRAINED_MODEL_PATH = os.path.join(PROJECT_ROOT, "models/model.pt")
+LOG_DIR = os.path.join(PROJECT_ROOT, "runs/vista3d_lidc_finetune")
+
+# --- VISTA SPECIFICATIONS (DO NOT CHANGE) ---
+# These match the Foundation Model's pre-training settings
+TARGET_SPACING = (0.7, 0.7, 0.7) 
+INTENSITY_RANGE = (-1000, 1000) 
+
+# --- CLASS MAPPING ---
+# LIDC Nodule (1) -> VISTA Lung Tumor (23)
+LABEL_MAPPINGS = {"default": [[1, 23]]}
+LABEL_SET = [0, 23] 
+
+TARGET_VISTA_CLASS = 23
+
+# --- HYPERPARAMETERS ---
+ROI_SIZE = (192, 192, 192)
+BATCH_SIZE = 16
+NUM_WORKERS = 16
+MAX_EPOCHS = 150
+VAL_INTERVAL = 2
+LR = 5e-5
+
+# --- SAMPLING CONFIG ---
+# --- SAMPLING CONFIG ---
+MAX_POINT = 5
+MAX_PROMPT = 32
+MAX_BACKPROMPT = 4
+# CHANGE THIS: Force model to use Auto-Seg mode 70% of the time (was 0.2 / 20%)
+DROP_POINT_PROB = 0.7 
+DROP_LABEL_PROB = 0.1======================================================
+
+======================================================
+          Model (model.py)
+======================================================
+import torch
+import os
+import config as cfg
+
+# Import strictly from standard MONAI paths or fallback
+try:
+    from monai.networks.nets import vista3d132
+except ImportError:
+    from scripts.modeling.vista3d import vista3d132
+
+def get_vista_model(load_weights=True):
+    """
+    Returns the full VISTA-3D architecture (132 classes).
+    """
+    print(f"[Model] Initializing VISTA-3D (132 Classes)...")
+    model = vista3d132(encoder_embed_dim=48, in_channels=1)
+    
+    if load_weights:
+        if not os.path.exists(cfg.PRETRAINED_MODEL_PATH):
+            print(f"[WARNING] Checkpoint not found at {cfg.PRETRAINED_MODEL_PATH}")
+        else:
+            print(f"[Model] Loading weights from {cfg.PRETRAINED_MODEL_PATH}...")
+            try:
+                # Security warning fix: weights_only=True
+                state_dict = torch.load(cfg.PRETRAINED_MODEL_PATH, map_location="cpu", weights_only=True)
+                model.load_state_dict(state_dict, strict=True)
+                print("[Model] Weights loaded successfully.")
+            except Exception as e:
+                print(f"[ERROR] Weight load failed: {e}")
+                
+    return model======================================================
+
+======================================================
+          Train Script (train.py)
+======================================================
+import os
+import torch
+import numpy as np
+from monai.data import DataLoader, CacheDataset, load_decathlon_datalist, list_data_collate
+from monai.losses import DiceFocalLoss
+from monai.metrics import compute_dice
+from monai.inferers import sliding_window_inference
+from monai.utils import set_determinism
+from monai.apps.vista3d.sampler import sample_prompt_pairs
+from monai.transforms import Activations, AsDiscrete
+from torch.optim.lr_scheduler import CosineAnnealingLR 
+import config as cfg
+from dataset import get_transforms
+from model import get_vista_model
+from monai.optimizers import WarmupCosineSchedule
+from tqdm import tqdm
+
+def flatten_collate(batch):
+    flattened_data = [item for sublist in batch for item in sublist]
+    return list_data_collate(flattened_data)
+
+def main():
+    set_determinism(seed=0)
+    os.makedirs(cfg.LOG_DIR, exist_ok=True)
+    device = torch.device("cuda:0")
+    print(f"VISTA-3D Finetuning on {device} | Spacing: {cfg.TARGET_SPACING}")
+
+    # 1. Load Data
+    train_files = load_decathlon_datalist(cfg.JSON_PATH, True, "training")
+    val_files = load_decathlon_datalist(cfg.JSON_PATH, True, "validation")
+
+    train_ds = CacheDataset(
+        data=train_files, 
+        transform=get_transforms("train"), 
+        cache_rate=1.0, 
+        num_workers=cfg.NUM_WORKERS
+    )
+    
+    # Logic: If Batch Size is 16 and we take 4 crops per image, we load 4 images.
+    num_samples = 2
+    loader_batch_size = max(1, cfg.BATCH_SIZE // num_samples) 
+    
+    train_loader = DataLoader(
+        train_ds, 
+        batch_size=loader_batch_size, 
+        shuffle=True, 
+        num_workers=cfg.NUM_WORKERS, 
+        collate_fn=flatten_collate, 
+        pin_memory=True
+    )
+
+    val_ds = CacheDataset(
+        data=val_files, 
+        transform=get_transforms("val"), 
+        cache_rate=1.0, 
+        num_workers=cfg.NUM_WORKERS
+    )
+    val_loader = DataLoader(val_ds, batch_size=1, num_workers=cfg.NUM_WORKERS)
+
+    # 2. Initialize Model
+    model = get_vista_model(load_weights=True).to(device)
+    
+    # 3. Optimization
+    # SOTA Loss for small objects (Squared Pred = True is crucial for stability)
+    loss_function = DiceFocalLoss(
+        to_onehot_y=False, 
+        sigmoid=True, 
+        lambda_dice=1.0, 
+        lambda_focal=1.0,
+        squared_pred=True 
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=1e-5)
+    
+    # [FIX] Calculate steps based on LOADER length (batches), not inner loop (images)
+    total_steps = cfg.MAX_EPOCHS * len(train_loader)
+    warmup_steps = int(0.05 * total_steps)
+    
+    scheduler = WarmupCosineSchedule(
+        optimizer=optimizer,
+        warmup_steps=warmup_steps,
+        t_total=total_steps,
+        end_lr=1e-7, 
+        warmup_multiplier=0.1
+    )
+    
+    scaler = torch.amp.GradScaler('cuda') 
+
+    # 4. Training Loop
+    best_metric = -1
+    best_metric_epoch = -1
+
+    for epoch in range(cfg.MAX_EPOCHS):
+        model.train()
+        epoch_loss = 0
+        step = 0
+        
+        epoch_skipped = 0
+        epoch_total_crops = 0
+        
+        # [FIX] Zero gradients before starting the loader loop
+        optimizer.zero_grad()
+        
+        for batch_data in train_loader:
+            step += 1
+            inputs = batch_data["image"].to(device)
+            labels = batch_data["label"].to(device)
+            
+            # [FIX] Gradient Accumulation Setup
+            # We process images one by one but update weights once per batch.
+            current_batch_size = inputs.shape[0]
+            batch_loss_accum = 0.0
+            
+            for i in range(current_batch_size):
+                curr_img = inputs[[i]]
+                curr_lbl = labels[[i]]
+                
+                label_prompt, point, point_label, prompt_class = sample_prompt_pairs(
+                    curr_lbl,
+                    cfg.LABEL_SET,
+                    max_point=cfg.MAX_POINT,
+                    max_prompt=cfg.MAX_PROMPT,
+                    max_backprompt=cfg.MAX_BACKPROMPT,
+                    max_foreprompt=None,
+                    drop_label_prob=cfg.DROP_LABEL_PROB,
+                    drop_point_prob=cfg.DROP_POINT_PROB,
+                )
+
+                epoch_total_crops += 1
+                if prompt_class is None: 
+                    epoch_skipped += 1
+                    continue
+
+                with torch.amp.autocast('cuda'):
+                    outputs = model(
+                        input_images=curr_img,
+                        point_coords=point,
+                        point_labels=point_label,
+                        class_vector=label_prompt
+                    )
+                    
+                    loss = torch.tensor(0.0, device=device)
+                    loss_n = torch.tensor(0.0, device=device)
+                    
+                    for idx in range(len(prompt_class)):
+                        # Create binary target (0 or 1) and cast to Float
+                        target_binary = (curr_lbl == prompt_class[idx]).float()
+                        
+                        loss += loss_function(
+                            outputs[[idx]].float(), 
+                            target_binary
+                        )
+                        loss_n += 1.0
+                    
+                    # Normalize by number of prompts in this specific image
+                    loss = loss / torch.max(loss_n, torch.tensor(1.0, device=device))
+                    
+                    # [FIX] Normalize by BATCH SIZE for accumulation
+                    # This ensures the gradient magnitude is averaged over the 4 images
+                    loss = loss / current_batch_size
+
+                # [FIX] Accumulate gradients (Backward), but do NOT step optimizer yet
+                scaler.scale(loss).backward()
+                
+                # Recover true loss magnitude for logging
+                batch_loss_accum += loss.item() * current_batch_size
+
+            # [FIX] Optimizer Step (Once per Loader Batch)
+            # This makes "Effective Batch Size" == 4 (or whatever is in config)
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            scaler.step(optimizer)
+            scaler.update()
+            
+            # [FIX] Scheduler Step (Once per Loader Batch)
+            scheduler.step()
+            
+            # [FIX] Zero Grads for the NEXT batch
+            optimizer.zero_grad()
+            
+            epoch_loss += batch_loss_accum / current_batch_size
+            
+            if step % 10 == 0:
+                current_lr = optimizer.param_groups[0]['lr']
+                print(f"Ep {epoch+1}/{cfg.MAX_EPOCHS} Step {step}/{len(train_loader)} Loss: {batch_loss_accum/current_batch_size:.4f} LR: {current_lr:.2e}", end="\r")
+
+        print(f"\nEpoch {epoch+1} Avg Loss: {epoch_loss/step:.4f}")
+
+        skip_rate = (epoch_skipped / epoch_total_crops) * 100 if epoch_total_crops > 0 else 0
+        print(f"Epoch {epoch+1} Avg Loss: {epoch_loss/step:.4f} | Skip Rate: {skip_rate:.1f}% ({epoch_skipped}/{epoch_total_crops})")
+
+        # 5. Validation
+        if (epoch + 1) % cfg.VAL_INTERVAL == 0:
+            model.eval()
+            dice_scores = []
+            val_prompt = torch.tensor([23], device=device)
+
+            post_sigmoid = Activations(sigmoid=True)
+            post_pred = AsDiscrete(threshold=0.5)
+            
+            val_bar = tqdm(
+                val_loader, 
+                desc=f"Validating Ep {epoch+1}", 
+                leave=False, 
+                dynamic_ncols=True
+            )
+            
+            with torch.no_grad():
+                for i, val_data in enumerate(val_bar):
+                    val_img = val_data["image"].to(device)
+                    val_lbl = val_data["label"].to(device)
+                    
+                    val_bar.set_postfix({"Batch": f"{i+1}/{len(val_loader)}", "Shape": list(val_img.shape[2:])})
+
+                    with torch.amp.autocast('cuda'):
+                        val_out = sliding_window_inference(
+                            val_img, cfg.ROI_SIZE, 32, model, 
+                            overlap=0.5, transpose=True, class_vector=val_prompt, device=device
+                        )
+                    
+                    val_pred = post_sigmoid(val_out)
+                    val_mask = post_pred(val_pred)
+                    
+                    target_binary = (val_lbl == 23).float()
+                    
+                    if i == 0:
+                        print(f"[DEBUG Ep{epoch+1}] Max Pred: {val_pred.max():.4f}, Max GT: {target_binary.max()}")
+                        print(f"[DEBUG Ep{epoch+1}] Pred Shape: {val_mask.shape}, GT Shape: {target_binary.shape}")
+
+                    dice = compute_dice(
+                        y_pred=val_mask, 
+                        y=target_binary, 
+                        include_background=False
+                    )
+                    
+                    if target_binary.sum() == 0:
+                        dice_scores.append(1.0 if val_mask.sum() == 0 else 0.0)
+                    else:
+                        dice_scores.append(dice.item())
+
+            mean_dice = np.mean(dice_scores)
+            current_lr = scheduler.get_last_lr()[0]
+            print(f"Validation Dice (Lung Tumor): {mean_dice:.4f} | LR: {current_lr:.8f}")
+            
+            if mean_dice > best_metric:
+                best_metric = mean_dice
+                best_metric_epoch = epoch + 1
+                torch.save(model.state_dict(), os.path.join(cfg.LOG_DIR, "best_model.pth"))
+                print(">>> New Best Model Saved!")
+
+if __name__ == "__main__":
+    main()======================================================
+
+import os
+import torch
+import numpy as np
+from tqdm import tqdm
+from monai.inferers import sliding_window_inference
+from monai.apps.vista3d.transforms import VistaPostTransformd
+from monai.metrics import DiceMetric, HausdorffDistanceMetric
+
+import config as cfg
+from dataset import get_dataloaders
+from model import get_model
+
+def evaluate():
+    device = torch.device("cuda")
+    print("--- Starting Evaluation ---")
+    
+    _, val_loader = get_dataloaders()
+    model = get_model(load_weights=False)
+    
+    best_model_path = os.path.join(cfg.CHECKPOINT_DIR, "best_metric_model.pth")
+    if not os.path.exists(best_model_path):
+        print(f"ERROR: Model not found at {best_model_path}")
+        return
+
+    model.load_state_dict(torch.load(best_model_path, weights_only=True))
+    model.to(device)
+    model.eval()
+    
+    dice_metric_calc = DiceMetric(include_background=False, reduction="mean")
+    hd95_metric_calc = HausdorffDistanceMetric(include_background=False, percentile=95, reduction="mean")
+    
+    dice_scores = []
+    hd95_scores = []
+
+    with torch.no_grad():
+        for val_data in tqdm(val_loader, desc="Evaluating"):
+            val_images = val_data["image"].to(device)
+            val_labels = val_data["label"].to(device)
+            
+            val_outputs = sliding_window_inference(
+                val_images,
+                cfg.INPUT_SHAPE,
+                4, 
+                model,
+                transpose=True,
+                class_vector=torch.tensor(cfg.LABEL_SET[1:], device=device),
+                overlap=0.5
+            )
+            
+            # --- CRITICAL FIX ---
+            # Use val_outputs[0]
+            post_pred_single = VistaPostTransformd(keys="pred")(
+                {"pred": val_outputs[0], "label_prompt": torch.tensor(cfg.LABEL_SET[1:], device=device)}
+            )["pred"]
+            
+            # Expand dims back to (1, D, H, W) for metrics
+            pred_binary = (post_pred_single == cfg.TARGET_VISTA_CLASS).float().unsqueeze(0)
+            gt_binary = (val_labels == cfg.TARGET_VISTA_CLASS).float()
+            
+            if gt_binary.sum() > 0:
+                dice = dice_metric_calc(y_pred=pred_binary, y=gt_binary)
+                hd95 = hd95_metric_calc(y_pred=pred_binary, y=gt_binary)
+                
+                dice_scores.append(dice.item())
+                hd95_scores.append(hd95.item())
+            
+            dice_metric_calc.reset()
+            hd95_metric_calc.reset()
+
+    print("=======================================")
+    print(f"FINAL RESULTS (Lung Tumor / Class 23)")
+    print("=======================================")
+    print(f"Mean Dice: {np.nanmean(dice_scores):.4f}")
+    print(f"Mean HD95: {np.nanmean(hd95_scores):.4f} mm")
+    print("=======================================")
+
+if __name__ == "__main__":
+    evaluate()import torch
+import numpy as np
+from monai.transforms import (
+    Compose,
+    LoadImaged,
+    EnsureChannelFirstd,
+    Orientationd,
+    Spacingd,
+    ScaleIntensityRanged,
+    RandCropByPosNegLabeld,
+    RandAffined,
+    RandGaussianNoised,
+    RandFlipd,
+    RandRotate90d,
+    EnsureTyped
+)
+from monai.apps.vista3d.transforms import Relabeld
+import config as cfg
+
+def get_transforms(mode="train"):
+    transforms = [
+        LoadImaged(keys=["image", "label"]),
+        EnsureChannelFirstd(keys=["image", "label"]),
+        Orientationd(keys=["image", "label"], axcodes="RAS"),
+        # Official VISTA spacing
+        Spacingd(
+            keys=["image", "label"], 
+            pixdim=cfg.TARGET_SPACING, 
+            mode=("bilinear", "nearest")
+        ),
+        # Official VISTA Intensity Range (Foundation Model Alignment)
+        ScaleIntensityRanged(
+            keys=["image"],
+            a_min=cfg.INTENSITY_RANGE[0],
+            a_max=cfg.INTENSITY_RANGE[1],
+            b_min=0.0,
+            b_max=1.0,
+            clip=True,
+        ),
+        # Map LIDC(1) -> VISTA(23)
+        Relabeld(keys="label", label_mappings=cfg.LABEL_MAPPINGS, dtype=torch.uint8),
+    ]
+
+    if mode == "train":
+        transforms += [
+            # Dynamic Cropping for Small Nodules
+            RandCropByPosNegLabeld(
+                keys=["image", "label"],
+                label_key="label",
+                spatial_size=cfg.ROI_SIZE,
+                pos=2,
+                neg=1,
+                num_samples=2,
+                image_key="image",
+                image_threshold=0,
+            ),
+            RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
+            RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
+            RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=2),
+            RandRotate90d(keys=["image", "label"], prob=0.5, max_k=3),
+            RandGaussianNoised(keys=["image"], prob=0.1, mean=0.0, std=0.1),
+            RandAffined(
+                keys=['image', 'label'],
+                mode=('bilinear', 'nearest'),
+                prob=0.3,
+                spatial_size=cfg.ROI_SIZE,
+                rotate_range=(0, 0, np.pi/15),
+                scale_range=(0.1, 0.1, 0.1)
+            )
+        ]
+
+    return Compose(transforms + [EnsureTyped(keys=["image", "label"])])import os
+import json
+import numpy as np
+import pylidc as pl
+import nibabel as nib
+from tqdm import tqdm
+from pylidc.utils import consensus  # <--- FIXED IMPORT
+import config as cfg
+
+# --- CRITICAL: PYLIDC MONKEY PATCH ---
+import numpy
+if not hasattr(numpy, 'int'): numpy.int = int
+if not hasattr(numpy, 'float'): numpy.float = float
+if not hasattr(numpy, 'bool'): numpy.bool = bool
+
+def get_affine_from_scan(scan):
+    """
+    Constructs a valid affine matrix preserving Spacing AND Origin.
+    """
+    try:
+        first_slice = scan.images[0]
+        spacings = [scan.pixel_spacing, scan.pixel_spacing, scan.slice_spacing]
+        origin = first_slice.ImagePositionPatient
+        
+        affine = np.eye(4)
+        affine[0, 0] = spacings[0]
+        affine[1, 1] = spacings[1]
+        affine[2, 2] = spacings[2]
+        
+        affine[0, 3] = origin[0]
+        affine[1, 3] = origin[1]
+        affine[2, 3] = origin[2]
+        
+        return affine
+    except Exception as e:
+        # Fallback if DICOM header is missing info
+        spacing = np.array([scan.pixel_spacing, scan.pixel_spacing, scan.slice_spacing]).flatten()
+        affine = np.eye(4)
+        affine[0, 0] = spacing[0]
+        affine[1, 1] = spacing[1]
+        affine[2, 2] = spacing[2]
+        return affine
+
+def preprocess_lidc_sota():
+    os.makedirs(os.path.join(cfg.DATA_ROOT, "images"), exist_ok=True)
+    os.makedirs(os.path.join(cfg.DATA_ROOT, "labels"), exist_ok=True)
+
+    print("Querying LIDC-IDRI database...")
+    scans = pl.query(pl.Scan).all()
+    print(f"Found {len(scans)} scans.")
+
+    valid_entries = []
+
+    # Iterate with index to catch problematic files easily
+    for scan in tqdm(scans, desc="Processing LIDC"):
+        try:
+            # 1. Check for Annotations
+            cluster_annotations = scan.cluster_annotations()
+            
+            if not cluster_annotations:
+                continue
+
+            # 2. Reconstruct Volume (HU)
+            vol = scan.to_volume(verbose=False)
+            mask = np.zeros(vol.shape, dtype=np.uint8)
+            v_shape = vol.shape
+            
+            has_valid_nodule = False
+
+            for cluster in cluster_annotations:
+                # 50% Consensus level
+                # Fixed: Calling consensus from pylidc.utils
+                # Pad is [(before, after), ...] tuples. 0 padding ensures we stick to the bbox.
+                cmask, cbbox, _ = consensus(cluster, clevel=0.5, pad=[(0,0), (0,0), (0,0)])
+                
+                # --- BOUNDARY LOGIC ---
+                b_start = [cbbox[0].start, cbbox[1].start, cbbox[2].start]
+                b_stop  = [cbbox[0].stop,  cbbox[1].stop,  cbbox[2].stop]
+
+                # Volume Slices (Clamp to volume limits)
+                vol_slice = tuple(
+                    slice(max(0, s), min(d, e)) 
+                    for s, e, d in zip(b_start, b_stop, v_shape)
+                )
+
+                # Mask Slices (Handle cases where bbox starts before 0)
+                mask_slice = tuple(
+                    slice(max(0, -s), max(0, -s) + (min(d, e) - max(0, s)))
+                    for s, e, d in zip(b_start, b_stop, v_shape)
+                )
+                
+                try:
+                    # Merge Logic
+                    if mask[vol_slice].shape == cmask[mask_slice].shape:
+                        combined = np.logical_or(mask[vol_slice], cmask[mask_slice])
+                        mask[vol_slice] = combined.astype(np.uint8)
+                        has_valid_nodule = True
+                except Exception:
+                    continue
+
+            if not has_valid_nodule:
+                continue
+
+            # 3. Construct Affine
+            affine = get_affine_from_scan(scan)
+
+            # 4. Save NIfTI
+            series_uid = scan.series_instance_uid.replace('.', '')[-10:]
+            file_id = f"{scan.patient_id}_{series_uid}"
+            
+            img_path = os.path.join(cfg.DATA_ROOT, "images", f"{file_id}_image.nii.gz")
+            lbl_path = os.path.join(cfg.DATA_ROOT, "labels", f"{file_id}_label.nii.gz")
+
+            nib.save(nib.Nifti1Image(vol.astype(np.float32), affine), img_path)
+            nib.save(nib.Nifti1Image(mask.astype(np.uint8), affine), lbl_path)
+
+            valid_entries.append({
+                "image": img_path,
+                "label": lbl_path,
+                "patient_id": scan.patient_id
+            })
+
+        except Exception as e:
+            print(f"!!! ERROR on scan {scan.patient_id}: {e}")
+            continue
+
+    # 5. Patient-Level Splitting
+    unique_patients = sorted(list(set(d['patient_id'] for d in valid_entries)))
+    rng = np.random.RandomState(42)
+    rng.shuffle(unique_patients)
+    
+    split_idx = int(len(unique_patients) * 0.8)
+    train_patients = set(unique_patients[:split_idx])
+    val_patients = set(unique_patients[split_idx:])
+    
+    final_train = [d for d in valid_entries if d['patient_id'] in train_patients]
+    final_val = [d for d in valid_entries if d['patient_id'] in val_patients]
+    
+    # Remove metadata before saving JSON
+    for d in final_train: del d['patient_id']
+    for d in final_val: del d['patient_id']
+
+    json_output = {
+        "training": final_train,
+        "validation": final_val
+    }
+
+    with open(cfg.JSON_PATH, "w") as f:
+        json.dump(json_output, f, indent=4)
+
+    print(f"Done. Train: {len(final_train)}, Val: {len(final_val)}")
+
+if __name__ == "__main__":
+    preprocess_lidc_sota()We used this for preprocessing:
+Starting Python training script... Log files are in the 'logs' directory.
+VISTA-3D Finetuning on cuda:0 | Spacing: (0.7, 0.7, 0.7)
+[Model] Initializing VISTA-3D (132 Classes)...
+[Model] Loading weights from /home/dem7clj/repos/mirpr/models/model.pt...
+[Model] Weights loaded successfully.
+Ep 1/150 Step 10/89 Loss: 8.2149 LR: 5.67e-06Ep 1/150 Step 20/89 Loss: 5.5661 LR: 6.35e-06Ep 1/150 Step 30/89 Loss: 3.0194 LR: 7.02e-06Ep 1/150 Step 40/89 Loss: 1.0854 LR: 7.70e-06Ep 1/150 Step 50/89 Loss: 0.4794 LR: 8.37e-06Ep 1/150 Step 60/89 Loss: 0.4372 LR: 9.05e-06Ep 1/150 Step 70/89 Loss: 0.4793 LR: 9.72e-06Ep 1/150 Step 80/89 Loss: 0.4543 LR: 1.04e-05
+Epoch 1 Avg Loss: 2.6336
+Epoch 1 Avg Loss: 2.6336 | Skip Rate: 0.0% (0/1416)
+Ep 2/150 Step 10/89 Loss: 0.3485 LR: 1.17e-05Ep 2/150 Step 20/89 Loss: 0.3430 LR: 1.24e-05Ep 2/150 Step 30/89 Loss: 0.3220 LR: 1.30e-05Ep 2/150 Step 40/89 Loss: 0.3164 LR: 1.37e-05Ep 2/150 Step 50/89 Loss: 0.2740 LR: 1.44e-05Ep 2/150 Step 60/89 Loss: 0.3267 LR: 1.51e-05Ep 2/150 Step 70/89 Loss: 0.2746 LR: 1.57e-05Ep 2/150 Step 80/89 Loss: 0.3020 LR: 1.64e-05
+Epoch 2 Avg Loss: 0.3167
+Epoch 2 Avg Loss: 0.3167 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep2] Max Pred: 0.9963, Max GT: 1.0
+[DEBUG Ep2] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.2989 | LR: 0.00001701
+>>> New Best Model Saved!
+Ep 3/150 Step 10/89 Loss: 0.3257 LR: 1.77e-05Ep 3/150 Step 20/89 Loss: 0.2409 LR: 1.84e-05Ep 3/150 Step 30/89 Loss: 0.3539 LR: 1.90e-05Ep 3/150 Step 40/89 Loss: 0.3236 LR: 1.97e-05Ep 3/150 Step 50/89 Loss: 0.2254 LR: 2.04e-05Ep 3/150 Step 60/89 Loss: 0.2496 LR: 2.11e-05Ep 3/150 Step 70/89 Loss: 0.1973 LR: 2.17e-05Ep 3/150 Step 80/89 Loss: 0.2659 LR: 2.24e-05
+Epoch 3 Avg Loss: 0.2712
+Epoch 3 Avg Loss: 0.2712 | Skip Rate: 0.0% (0/1416)
+Ep 4/150 Step 10/89 Loss: 0.2708 LR: 2.37e-05Ep 4/150 Step 20/89 Loss: 0.2194 LR: 2.44e-05Ep 4/150 Step 30/89 Loss: 0.2360 LR: 2.50e-05Ep 4/150 Step 40/89 Loss: 0.2556 LR: 2.57e-05Ep 4/150 Step 50/89 Loss: 0.3057 LR: 2.64e-05Ep 4/150 Step 60/89 Loss: 0.3204 LR: 2.71e-05Ep 4/150 Step 70/89 Loss: 0.3307 LR: 2.77e-05Ep 4/150 Step 80/89 Loss: 0.3621 LR: 2.84e-05
+Epoch 4 Avg Loss: 0.2621
+Epoch 4 Avg Loss: 0.2621 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep4] Max Pred: 0.9899, Max GT: 1.0
+[DEBUG Ep4] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.3958 | LR: 0.00002902
+>>> New Best Model Saved!
+Ep 5/150 Step 10/89 Loss: 0.2947 LR: 2.97e-05Ep 5/150 Step 20/89 Loss: 0.2046 LR: 3.04e-05Ep 5/150 Step 30/89 Loss: 0.2813 LR: 3.10e-05Ep 5/150 Step 40/89 Loss: 0.1939 LR: 3.17e-05Ep 5/150 Step 50/89 Loss: 0.2424 LR: 3.24e-05Ep 5/150 Step 60/89 Loss: 0.1733 LR: 3.31e-05Ep 5/150 Step 70/89 Loss: 0.2911 LR: 3.37e-05Ep 5/150 Step 80/89 Loss: 0.2517 LR: 3.44e-05
+Epoch 5 Avg Loss: 0.2443
+Epoch 5 Avg Loss: 0.2443 | Skip Rate: 0.0% (0/1416)
+Ep 6/150 Step 10/89 Loss: 0.2311 LR: 3.57e-05Ep 6/150 Step 20/89 Loss: 0.3662 LR: 3.64e-05Ep 6/150 Step 30/89 Loss: 0.2854 LR: 3.70e-05Ep 6/150 Step 40/89 Loss: 0.1776 LR: 3.77e-05Ep 6/150 Step 50/89 Loss: 0.1566 LR: 3.84e-05Ep 6/150 Step 60/89 Loss: 0.1898 LR: 3.91e-05Ep 6/150 Step 70/89 Loss: 0.3085 LR: 3.97e-05Ep 6/150 Step 80/89 Loss: 0.2313 LR: 4.04e-05
+Epoch 6 Avg Loss: 0.2458
+Epoch 6 Avg Loss: 0.2458 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep6] Max Pred: 0.9955, Max GT: 1.0
+[DEBUG Ep6] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.4482 | LR: 0.00004103
+>>> New Best Model Saved!
+Ep 7/150 Step 10/89 Loss: 0.2905 LR: 4.17e-05Ep 7/150 Step 20/89 Loss: 0.1469 LR: 4.24e-05Ep 7/150 Step 30/89 Loss: 0.2655 LR: 4.31e-05Ep 7/150 Step 40/89 Loss: 0.2865 LR: 4.37e-05Ep 7/150 Step 50/89 Loss: 0.2456 LR: 4.44e-05Ep 7/150 Step 60/89 Loss: 0.2880 LR: 4.51e-05Ep 7/150 Step 70/89 Loss: 0.2646 LR: 4.57e-05Ep 7/150 Step 80/89 Loss: 0.2860 LR: 4.64e-05
+Epoch 7 Avg Loss: 0.2427
+Epoch 7 Avg Loss: 0.2427 | Skip Rate: 0.0% (0/1416)
+Ep 8/150 Step 10/89 Loss: 0.2314 LR: 4.77e-05Ep 8/150 Step 20/89 Loss: 0.2128 LR: 4.84e-05Ep 8/150 Step 30/89 Loss: 0.2866 LR: 4.91e-05Ep 8/150 Step 40/89 Loss: 0.2102 LR: 4.97e-05Ep 8/150 Step 50/89 Loss: 0.2005 LR: 5.00e-05Ep 8/150 Step 60/89 Loss: 0.2825 LR: 5.00e-05Ep 8/150 Step 70/89 Loss: 0.2408 LR: 5.00e-05Ep 8/150 Step 80/89 Loss: 0.2226 LR: 5.00e-05
+Epoch 8 Avg Loss: 0.2361
+Epoch 8 Avg Loss: 0.2361 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep8] Max Pred: 0.9972, Max GT: 1.0
+[DEBUG Ep8] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.4396 | LR: 0.00005000
+Ep 9/150 Step 10/89 Loss: 0.1982 LR: 5.00e-05Ep 9/150 Step 20/89 Loss: 0.3048 LR: 5.00e-05Ep 9/150 Step 30/89 Loss: 0.3939 LR: 5.00e-05Ep 9/150 Step 40/89 Loss: 0.3210 LR: 5.00e-05Ep 9/150 Step 50/89 Loss: 0.1428 LR: 5.00e-05Ep 9/150 Step 60/89 Loss: 0.2832 LR: 5.00e-05Ep 9/150 Step 70/89 Loss: 0.2898 LR: 5.00e-05Ep 9/150 Step 80/89 Loss: 0.3036 LR: 5.00e-05
+Epoch 9 Avg Loss: 0.2450
+Epoch 9 Avg Loss: 0.2450 | Skip Rate: 0.0% (0/1416)
+Ep 10/150 Step 10/89 Loss: 0.1994 LR: 5.00e-05Ep 10/150 Step 20/89 Loss: 0.1846 LR: 5.00e-05Ep 10/150 Step 30/89 Loss: 0.2835 LR: 5.00e-05Ep 10/150 Step 40/89 Loss: 0.2462 LR: 5.00e-05Ep 10/150 Step 50/89 Loss: 0.2743 LR: 5.00e-05Ep 10/150 Step 60/89 Loss: 0.2067 LR: 5.00e-05Ep 10/150 Step 70/89 Loss: 0.1973 LR: 5.00e-05Ep 10/150 Step 80/89 Loss: 0.2496 LR: 5.00e-05
+Epoch 10 Avg Loss: 0.2334
+Epoch 10 Avg Loss: 0.2334 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep10] Max Pred: 0.9950, Max GT: 1.0
+[DEBUG Ep10] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.4555 | LR: 0.00004996
+>>> New Best Model Saved!
+Ep 11/150 Step 10/89 Loss: 0.2676 LR: 5.00e-05Ep 11/150 Step 20/89 Loss: 0.2265 LR: 5.00e-05Ep 11/150 Step 30/89 Loss: 0.2462 LR: 5.00e-05Ep 11/150 Step 40/89 Loss: 0.1997 LR: 4.99e-05Ep 11/150 Step 50/89 Loss: 0.2600 LR: 4.99e-05Ep 11/150 Step 60/89 Loss: 0.2464 LR: 4.99e-05Ep 11/150 Step 70/89 Loss: 0.3136 LR: 4.99e-05Ep 11/150 Step 80/89 Loss: 0.1829 LR: 4.99e-05
+Epoch 11 Avg Loss: 0.2388
+Epoch 11 Avg Loss: 0.2388 | Skip Rate: 0.0% (0/1416)
+Ep 12/150 Step 10/89 Loss: 0.1741 LR: 4.99e-05Ep 12/150 Step 20/89 Loss: 0.1832 LR: 4.99e-05Ep 12/150 Step 30/89 Loss: 0.2226 LR: 4.99e-05Ep 12/150 Step 40/89 Loss: 0.1960 LR: 4.99e-05Ep 12/150 Step 50/89 Loss: 0.2144 LR: 4.99e-05Ep 12/150 Step 60/89 Loss: 0.2818 LR: 4.99e-05Ep 12/150 Step 70/89 Loss: 0.1941 LR: 4.99e-05Ep 12/150 Step 80/89 Loss: 0.2086 LR: 4.99e-05
+Epoch 12 Avg Loss: 0.2314
+Epoch 12 Avg Loss: 0.2314 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep12] Max Pred: 0.8756, Max GT: 1.0
+[DEBUG Ep12] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.4733 | LR: 0.00004988
+>>> New Best Model Saved!
+Ep 13/150 Step 10/89 Loss: 0.2301 LR: 4.99e-05Ep 13/150 Step 20/89 Loss: 0.2015 LR: 4.99e-05Ep 13/150 Step 30/89 Loss: 0.3134 LR: 4.99e-05Ep 13/150 Step 40/89 Loss: 0.1331 LR: 4.99e-05Ep 13/150 Step 50/89 Loss: 0.2254 LR: 4.98e-05Ep 13/150 Step 60/89 Loss: 0.2073 LR: 4.98e-05Ep 13/150 Step 70/89 Loss: 0.2533 LR: 4.98e-05Ep 13/150 Step 80/89 Loss: 0.2061 LR: 4.98e-05
+Epoch 13 Avg Loss: 0.2286
+Epoch 13 Avg Loss: 0.2286 | Skip Rate: 0.0% (0/1416)
+Ep 14/150 Step 10/89 Loss: 0.2412 LR: 4.98e-05Ep 14/150 Step 20/89 Loss: 0.2257 LR: 4.98e-05Ep 14/150 Step 30/89 Loss: 0.1904 LR: 4.98e-05Ep 14/150 Step 40/89 Loss: 0.2078 LR: 4.98e-05Ep 14/150 Step 50/89 Loss: 0.1466 LR: 4.98e-05Ep 14/150 Step 60/89 Loss: 0.2990 LR: 4.98e-05Ep 14/150 Step 70/89 Loss: 0.2532 LR: 4.98e-05Ep 14/150 Step 80/89 Loss: 0.1633 LR: 4.98e-05
+Epoch 14 Avg Loss: 0.2278
+Epoch 14 Avg Loss: 0.2278 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep14] Max Pred: 0.9542, Max GT: 1.0
+[DEBUG Ep14] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.4711 | LR: 0.00004974
+Ep 15/150 Step 10/89 Loss: 0.2224 LR: 4.97e-05Ep 15/150 Step 20/89 Loss: 0.1815 LR: 4.97e-05Ep 15/150 Step 30/89 Loss: 0.2333 LR: 4.97e-05Ep 15/150 Step 40/89 Loss: 0.2259 LR: 4.97e-05Ep 15/150 Step 50/89 Loss: 0.1669 LR: 4.97e-05Ep 15/150 Step 60/89 Loss: 0.1642 LR: 4.97e-05Ep 15/150 Step 70/89 Loss: 0.2682 LR: 4.97e-05Ep 15/150 Step 80/89 Loss: 0.2098 LR: 4.97e-05
+Epoch 15 Avg Loss: 0.2287
+Epoch 15 Avg Loss: 0.2287 | Skip Rate: 0.0% (0/1416)
+Ep 16/150 Step 10/89 Loss: 0.2534 LR: 4.96e-05Ep 16/150 Step 20/89 Loss: 0.2362 LR: 4.96e-05Ep 16/150 Step 30/89 Loss: 0.2446 LR: 4.96e-05Ep 16/150 Step 40/89 Loss: 0.2145 LR: 4.96e-05Ep 16/150 Step 50/89 Loss: 0.2448 LR: 4.96e-05Ep 16/150 Step 60/89 Loss: 0.2023 LR: 4.96e-05Ep 16/150 Step 70/89 Loss: 0.2708 LR: 4.96e-05Ep 16/150 Step 80/89 Loss: 0.2535 LR: 4.96e-05
+Epoch 16 Avg Loss: 0.2281
+Epoch 16 Avg Loss: 0.2281 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep16] Max Pred: 0.9482, Max GT: 1.0
+[DEBUG Ep16] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.5096 | LR: 0.00004956
+>>> New Best Model Saved!
+Ep 17/150 Step 10/89 Loss: 0.2204 LR: 4.96e-05Ep 17/150 Step 20/89 Loss: 0.2862 LR: 4.95e-05Ep 17/150 Step 30/89 Loss: 0.2236 LR: 4.95e-05Ep 17/150 Step 40/89 Loss: 0.3430 LR: 4.95e-05Ep 17/150 Step 50/89 Loss: 0.1885 LR: 4.95e-05Ep 17/150 Step 60/89 Loss: 0.2719 LR: 4.95e-05Ep 17/150 Step 70/89 Loss: 0.2864 LR: 4.95e-05Ep 17/150 Step 80/89 Loss: 0.2072 LR: 4.95e-05
+Epoch 17 Avg Loss: 0.2226
+Epoch 17 Avg Loss: 0.2226 | Skip Rate: 0.0% (0/1416)
+Ep 18/150 Step 10/89 Loss: 0.2445 LR: 4.94e-05Ep 18/150 Step 20/89 Loss: 0.2444 LR: 4.94e-05Ep 18/150 Step 30/89 Loss: 0.1487 LR: 4.94e-05Ep 18/150 Step 40/89 Loss: 0.2472 LR: 4.94e-05Ep 18/150 Step 50/89 Loss: 0.1553 LR: 4.94e-05Ep 18/150 Step 60/89 Loss: 0.1869 LR: 4.94e-05Ep 18/150 Step 70/89 Loss: 0.2583 LR: 4.94e-05Ep 18/150 Step 80/89 Loss: 0.1814 LR: 4.93e-05
+Epoch 18 Avg Loss: 0.2279
+Epoch 18 Avg Loss: 0.2279 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep18] Max Pred: 0.9731, Max GT: 1.0
+[DEBUG Ep18] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.4662 | LR: 0.00004933
+Ep 19/150 Step 10/89 Loss: 0.2139 LR: 4.93e-05Ep 19/150 Step 20/89 Loss: 0.2774 LR: 4.93e-05Ep 19/150 Step 30/89 Loss: 0.2065 LR: 4.93e-05Ep 19/150 Step 40/89 Loss: 0.2002 LR: 4.93e-05Ep 19/150 Step 50/89 Loss: 0.2732 LR: 4.93e-05Ep 19/150 Step 60/89 Loss: 0.1060 LR: 4.92e-05Ep 19/150 Step 70/89 Loss: 0.2557 LR: 4.92e-05Ep 19/150 Step 80/89 Loss: 0.2555 LR: 4.92e-05
+Epoch 19 Avg Loss: 0.2269
+Epoch 19 Avg Loss: 0.2269 | Skip Rate: 0.0% (0/1416)
+Ep 20/150 Step 10/89 Loss: 0.2579 LR: 4.92e-05Ep 20/150 Step 20/89 Loss: 0.1788 LR: 4.92e-05Ep 20/150 Step 30/89 Loss: 0.2616 LR: 4.92e-05Ep 20/150 Step 40/89 Loss: 0.1821 LR: 4.91e-05Ep 20/150 Step 50/89 Loss: 0.2754 LR: 4.91e-05Ep 20/150 Step 60/89 Loss: 0.2276 LR: 4.91e-05Ep 20/150 Step 70/89 Loss: 0.2210 LR: 4.91e-05Ep 20/150 Step 80/89 Loss: 0.2186 LR: 4.91e-05
+Epoch 20 Avg Loss: 0.2222
+Epoch 20 Avg Loss: 0.2222 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep20] Max Pred: 0.9861, Max GT: 1.0
+[DEBUG Ep20] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.4607 | LR: 0.00004906
+Ep 21/150 Step 10/89 Loss: 0.2717 LR: 4.90e-05Ep 21/150 Step 20/89 Loss: 0.1946 LR: 4.90e-05Ep 21/150 Step 30/89 Loss: 0.1878 LR: 4.90e-05Ep 21/150 Step 40/89 Loss: 0.2656 LR: 4.90e-05Ep 21/150 Step 50/89 Loss: 0.1745 LR: 4.90e-05Ep 21/150 Step 60/89 Loss: 0.1071 LR: 4.90e-05Ep 21/150 Step 70/89 Loss: 0.2980 LR: 4.89e-05Ep 21/150 Step 80/89 Loss: 0.1647 LR: 4.89e-05
+Epoch 21 Avg Loss: 0.2221
+Epoch 21 Avg Loss: 0.2221 | Skip Rate: 0.0% (0/1416)
+Ep 22/150 Step 10/89 Loss: 0.2124 LR: 4.89e-05Ep 22/150 Step 20/89 Loss: 0.2482 LR: 4.89e-05Ep 22/150 Step 30/89 Loss: 0.2968 LR: 4.88e-05Ep 22/150 Step 40/89 Loss: 0.2137 LR: 4.88e-05Ep 22/150 Step 50/89 Loss: 0.1939 LR: 4.88e-05Ep 22/150 Step 60/89 Loss: 0.2446 LR: 4.88e-05Ep 22/150 Step 70/89 Loss: 0.1903 LR: 4.88e-05Ep 22/150 Step 80/89 Loss: 0.2090 LR: 4.88e-05
+Epoch 22 Avg Loss: 0.2231
+Epoch 22 Avg Loss: 0.2231 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep22] Max Pred: 0.3114, Max GT: 1.0
+[DEBUG Ep22] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.5434 | LR: 0.00004873
+>>> New Best Model Saved!
+Ep 23/150 Step 10/89 Loss: 0.2051 LR: 4.87e-05Ep 23/150 Step 20/89 Loss: 0.1620 LR: 4.87e-05Ep 23/150 Step 30/89 Loss: 0.1177 LR: 4.87e-05Ep 23/150 Step 40/89 Loss: 0.2009 LR: 4.87e-05Ep 23/150 Step 50/89 Loss: 0.2336 LR: 4.86e-05Ep 23/150 Step 60/89 Loss: 0.1631 LR: 4.86e-05Ep 23/150 Step 70/89 Loss: 0.1811 LR: 4.86e-05Ep 23/150 Step 80/89 Loss: 0.1505 LR: 4.86e-05
+Epoch 23 Avg Loss: 0.2218
+Epoch 23 Avg Loss: 0.2218 | Skip Rate: 0.0% (0/1416)
+Ep 24/150 Step 10/89 Loss: 0.2317 LR: 4.85e-05Ep 24/150 Step 20/89 Loss: 0.2788 LR: 4.85e-05Ep 24/150 Step 30/89 Loss: 0.1970 LR: 4.85e-05Ep 24/150 Step 40/89 Loss: 0.1601 LR: 4.85e-05Ep 24/150 Step 50/89 Loss: 0.1744 LR: 4.84e-05Ep 24/150 Step 60/89 Loss: 0.2411 LR: 4.84e-05Ep 24/150 Step 70/89 Loss: 0.2197 LR: 4.84e-05Ep 24/150 Step 80/89 Loss: 0.1095 LR: 4.84e-05
+Epoch 24 Avg Loss: 0.2186
+Epoch 24 Avg Loss: 0.2186 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep24] Max Pred: 0.5024, Max GT: 1.0
+[DEBUG Ep24] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.5189 | LR: 0.00004836
+Ep 25/150 Step 10/89 Loss: 0.2338 LR: 4.83e-05Ep 25/150 Step 20/89 Loss: 0.2674 LR: 4.83e-05Ep 25/150 Step 30/89 Loss: 0.1332 LR: 4.83e-05Ep 25/150 Step 40/89 Loss: 0.1697 LR: 4.83e-05Ep 25/150 Step 50/89 Loss: 0.1631 LR: 4.83e-05Ep 25/150 Step 60/89 Loss: 0.2284 LR: 4.82e-05Ep 25/150 Step 70/89 Loss: 0.2467 LR: 4.82e-05Ep 25/150 Step 80/89 Loss: 0.2573 LR: 4.82e-05
+Epoch 25 Avg Loss: 0.2194
+Epoch 25 Avg Loss: 0.2194 | Skip Rate: 0.0% (0/1416)
+Ep 26/150 Step 10/89 Loss: 0.1077 LR: 4.81e-05Ep 26/150 Step 20/89 Loss: 0.2475 LR: 4.81e-05Ep 26/150 Step 30/89 Loss: 0.2137 LR: 4.81e-05Ep 26/150 Step 40/89 Loss: 0.1422 LR: 4.81e-05Ep 26/150 Step 50/89 Loss: 0.1866 LR: 4.80e-05Ep 26/150 Step 60/89 Loss: 0.1783 LR: 4.80e-05Ep 26/150 Step 70/89 Loss: 0.2581 LR: 4.80e-05Ep 26/150 Step 80/89 Loss: 0.2162 LR: 4.80e-05
+Epoch 26 Avg Loss: 0.2175
+Epoch 26 Avg Loss: 0.2175 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep26] Max Pred: 0.9890, Max GT: 1.0
+[DEBUG Ep26] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.4688 | LR: 0.00004795
+Ep 27/150 Step 10/89 Loss: 0.2152 LR: 4.79e-05Ep 27/150 Step 20/89 Loss: 0.2259 LR: 4.79e-05Ep 27/150 Step 30/89 Loss: 0.3030 LR: 4.79e-05Ep 27/150 Step 40/89 Loss: 0.1313 LR: 4.78e-05Ep 27/150 Step 50/89 Loss: 0.1651 LR: 4.78e-05Ep 27/150 Step 60/89 Loss: 0.2493 LR: 4.78e-05Ep 27/150 Step 70/89 Loss: 0.1904 LR: 4.78e-05Ep 27/150 Step 80/89 Loss: 0.2115 LR: 4.77e-05
+Epoch 27 Avg Loss: 0.2162
+Epoch 27 Avg Loss: 0.2162 | Skip Rate: 0.0% (0/1416)
+Ep 28/150 Step 10/89 Loss: 0.2398 LR: 4.77e-05Ep 28/150 Step 20/89 Loss: 0.2362 LR: 4.77e-05Ep 28/150 Step 30/89 Loss: 0.2555 LR: 4.76e-05Ep 28/150 Step 40/89 Loss: 0.2124 LR: 4.76e-05Ep 28/150 Step 50/89 Loss: 0.1800 LR: 4.76e-05Ep 28/150 Step 60/89 Loss: 0.1866 LR: 4.76e-05Ep 28/150 Step 70/89 Loss: 0.2198 LR: 4.75e-05Ep 28/150 Step 80/89 Loss: 0.1467 LR: 4.75e-05
+Epoch 28 Avg Loss: 0.2175
+Epoch 28 Avg Loss: 0.2175 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep28] Max Pred: 0.6439, Max GT: 1.0
+[DEBUG Ep28] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.5161 | LR: 0.00004749
+Ep 29/150 Step 10/89 Loss: 0.2633 LR: 4.75e-05Ep 29/150 Step 20/89 Loss: 0.2353 LR: 4.74e-05Ep 29/150 Step 30/89 Loss: 0.2603 LR: 4.74e-05Ep 29/150 Step 40/89 Loss: 0.2382 LR: 4.74e-05Ep 29/150 Step 50/89 Loss: 0.2150 LR: 4.74e-05Ep 29/150 Step 60/89 Loss: 0.2063 LR: 4.73e-05Ep 29/150 Step 70/89 Loss: 0.1861 LR: 4.73e-05Ep 29/150 Step 80/89 Loss: 0.1504 LR: 4.73e-05
+Epoch 29 Avg Loss: 0.2177
+Epoch 29 Avg Loss: 0.2177 | Skip Rate: 0.0% (0/1416)
+Ep 30/150 Step 10/89 Loss: 0.1907 LR: 4.72e-05Ep 30/150 Step 20/89 Loss: 0.2954 LR: 4.72e-05Ep 30/150 Step 30/89 Loss: 0.2815 LR: 4.72e-05Ep 30/150 Step 40/89 Loss: 0.1708 LR: 4.71e-05Ep 30/150 Step 50/89 Loss: 0.1565 LR: 4.71e-05Ep 30/150 Step 60/89 Loss: 0.2277 LR: 4.71e-05Ep 30/150 Step 70/89 Loss: 0.2316 LR: 4.70e-05Ep 30/150 Step 80/89 Loss: 0.2191 LR: 4.70e-05
+Epoch 30 Avg Loss: 0.2089
+Epoch 30 Avg Loss: 0.2089 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep30] Max Pred: 0.9928, Max GT: 1.0
+[DEBUG Ep30] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.5271 | LR: 0.00004699
+Ep 31/150 Step 10/89 Loss: 0.3359 LR: 4.70e-05Ep 31/150 Step 20/89 Loss: 0.1593 LR: 4.69e-05Ep 31/150 Step 30/89 Loss: 0.2199 LR: 4.69e-05Ep 31/150 Step 40/89 Loss: 0.2396 LR: 4.69e-05Ep 31/150 Step 50/89 Loss: 0.1598 LR: 4.68e-05Ep 31/150 Step 60/89 Loss: 0.1671 LR: 4.68e-05Ep 31/150 Step 70/89 Loss: 0.1537 LR: 4.68e-05Ep 31/150 Step 80/89 Loss: 0.2060 LR: 4.67e-05
+Epoch 31 Avg Loss: 0.2165
+Epoch 31 Avg Loss: 0.2165 | Skip Rate: 0.0% (0/1416)
+Ep 32/150 Step 10/89 Loss: 0.1861 LR: 4.67e-05Ep 32/150 Step 20/89 Loss: 0.1713 LR: 4.67e-05Ep 32/150 Step 30/89 Loss: 0.2376 LR: 4.66e-05Ep 32/150 Step 40/89 Loss: 0.2252 LR: 4.66e-05Ep 32/150 Step 50/89 Loss: 0.2526 LR: 4.66e-05Ep 32/150 Step 60/89 Loss: 0.1895 LR: 4.65e-05Ep 32/150 Step 70/89 Loss: 0.1714 LR: 4.65e-05Ep 32/150 Step 80/89 Loss: 0.1190 LR: 4.65e-05
+Epoch 32 Avg Loss: 0.2187
+Epoch 32 Avg Loss: 0.2187 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep32] Max Pred: 0.9397, Max GT: 1.0
+[DEBUG Ep32] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.5016 | LR: 0.00004644
+Ep 33/150 Step 10/89 Loss: 0.2465 LR: 4.64e-05Ep 33/150 Step 20/89 Loss: 0.2016 LR: 4.64e-05Ep 33/150 Step 30/89 Loss: 0.1856 LR: 4.63e-05Ep 33/150 Step 40/89 Loss: 0.2015 LR: 4.63e-05Ep 33/150 Step 50/89 Loss: 0.2463 LR: 4.63e-05Ep 33/150 Step 60/89 Loss: 0.2361 LR: 4.62e-05Ep 33/150 Step 70/89 Loss: 0.1261 LR: 4.62e-05Ep 33/150 Step 80/89 Loss: 0.2401 LR: 4.62e-05
+Epoch 33 Avg Loss: 0.2144
+Epoch 33 Avg Loss: 0.2144 | Skip Rate: 0.0% (0/1416)
+Ep 34/150 Step 10/89 Loss: 0.2602 LR: 4.61e-05Ep 34/150 Step 20/89 Loss: 0.2920 LR: 4.61e-05Ep 34/150 Step 30/89 Loss: 0.2310 LR: 4.61e-05Ep 34/150 Step 40/89 Loss: 0.1903 LR: 4.60e-05Ep 34/150 Step 50/89 Loss: 0.1739 LR: 4.60e-05Ep 34/150 Step 60/89 Loss: 0.2020 LR: 4.60e-05Ep 34/150 Step 70/89 Loss: 0.2032 LR: 4.59e-05Ep 34/150 Step 80/89 Loss: 0.2603 LR: 4.59e-05
+Epoch 34 Avg Loss: 0.2124
+Epoch 34 Avg Loss: 0.2124 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep34] Max Pred: 0.9871, Max GT: 1.0
+[DEBUG Ep34] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.5171 | LR: 0.00004585
+Ep 35/150 Step 10/89 Loss: 0.1842 LR: 4.58e-05Ep 35/150 Step 20/89 Loss: 0.2531 LR: 4.58e-05Ep 35/150 Step 30/89 Loss: 0.2875 LR: 4.57e-05Ep 35/150 Step 40/89 Loss: 0.2814 LR: 4.57e-05Ep 35/150 Step 50/89 Loss: 0.1676 LR: 4.57e-05Ep 35/150 Step 60/89 Loss: 0.2643 LR: 4.56e-05Ep 35/150 Step 70/89 Loss: 0.2132 LR: 4.56e-05Ep 35/150 Step 80/89 Loss: 0.1680 LR: 4.56e-05
+Epoch 35 Avg Loss: 0.2125
+Epoch 35 Avg Loss: 0.2125 | Skip Rate: 0.0% (0/1416)
+Ep 36/150 Step 10/89 Loss: 0.1985 LR: 4.55e-05Ep 36/150 Step 20/89 Loss: 0.2705 LR: 4.55e-05Ep 36/150 Step 30/89 Loss: 0.2797 LR: 4.54e-05Ep 36/150 Step 40/89 Loss: 0.1579 LR: 4.54e-05Ep 36/150 Step 50/89 Loss: 0.2678 LR: 4.54e-05Ep 36/150 Step 60/89 Loss: 0.2121 LR: 4.53e-05Ep 36/150 Step 70/89 Loss: 0.1712 LR: 4.53e-05Ep 36/150 Step 80/89 Loss: 0.1996 LR: 4.53e-05
+Epoch 36 Avg Loss: 0.2107
+Epoch 36 Avg Loss: 0.2107 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep36] Max Pred: 0.9772, Max GT: 1.0
+[DEBUG Ep36] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.5466 | LR: 0.00004522
+>>> New Best Model Saved!
+Ep 37/150 Step 10/89 Loss: 0.2197 LR: 4.52e-05Ep 37/150 Step 20/89 Loss: 0.2323 LR: 4.52e-05Ep 37/150 Step 30/89 Loss: 0.2235 LR: 4.51e-05Ep 37/150 Step 40/89 Loss: 0.2890 LR: 4.51e-05Ep 37/150 Step 50/89 Loss: 0.2528 LR: 4.50e-05Ep 37/150 Step 60/89 Loss: 0.2541 LR: 4.50e-05Ep 37/150 Step 70/89 Loss: 0.1798 LR: 4.50e-05Ep 37/150 Step 80/89 Loss: 0.2241 LR: 4.49e-05
+Epoch 37 Avg Loss: 0.2215
+Epoch 37 Avg Loss: 0.2215 | Skip Rate: 0.0% (0/1416)
+Ep 38/150 Step 10/89 Loss: 0.2184 LR: 4.49e-05Ep 38/150 Step 20/89 Loss: 0.1670 LR: 4.48e-05Ep 38/150 Step 30/89 Loss: 0.2674 LR: 4.48e-05Ep 38/150 Step 40/89 Loss: 0.1410 LR: 4.47e-05Ep 38/150 Step 50/89 Loss: 0.1565 LR: 4.47e-05Ep 38/150 Step 60/89 Loss: 0.2530 LR: 4.47e-05Ep 38/150 Step 70/89 Loss: 0.1822 LR: 4.46e-05Ep 38/150 Step 80/89 Loss: 0.2219 LR: 4.46e-05
+Epoch 38 Avg Loss: 0.2111
+Epoch 38 Avg Loss: 0.2111 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep38] Max Pred: 0.5214, Max GT: 1.0
+[DEBUG Ep38] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.5472 | LR: 0.00004456
+>>> New Best Model Saved!
+Ep 39/150 Step 10/89 Loss: 0.2110 LR: 4.45e-05Ep 39/150 Step 20/89 Loss: 0.1832 LR: 4.45e-05Ep 39/150 Step 30/89 Loss: 0.2336 LR: 4.44e-05Ep 39/150 Step 40/89 Loss: 0.2287 LR: 4.44e-05Ep 39/150 Step 50/89 Loss: 0.2832 LR: 4.44e-05Ep 39/150 Step 60/89 Loss: 0.2157 LR: 4.43e-05Ep 39/150 Step 70/89 Loss: 0.2049 LR: 4.43e-05Ep 39/150 Step 80/89 Loss: 0.2577 LR: 4.42e-05
+Epoch 39 Avg Loss: 0.2137
+Epoch 39 Avg Loss: 0.2137 | Skip Rate: 0.0% (0/1416)
+Ep 40/150 Step 10/89 Loss: 0.1517 LR: 4.42e-05Ep 40/150 Step 20/89 Loss: 0.2198 LR: 4.41e-05Ep 40/150 Step 30/89 Loss: 0.2028 LR: 4.41e-05Ep 40/150 Step 40/89 Loss: 0.1721 LR: 4.40e-05Ep 40/150 Step 50/89 Loss: 0.2952 LR: 4.40e-05Ep 40/150 Step 60/89 Loss: 0.2638 LR: 4.40e-05Ep 40/150 Step 70/89 Loss: 0.2422 LR: 4.39e-05Ep 40/150 Step 80/89 Loss: 0.1783 LR: 4.39e-05
+Epoch 40 Avg Loss: 0.2104
+Epoch 40 Avg Loss: 0.2104 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep40] Max Pred: 0.9968, Max GT: 1.0
+[DEBUG Ep40] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.5554 | LR: 0.00004385
+>>> New Best Model Saved!
+Ep 41/150 Step 10/89 Loss: 0.1722 LR: 4.38e-05Ep 41/150 Step 20/89 Loss: 0.2216 LR: 4.38e-05Ep 41/150 Step 30/89 Loss: 0.1538 LR: 4.37e-05Ep 41/150 Step 40/89 Loss: 0.2547 LR: 4.37e-05Ep 41/150 Step 50/89 Loss: 0.2735 LR: 4.36e-05Ep 41/150 Step 60/89 Loss: 0.2640 LR: 4.36e-05Ep 41/150 Step 70/89 Loss: 0.2265 LR: 4.36e-05Ep 41/150 Step 80/89 Loss: 0.2419 LR: 4.35e-05
+Epoch 41 Avg Loss: 0.2031
+Epoch 41 Avg Loss: 0.2031 | Skip Rate: 0.0% (0/1416)
+Ep 42/150 Step 10/89 Loss: 0.1714 LR: 4.34e-05Ep 42/150 Step 20/89 Loss: 0.1055 LR: 4.34e-05Ep 42/150 Step 30/89 Loss: 0.2992 LR: 4.34e-05Ep 42/150 Step 40/89 Loss: 0.1682 LR: 4.33e-05Ep 42/150 Step 50/89 Loss: 0.2829 LR: 4.33e-05Ep 42/150 Step 60/89 Loss: 0.2797 LR: 4.32e-05Ep 42/150 Step 70/89 Loss: 0.2465 LR: 4.32e-05Ep 42/150 Step 80/89 Loss: 0.2027 LR: 4.31e-05
+Epoch 42 Avg Loss: 0.2077
+Epoch 42 Avg Loss: 0.2077 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep42] Max Pred: 0.9930, Max GT: 1.0
+[DEBUG Ep42] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.5419 | LR: 0.00004311
+Ep 43/150 Step 10/89 Loss: 0.2072 LR: 4.31e-05Ep 43/150 Step 20/89 Loss: 0.1689 LR: 4.30e-05Ep 43/150 Step 30/89 Loss: 0.2252 LR: 4.30e-05Ep 43/150 Step 40/89 Loss: 0.2095 LR: 4.29e-05Ep 43/150 Step 50/89 Loss: 0.1496 LR: 4.29e-05Ep 43/150 Step 60/89 Loss: 0.2319 LR: 4.29e-05Ep 43/150 Step 70/89 Loss: 0.2348 LR: 4.28e-05Ep 43/150 Step 80/89 Loss: 0.2500 LR: 4.28e-05
+Epoch 43 Avg Loss: 0.2174
+Epoch 43 Avg Loss: 0.2174 | Skip Rate: 0.0% (0/1416)
+Ep 44/150 Step 10/89 Loss: 0.2600 LR: 4.27e-05Ep 44/150 Step 20/89 Loss: 0.1400 LR: 4.26e-05Ep 44/150 Step 30/89 Loss: 0.2364 LR: 4.26e-05Ep 44/150 Step 40/89 Loss: 0.1190 LR: 4.25e-05Ep 44/150 Step 50/89 Loss: 0.2009 LR: 4.25e-05Ep 44/150 Step 60/89 Loss: 0.2001 LR: 4.25e-05Ep 44/150 Step 70/89 Loss: 0.2696 LR: 4.24e-05Ep 44/150 Step 80/89 Loss: 0.1829 LR: 4.24e-05
+Epoch 44 Avg Loss: 0.2126
+Epoch 44 Avg Loss: 0.2126 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep44] Max Pred: 0.8803, Max GT: 1.0
+[DEBUG Ep44] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.5398 | LR: 0.00004233
+Ep 45/150 Step 10/89 Loss: 0.2698 LR: 4.23e-05Ep 45/150 Step 20/89 Loss: 0.1859 LR: 4.22e-05Ep 45/150 Step 30/89 Loss: 0.1395 LR: 4.22e-05Ep 45/150 Step 40/89 Loss: 0.2059 LR: 4.22e-05Ep 45/150 Step 50/89 Loss: 0.2033 LR: 4.21e-05Ep 45/150 Step 60/89 Loss: 0.2131 LR: 4.21e-05Ep 45/150 Step 70/89 Loss: 0.2364 LR: 4.20e-05Ep 45/150 Step 80/89 Loss: 0.2174 LR: 4.20e-05
+Epoch 45 Avg Loss: 0.2104
+Epoch 45 Avg Loss: 0.2104 | Skip Rate: 0.0% (0/1416)
+Ep 46/150 Step 10/89 Loss: 0.2507 LR: 4.19e-05Ep 46/150 Step 20/89 Loss: 0.2237 LR: 4.18e-05Ep 46/150 Step 30/89 Loss: 0.2466 LR: 4.18e-05Ep 46/150 Step 40/89 Loss: 0.2321 LR: 4.17e-05Ep 46/150 Step 50/89 Loss: 0.1786 LR: 4.17e-05Ep 46/150 Step 60/89 Loss: 0.1622 LR: 4.17e-05Ep 46/150 Step 70/89 Loss: 0.3027 LR: 4.16e-05Ep 46/150 Step 80/89 Loss: 0.1731 LR: 4.16e-05
+Epoch 46 Avg Loss: 0.2007
+Epoch 46 Avg Loss: 0.2007 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep46] Max Pred: 0.8917, Max GT: 1.0
+[DEBUG Ep46] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.5487 | LR: 0.00004152
+Ep 47/150 Step 10/89 Loss: 0.2062 LR: 4.15e-05Ep 47/150 Step 20/89 Loss: 0.1618 LR: 4.14e-05Ep 47/150 Step 30/89 Loss: 0.2675 LR: 4.14e-05Ep 47/150 Step 40/89 Loss: 0.1384 LR: 4.13e-05Ep 47/150 Step 50/89 Loss: 0.2021 LR: 4.13e-05Ep 47/150 Step 60/89 Loss: 0.1829 LR: 4.12e-05Ep 47/150 Step 70/89 Loss: 0.2314 LR: 4.12e-05Ep 47/150 Step 80/89 Loss: 0.2137 LR: 4.11e-05
+Epoch 47 Avg Loss: 0.2078
+Epoch 47 Avg Loss: 0.2078 | Skip Rate: 0.0% (0/1416)
+Ep 48/150 Step 10/89 Loss: 0.2325 LR: 4.11e-05Ep 48/150 Step 20/89 Loss: 0.2017 LR: 4.10e-05Ep 48/150 Step 30/89 Loss: 0.1349 LR: 4.10e-05Ep 48/150 Step 40/89 Loss: 0.1687 LR: 4.09e-05Ep 48/150 Step 50/89 Loss: 0.1830 LR: 4.09e-05Ep 48/150 Step 60/89 Loss: 0.1789 LR: 4.08e-05Ep 48/150 Step 70/89 Loss: 0.2536 LR: 4.08e-05Ep 48/150 Step 80/89 Loss: 0.2259 LR: 4.07e-05
+Epoch 48 Avg Loss: 0.2123
+Epoch 48 Avg Loss: 0.2123 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep48] Max Pred: 0.9999, Max GT: 1.0
+[DEBUG Ep48] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.5594 | LR: 0.00004068
+>>> New Best Model Saved!
+Ep 49/150 Step 10/89 Loss: 0.2471 LR: 4.06e-05Ep 49/150 Step 20/89 Loss: 0.2018 LR: 4.06e-05Ep 49/150 Step 30/89 Loss: 0.1666 LR: 4.05e-05Ep 49/150 Step 40/89 Loss: 0.1985 LR: 4.05e-05Ep 49/150 Step 50/89 Loss: 0.1547 LR: 4.04e-05Ep 49/150 Step 60/89 Loss: 0.2032 LR: 4.04e-05Ep 49/150 Step 70/89 Loss: 0.2159 LR: 4.03e-05Ep 49/150 Step 80/89 Loss: 0.1715 LR: 4.03e-05
+Epoch 49 Avg Loss: 0.2005
+Epoch 49 Avg Loss: 0.2005 | Skip Rate: 0.0% (0/1416)
+Ep 50/150 Step 10/89 Loss: 0.2318 LR: 4.02e-05Ep 50/150 Step 20/89 Loss: 0.2715 LR: 4.01e-05Ep 50/150 Step 30/89 Loss: 0.2339 LR: 4.01e-05Ep 50/150 Step 40/89 Loss: 0.1996 LR: 4.00e-05Ep 50/150 Step 50/89 Loss: 0.2016 LR: 4.00e-05Ep 50/150 Step 60/89 Loss: 0.2076 LR: 3.99e-05Ep 50/150 Step 70/89 Loss: 0.1863 LR: 3.99e-05Ep 50/150 Step 80/89 Loss: 0.2187 LR: 3.98e-05
+Epoch 50 Avg Loss: 0.2210
+Epoch 50 Avg Loss: 0.2210 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep50] Max Pred: 0.9995, Max GT: 1.0
+[DEBUG Ep50] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.5405 | LR: 0.00003980
+Ep 51/150 Step 10/89 Loss: 0.2305 LR: 3.98e-05Ep 51/150 Step 20/89 Loss: 0.1823 LR: 3.97e-05Ep 51/150 Step 30/89 Loss: 0.1997 LR: 3.97e-05Ep 51/150 Step 40/89 Loss: 0.2510 LR: 3.96e-05Ep 51/150 Step 50/89 Loss: 0.1656 LR: 3.96e-05Ep 51/150 Step 60/89 Loss: 0.2035 LR: 3.95e-05Ep 51/150 Step 70/89 Loss: 0.2388 LR: 3.95e-05Ep 51/150 Step 80/89 Loss: 0.2011 LR: 3.94e-05
+Epoch 51 Avg Loss: 0.2155
+Epoch 51 Avg Loss: 0.2155 | Skip Rate: 0.0% (0/1416)
+Ep 52/150 Step 10/89 Loss: 0.2261 LR: 3.93e-05Ep 52/150 Step 20/89 Loss: 0.2237 LR: 3.93e-05Ep 52/150 Step 30/89 Loss: 0.1824 LR: 3.92e-05Ep 52/150 Step 40/89 Loss: 0.1218 LR: 3.92e-05Ep 52/150 Step 50/89 Loss: 0.1964 LR: 3.91e-05Ep 52/150 Step 60/89 Loss: 0.2806 LR: 3.91e-05Ep 52/150 Step 70/89 Loss: 0.1414 LR: 3.90e-05Ep 52/150 Step 80/89 Loss: 0.2538 LR: 3.89e-05
+Epoch 52 Avg Loss: 0.2082
+Epoch 52 Avg Loss: 0.2082 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep52] Max Pred: 0.9994, Max GT: 1.0
+[DEBUG Ep52] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.5554 | LR: 0.00003890
+Ep 53/150 Step 10/89 Loss: 0.2590 LR: 3.89e-05Ep 53/150 Step 20/89 Loss: 0.1895 LR: 3.88e-05Ep 53/150 Step 30/89 Loss: 0.2292 LR: 3.87e-05Ep 53/150 Step 40/89 Loss: 0.2138 LR: 3.87e-05Ep 53/150 Step 50/89 Loss: 0.1432 LR: 3.86e-05Ep 53/150 Step 60/89 Loss: 0.2700 LR: 3.86e-05Ep 53/150 Step 70/89 Loss: 0.1935 LR: 3.85e-05Ep 53/150 Step 80/89 Loss: 0.2635 LR: 3.85e-05
+Epoch 53 Avg Loss: 0.2156
+Epoch 53 Avg Loss: 0.2156 | Skip Rate: 0.0% (0/1416)
+Ep 54/150 Step 10/89 Loss: 0.2053 LR: 3.84e-05Ep 54/150 Step 20/89 Loss: 0.2548 LR: 3.83e-05Ep 54/150 Step 30/89 Loss: 0.1763 LR: 3.83e-05Ep 54/150 Step 40/89 Loss: 0.1397 LR: 3.82e-05Ep 54/150 Step 50/89 Loss: 0.2016 LR: 3.82e-05Ep 54/150 Step 60/89 Loss: 0.2032 LR: 3.81e-05Ep 54/150 Step 70/89 Loss: 0.0834 LR: 3.81e-05Ep 54/150 Step 80/89 Loss: 0.0920 LR: 3.80e-05
+Epoch 54 Avg Loss: 0.1746
+Epoch 54 Avg Loss: 0.1746 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep54] Max Pred: 1.0000, Max GT: 1.0
+[DEBUG Ep54] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.5542 | LR: 0.00003797
+Ep 55/150 Step 10/89 Loss: 0.0396 LR: 3.79e-05Ep 55/150 Step 20/89 Loss: 0.1605 LR: 3.79e-05Ep 55/150 Step 30/89 Loss: 0.1007 LR: 3.78e-05Ep 55/150 Step 40/89 Loss: 0.0924 LR: 3.78e-05Ep 55/150 Step 50/89 Loss: 0.1212 LR: 3.77e-05Ep 55/150 Step 60/89 Loss: 0.0944 LR: 3.77e-05Ep 55/150 Step 70/89 Loss: 0.1543 LR: 3.76e-05Ep 55/150 Step 80/89 Loss: 0.1210 LR: 3.75e-05
+Epoch 55 Avg Loss: 0.1081
+Epoch 55 Avg Loss: 0.1081 | Skip Rate: 0.0% (0/1416)
+Ep 56/150 Step 10/89 Loss: 0.0838 LR: 3.74e-05Ep 56/150 Step 20/89 Loss: 0.0522 LR: 3.74e-05Ep 56/150 Step 30/89 Loss: 0.0687 LR: 3.73e-05Ep 56/150 Step 40/89 Loss: 0.0791 LR: 3.73e-05Ep 56/150 Step 50/89 Loss: 0.0482 LR: 3.72e-05Ep 56/150 Step 60/89 Loss: 0.0639 LR: 3.72e-05Ep 56/150 Step 70/89 Loss: 0.1317 LR: 3.71e-05Ep 56/150 Step 80/89 Loss: 0.0739 LR: 3.71e-05
+Epoch 56 Avg Loss: 0.1033
+Epoch 56 Avg Loss: 0.1033 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep56] Max Pred: 0.0000, Max GT: 1.0
+[DEBUG Ep56] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.4169 | LR: 0.00003702
+Ep 57/150 Step 10/89 Loss: 0.0982 LR: 3.70e-05Ep 57/150 Step 20/89 Loss: 0.0391 LR: 3.69e-05Ep 57/150 Step 30/89 Loss: 0.1163 LR: 3.69e-05Ep 57/150 Step 40/89 Loss: 0.1348 LR: 3.68e-05Ep 57/150 Step 50/89 Loss: 0.0481 LR: 3.67e-05Ep 57/150 Step 60/89 Loss: 0.1496 LR: 3.67e-05Ep 57/150 Step 70/89 Loss: 0.1057 LR: 3.66e-05Ep 57/150 Step 80/89 Loss: 0.0953 LR: 3.66e-05
+Epoch 57 Avg Loss: 0.1094
+Epoch 57 Avg Loss: 0.1094 | Skip Rate: 0.0% (0/1416)
+Ep 58/150 Step 10/89 Loss: 0.1285 LR: 3.65e-05Ep 58/150 Step 20/89 Loss: 0.1064 LR: 3.64e-05Ep 58/150 Step 30/89 Loss: 0.1089 LR: 3.64e-05Ep 58/150 Step 40/89 Loss: 0.1423 LR: 3.63e-05Ep 58/150 Step 50/89 Loss: 0.1033 LR: 3.63e-05Ep 58/150 Step 60/89 Loss: 0.0613 LR: 3.62e-05Ep 58/150 Step 70/89 Loss: 0.0914 LR: 3.61e-05Ep 58/150 Step 80/89 Loss: 0.1674 LR: 3.61e-05
+Epoch 58 Avg Loss: 0.1056
+Epoch 58 Avg Loss: 0.1056 | Skip Rate: 0.0% (0/1416)
+[DEBUG Ep58] Max Pred: 0.0011, Max GT: 1.0
+[DEBUG Ep58] Pred Shape: torch.Size([1, 1, 459, 459, 640]), GT Shape: torch.Size([1, 1, 459, 459, 640])
+Validation Dice (Lung Tumor): 0.4930 | LR: 0.00003604
+
+------------------------------------------------------------
+Sender: LSF System <jdl1fe@abts55789>
+Subject: Job 21826685: <vista3d_H200> in cluster <abt-dl01> Exited
+
+Job <vista3d_H200> was submitted from host <abts55130> by user <dem7clj> in cluster <abt-dl01> at Sun Dec 21 21:56:13 2025
+Job was executed on host(s) <4*abts55789>, in queue <batch_h200>, as user <dem7clj> in cluster <abt-dl01> at Mon Dec 22 06:48:17 2025
+</home/dem7clj> was used as the home directory.
+</home/dem7clj/repos/mirpr> was used as the working directory.
+Started at Mon Dec 22 06:48:17 2025
+Terminated at Tue Dec 23 16:21:05 2025
+Results reported at Tue Dec 23 16:21:05 2025
+
+Your job looked like:
+
+------------------------------------------------------------
+# LSBATCH: User input
+#!/bin/bash
+# --- LSF Batch Job Submission Script for VISTA-3D Fine-Tuning ---
+# Uses a standard Python venv, not conda.
+
+# --- LSF Job Parameters ---
+#BSUB -J vista3d_H200         # Job name
+#BSUB -q batch_h200            # Your H200 queue
+#BSUB -n 4                    # Request 4 CPU cores (for dataloaders)
+#BSUB -W 48:00                 # Set wall-clock time limit to 24 hours
+#BSUB -M 150000                # Request 150 GB of host RAM
+#BSUB -R "span[hosts=1]"       # Ensure all cores are on the same host
+#BSUB -gpu "num=1"
+
+# --- Logging Configuration ---
+# Logs will be saved to a 'logs' directory in the submission folder.
+#BSUB -o logs/%J.stdout
+#BSUB -e logs/%J.stderr
+
+# --- Script Execution Logic ---
+
+# 1. Create the log directory if it doesn't exist.
+mkdir -p logs
+
+# 2. Set up the Python Virtual Environment (venv)
+#    *** THIS IS THE FIX ***
+#    We are now sourcing the 'activate' script from your venv directory.
+#    All 'conda' commands have been removed.
+VENV_PATH="/home/dem7clj/repos/mirpr/mirpr/bin/activate"
+if [ -f "$VENV_PATH" ]; then
+    echo "Activating venv: $VENV_PATH"
+    source $VENV_PATH
+else
+    echo "FATAL: Could not find venv activate script at $VENV_PATH"
+    exit 1
+fi
+
+# 3. Navigate to the project directory.
+cd ~/repos/mirpr || { echo "Failed to cd to ~/repos/mirpr"; exit 1; }
+
+echo "======================================================"
+echo "          Project Root: $(pwd)"
+echo "          Job ID: $LSB_JOBID"
+echo "          Python Path: $(which python)"
+echo "======================================================"
+echo ""
+echo "======================================================"
+echo "          Configuration (config.py)"
+echo "======================================================"
+cat config.py
+echo "======================================================"
+
+(... more ...)
+------------------------------------------------------------
+
+TERM_OWNER: job killed by owner.
+Exited with exit code 143.
+
+Resource usage summary:
+
+    CPU time :                                   207474.00 sec.
+    Max Memory :                                 558477 MB
+    Average Memory :                             520327.97 MB
+    Total Requested Memory :                     600000.00 MB
+    Delta Memory :                               41523.00 MB
+    Max Swap :                                   -
+    Max Processes :                              20
+    Max Threads :                                81
+    Run time :                                   120768 sec.
+    Turnaround time :                            152692 sec.
+
+The output (if any) is above this job summary.
+
+
+
+PS:
+
+Read file <logs/21826685.stderr> for stderr output of this job.
+

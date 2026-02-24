@@ -1,0 +1,75 @@
+#!/bin/bash
+# --- LSF Batch Job Submission Script for VISTA-3D Fine-Tuning ---
+# Uses a standard Python venv, not conda.
+
+# --- LSF Job Parameters ---
+#BSUB -J vista3d_H200         # Job name
+#BSUB -q batch_h200            # Your H200 queue
+#BSUB -n 4                    # Request 4 CPU cores (for dataloaders)
+#BSUB -W 48:00                 # Set wall-clock time limit to 24 hours
+#BSUB -M 200000               # Request 150 GB of host RAM
+#BSUB -R "span[hosts=1]"       # Ensure all cores are on the same host
+#BSUB -gpu "num=1"
+
+# --- Logging Configuration ---
+# Logs will be saved to a 'logs' directory in the submission folder.
+#BSUB -o logs/%J.stdout
+#BSUB -e logs/%J.stderr
+
+# --- Script Execution Logic ---
+
+# 1. Create the log directory if it doesn't exist.
+mkdir -p logs
+
+# 2. Set up the Python Virtual Environment (venv)
+#    *** THIS IS THE FIX ***
+#    We are now sourcing the 'activate' script from your venv directory.
+#    All 'conda' commands have been removed.
+VENV_PATH="/home/dem7clj/repos/mirpr/mirpr/bin/activate"
+if [ -f "$VENV_PATH" ]; then
+    echo "Activating venv: $VENV_PATH"
+    source $VENV_PATH
+else
+    echo "FATAL: Could not find venv activate script at $VENV_PATH"
+    exit 1
+fi
+
+# 3. Navigate to the project directory.
+cd ~/repos/mirpr || { echo "Failed to cd to ~/repos/mirpr"; exit 1; }
+
+echo "======================================================"
+echo "          Project Root: $(pwd)"
+echo "          Job ID: $LSB_JOBID"
+echo "          Python Path: $(which python)"
+echo "======================================================"
+echo ""
+echo "======================================================"
+echo "          Configuration (config.py)"
+echo "======================================================"
+cat config.py
+echo "======================================================"
+echo ""
+echo "======================================================"
+echo "          Model (model.py)"
+echo "======================================================"
+cat model.py
+echo "======================================================"
+echo ""
+echo "======================================================"
+echo "          Train Script (train.py)"
+echo "======================================================"
+cat train.py
+echo "======================================================"
+echo ""
+cat evaluate.py
+cat dataset.py
+cat prepare_dataset.py
+
+echo "We used this for preprocessing:"
+
+
+# 4. Run the main training script with I/O buffering disabled.
+#    We can now call 'python' directly, since the venv is active.
+echo "Starting Python training script... Log files are in the 'logs' directory."
+stdbuf -oL -eL python train.py
+echo "Python script finished."
