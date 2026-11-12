@@ -66,7 +66,7 @@ The model is integrated into the FastAPI backend through:
 
 ```bash
 # Terminal 1: Start Backend
-cd /Users/adriantrill/Desktop/github/LungScan
+# From the repository root
 ./scripts/dev_backend.sh
 
 # Terminal 2: Start Frontend  
@@ -280,7 +280,7 @@ For production, you would:
 
 ```bash
 # 1. Start backend
-cd /Users/adriantrill/Desktop/github/LungScan/backend
+cd backend
 source .venv/bin/activate
 uvicorn app.main:app --reload
 

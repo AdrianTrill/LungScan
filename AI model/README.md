@@ -29,71 +29,41 @@ This monorepo implements multiple approaches to 3D semantic segmentation of pulm
 
 ## 🏗️ Repository Structure
 
+This folder holds the research side of LungScan. The web application (FastAPI backend, Next.js frontend, and their scripts) lives at the root of the repository.
+
 ```
-projects-in-silico-diagnostics/
+AI model/
+├── README.md                    # This file
+├── requirements.txt             # Research dependencies (MONAI, pylidc, timm, ...)
+├── preprocessing_requirements.txt
+├── set_paths.sh                 # nnU-Net environment variables for the HPC runs
 │
-├── 📄 README.md                 # This file
-├── 📄 LICENSE                   # MIT License
-├── 📄 CITATION.cff              # Citation metadata
+├── paper/                       # Publication materials
+│   ├── sensera_report.pdf       # SENSERA report: segmentation and biomarker results
+│   ├── manuscript_source/       # LaTeX source of the report
+│   ├── MIRPR_VISTA_3D_Documentation.pdf
+│   ├── lab3_MIRPR.pdf
+│   └── literature_reviews/      # Paper reviews by the team
 │
-├── 📁 paper/                    # 📝 Publication materials
-│   ├── README.md
-│   ├── figures/                 # High-res figures
-│   ├── tables/                  # Result tables
-│   ├── literature_reviews/      # Paper reviews by team
-│   └── *.pdf                    # Documentation
+├── docs/                        # Methodology, experiments, dataset, setup, reproduction
 │
-├── 📁 docs/                     # 📚 Comprehensive documentation
-│   ├── README.md                # Documentation index
-│   ├── METHODOLOGY.md           # Theoretical background
-│   ├── EXPERIMENTS.md           # Detailed experimental results
-│   ├── DATASET.md               # Dataset description
-│   ├── SETUP.md                 # Installation guide
-│   └── REPRODUCTION.md          # Reproduce paper results
+├── apps/
+│   └── MIRPR-full-pipeline/     # Radiomics + XGBoost / DenseNet biomarker pipeline
 │
-├── 📁 data/                     # 💾 Data organization
-│   ├── README.md
-│   ├── splits/                  # Train/val/test splits
-│   │   └── patient_level_splits.json
-│   ├── raw/                     # LIDC-IDRI raw data (gitignored)
-│   └── processed/               # Preprocessed data (gitignored)
-│
-├── 📁 checkpoints/              # 🎯 Pretrained models
-│   ├── README.md                # Model zoo with download links
-│   └── *.pth                    # Model checkpoints (to be added)
-│
-├── 📁 apps/                     # 🚀 Production application
-│   ├── README.md
-│   ├── backend/                 # FastAPI backend
-│   ├── frontend/                # Next.js 14 frontend
-│   └── MIRPR-full-pipeline/     # ML inference pipeline
-│
-├── 📁 research/                 # 🔬 Research & experiments
-│   ├── experiments/             # Organized by model
-│   │   ├── unetrpp/
-│   │   ├── swinunetr/
-│   │   └── segresnet/
-│   ├── training/                # Training scripts
-│   ├── evaluation/              # Benchmarking tools
-│   ├── notebooks/               # Jupyter analysis
+├── research/
+│   ├── experiments/unetrpp/     # UNETR++ runs: full-dataset and legacy overfit experiments
+│   ├── training/                # Training and resume scripts (VISTA-3D, H100 jobs)
+│   ├── evaluation/              # Dice, lesion-level, and probability evaluation
+│   ├── notebooks/               # Dataset generation and training notebooks
 │   ├── models/                  # Model architectures
-│   └── diagnostic/              # Debug utilities
+│   ├── results/                 # Qualitative predictions and training plots
+│   └── diagnostic/              # Debugging and visualization utilities
 │
-├── 📁 utils/                    # 🛠️ Shared utilities
-│   ├── data_utils.py
-│   ├── dataset.py
-│   └── ...
+├── utils/                       # LIDC-IDRI preparation, datasets, nnU-Net conversion
 │
-├── 📁 scripts/                  # ⚙️ Automation scripts
-│   ├── setup.sh
-│   ├── dev.sh
-│   └── ...
-│
-├── 📁 tests/                    # ✅ Unit tests (to be expanded)
-│
-└── 📁 archive/                  # 🗄️ Legacy code
-    ├── early_reports/
-    └── logs/
+└── archive/
+    ├── early_reports/           # Early experiment write-ups
+    └── logs/                    # HPC job logs (stdout/stderr) of the VISTA-3D runs
 ```
 
 ## 🚀 Quick Start
@@ -101,9 +71,8 @@ projects-in-silico-diagnostics/
 ### 1. Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/LauraDiosan-CS/projects-in-silico-diagnostics.git
-cd projects-in-silico-diagnostics
+# From the repository root
+cd "AI model"
 
 # Create environment
 conda create -n lungscan python=3.10
@@ -120,17 +89,16 @@ See [docs/SETUP.md](docs/SETUP.md) for detailed instructions.
 
 1. Register at [TCIA - LIDC-IDRI](https://wiki.cancerimagingarchive.net/display/Public/LIDC-IDRI)
 2. Download the dataset (124 GB)
-3. Preprocess: `python utils/prepare_dataset.py --input data/raw/LIDC-IDRI --output data/processed`
+3. Preprocess with the scripts in [utils/](utils/), for example `utils/prepare_dataset.py`
 
-See [data/README.md](data/README.md) for details.
+See [docs/DATASET.md](docs/DATASET.md) for details.
 
-### 3. Run Production App
+### 3. Run the Production App
+
+The app is at the repository root:
 
 ```bash
-# Make scripts executable
-chmod +x scripts/*.sh
-
-# Setup and run
+cd ..
 ./scripts/setup.sh
 ./scripts/dev.sh
 ```
@@ -142,14 +110,7 @@ Access:
 
 ### 4. Reproduce Research Results
 
-```bash
-# Train SwinUNETR (best model)
-cd research/training
-python train_swin_unetr.py --config ../configs/swin_unetr_ssl.yaml
-
-# Or use pretrained checkpoints
-bash scripts/download_pretrained_models.sh
-```
+Training entry points are in [research/training/](research/training/) and the evaluation scripts in [research/evaluation/](research/evaluation/). Checkpoints are not included in this repository.
 
 See [docs/REPRODUCTION.md](docs/REPRODUCTION.md) for full reproduction guide.
 
@@ -215,11 +176,9 @@ If you use this code or our pretrained models:
 }
 ```
 
-See [CITATION.cff](CITATION.cff) for full citation metadata.
-
 ## 📝 License
 
-This project is licensed under the MIT License - see [LICENSE](LICENSE) for details.
+This project is licensed under the MIT License - see [LICENSE](../LICENSE) for details.
 
 ## 🙏 Acknowledgments
 
@@ -237,7 +196,6 @@ For questions or collaborations:
 ## 🔗 Links
 
 - **Dataset**: [LIDC-IDRI on TCIA](https://wiki.cancerimagingarchive.net/display/Public/LIDC-IDRI)
-- **Pretrained Models**: [checkpoints/README.md](checkpoints/README.md)
 - **Paper Materials**: [paper/](paper/)
 
 ---

@@ -4,6 +4,10 @@
 .LSOverride
 Icon\r
 
+# Notebook and IDE project state
+.ipynb_checkpoints/
+anaconda_projects/
+
 # General
 *.log
 *.tmp

@@ -79,13 +79,12 @@ bash scripts/download_pretrained_models.sh
 
 ## Running the Production App
 
+The web application lives at the root of the repository, outside `AI model/`.
+
 ### Backend + Frontend
 
 ```bash
-# Make scripts executable
-chmod +x scripts/*.sh
-
-# Setup environment
+# From the repository root
 ./scripts/setup.sh
 
 # Run development servers

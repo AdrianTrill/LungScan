@@ -1,2 +1,0 @@
-"""LungScan Assist Backend Application."""
-

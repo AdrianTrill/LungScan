@@ -197,8 +197,8 @@ Typical performance on modern hardware:
 ## 🔗 Integration
 
 This pipeline integrates with:
-- **Backend API**: `apps/backend/` for web-based inference
-- **Frontend**: `apps/frontend/` for visualization
+- **Backend API**: `backend/` at the repository root, for web-based inference
+- **Frontend**: `frontend/` at the repository root, for visualization
 - **Research**: `research/` for experimental models
 
 ## 📝 Data Format
