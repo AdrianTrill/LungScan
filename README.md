@@ -1,298 +1,285 @@
-# LungScan Assist: AI-Powered Lung Nodule Detection and Analysis
+<p align="center">
+  <a href="https://adriantrill.github.io/LungScan/"><img src="frontend/public/social.png" width="857" alt="LungScan: lung CT reading on your own device. A CT slice with its Grad-CAM heat map inside a scanner ring, read in the browser on WebGPU, with a cancer probability of 94.4%"></a>
+</p>
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org/)
+<p align="center">
+  <a href="https://github.com/AdrianTrill/LungScan/actions/workflows/ci.yml"><img src="https://github.com/AdrianTrill/LungScan/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="https://adriantrill.github.io/LungScan/"><img src="https://github.com/AdrianTrill/LungScan/actions/workflows/pages.yml/badge.svg?branch=main" alt="Live demo"></a>
+  <img src="https://img.shields.io/badge/python-3.11%2B-blue.svg" alt="Python 3.11+">
+  <img src="https://img.shields.io/badge/Next.js-14-black.svg" alt="Next.js 14">
+  <img src="https://img.shields.io/badge/ONNX%20Runtime-server%20%7C%20web-005CED.svg" alt="ONNX Runtime on the server and in the browser">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT"></a>
+</p>
 
-A research project for **3D lung nodule segmentation** from CT scans using state-of-the-art deep learning architectures. This repository contains both a **production-ready web application** and **comprehensive research experiments** for academic publication.
+LungScan is a reading room for lung CT: a worklist, a PACS-style viewer, and a model that reads each axial slice for cancer and shows where its evidence lies. The model is a ResNet-50 exported to ONNX with its Grad-CAM map computed in the same forward pass, so one file serves both ways the app runs: behind a FastAPI server with ONNX Runtime, or entirely in the browser with ONNX Runtime Web, where scans never leave the page. The repository also holds the 3D nodule segmentation research of the SENSERA report, which reaches a tumor Dice of 0.73 with VISTA-3D and a false-positive classifier.
 
-## 🎯 Project Overview
+> [!IMPORTANT]
+> LungScan is research software, not a medical device. Its classifier separates this dataset's cancer slices from its normal ones almost perfectly, most likely by how the slices were rendered rather than by what they show ([details](#what-the-model-can-and-cannot-do)). Never use it for diagnosis.
 
-This monorepo implements multiple approaches to 3D semantic segmentation of pulmonary nodules from the LIDC-IDRI dataset, achieving up to **0.82 Dice score** with only **8-12 hours of training** on H100 GPUs through advanced optimization techniques.
+<p align="center">
+  <a href="https://adriantrill.github.io/LungScan/"><img src="docs/assets/demo.gif" width="857" alt="The live demo: a sample study with its precomputed read, then a read in the page, where the model is downloaded, checked, and run on WebGPU, and Grad-CAM marks the region that raised the cancer score"></a>
+</p>
+<p align="center"><em>The <a href="https://adriantrill.github.io/LungScan/">live demo</a> on GitHub Pages: a sample study, read again in the page on WebGPU, then a look at the region that raised the score.</em></p>
 
-### Key Achievements
+## What's inside
 
-- 🚀 **90% Training Time Reduction**: Via self-supervised pretraining (SwinUNETR)
-- ⚡ **8-Hour Speed Record**: Near-SOTA performance with optimized SegResNet
-- 🎯 **SOTA-Level Accuracy**: 0.82 Dice score on LIDC-IDRI
-- 💪 **Production Ready**: Full web application with FastAPI + Next.js 14
-- 📊 **Reproducible**: Complete configs, splits, and pretrained checkpoints
+| Part | What it does | How it is checked |
+| --- | --- | --- |
+| **[Reading room](#the-reading-room)** | Worklist, viewer with window and level, Grad-CAM overlay and regions, the model's read, notes, and reports, all on the keyboard | A headless-Chrome run of the real site on every push |
+| **[In your browser](#in-your-browser)** | The whole app in the page: IndexedDB for the data, ONNX Runtime Web on WebGPU or WebAssembly for the model, which downloads once | The same run reads slices in the page and compares them with the server's reads |
+| **[One model, two runtimes](#one-model-two-runtimes)** | One ONNX file on the server and in the browser; the browser's preprocessing is a bit-exact port of Pillow 13's resize | Jest tests against fixtures written by the server's own code |
+| **[Grad-CAM in one pass](#grad-cam-in-one-forward-pass)** | The classifier head's gradient, computed inside the graph, so the browser needs no backward pass | The export must match autograd's Grad-CAM before it is written |
+| **[Measured, not quoted](#what-the-model-can-and-cannot-do)** | An evaluation on the published test split, after removing the 50 test images that copy training images or each other | CI re-runs it from a fresh export and requires the same numbers |
+| **[3D segmentation research](#3d-segmentation-research)** | VISTA-3D with a "Shadow Mining" false-positive classifier, and radiogenomic biomarker prediction | Reported in the SENSERA report |
 
-### Methods Implemented
+**Contents:** [Try it](#try-it) · [Reading room](#the-reading-room) · [In your browser](#in-your-browser) · [Two runtimes](#one-model-two-runtimes) · [Grad-CAM](#grad-cam-in-one-forward-pass) · [Limits](#what-the-model-can-and-cannot-do) · [Research](#3d-segmentation-research) · [Layout](#repository-layout) · [Run locally](#run-it-locally) · [API](#api) · [Tests and CI](#tests-and-ci) · [Credits](#credits)
 
-| Model | Dice Score | Training Time (H100×2) | Key Feature |
-|-------|------------|------------------------|-------------|
-| **SwinUNETR** | **0.82** | 8-12h | SSL pretraining (5,050 CT scans) |
-| **SegResNet** | 0.80 | ~8h | Speed-optimized, virtual epochs |
-| **UNETR++** | 0.78 | 24-36h | Transformer baseline |
-| **nnUNet** | 0.76 | ~48h | Auto-configured baseline |
+## Try it
 
-## 🏗️ Architecture
+**[Open the live demo](https://adriantrill.github.io/LungScan/).** It starts with seven sample studies from the model's held-out test split, already read. Open one and press <kbd>A</kbd> to read it again in your browser: the model (96 MB) downloads once, its SHA-256 is checked, and from then on a read takes about 25 ms on WebGPU or 200 ms on WebAssembly. Press <kbd>N</kbd> to add a slice of your own, or one of the samples, and <kbd>?</kbd> for every shortcut. Everything you add stays in your browser; **Reset demo data** in the sidebar starts over.
 
-This is a **monorepo** containing:
+To run it yourself, with the FastAPI backend:
 
-- **Backend**: FastAPI (Python 3.11+) with integrated AI model from Hugging Face
-- **Frontend**: Next.js 14 (App Router) + TypeScript + Tailwind CSS
-- **AI model/** : Research code, training, evaluation, and documentation (see [AI model/README.md](AI%20model/README.md))
-
-## 🏗️ Repository Structure
-
+```bash
+./scripts/setup.sh   # Python venv, npm install, and the model
+./scripts/dev.sh     # backend on :8000, frontend on :3000
 ```
-LungScan/
-├── README.md                 # This file
-├── scripts/                  # App setup and run
-│   ├── setup.sh
-│   ├── dev.sh
-│   ├── dev_backend.sh
-│   └── dev_frontend.sh
-├── backend/                  # FastAPI backend (production app)
-│   └── app/
-├── frontend/                 # Next.js 14 frontend
+
+## The reading room
+
+<p align="center">
+  <img src="docs/assets/reading-room.png" width="857" alt="The reading view in the dark theme: a CT slice with the Grad-CAM heat map and one region in the viewer, PACS-style corner annotations, and the model's read beside it: a cancer probability of 94.4%, flagged, read in the browser on WebGPU, the dataset label it agrees with, the class probabilities, and the region">
+</p>
+
+The reading view puts the slice beside the model's read, with the previous and next study a key away (<kbd>[</kbd> <kbd>]</kbd>).
+
+- **The viewer** zooms around the cursor and pans; dragging with the window tool (<kbd>W</kbd>), or with the right button, sets window and level. That is an exact linear transfer on each channel, applied as an SVG filter, so display settings never resample the pixels. <kbd>I</kbd> inverts, <kbd>H</kbd> and <kbd>R</kbd> toggle the heat map and the regions, <kbd>F</kbd> fits, and <kbd>0</kbd> resets. The corners carry the patient, the study, the zoom, the window, and a readout of the pixel value and the Grad-CAM value under the cursor.
+- **The read** gives the cancer probability, the class probabilities, and the subtype as a guess beside its measured accuracy. Each region lists its evidence and position; hovering highlights it in the viewer and a click zooms to it. For the sample slices, a panel compares the read with the dataset's label, including the misses.
+- **Notes** save as you type, and <kbd>E</kbd> exports a plain-text report with the read, the regions, and the notes.
+
+<p align="center">
+  <img src="docs/assets/worklist.png" width="857" alt="The worklist in the light theme: seven studies with thumbnails, patients, the model's cancer probability as a bar with the 50% threshold marked, a flagged or cleared status, the dataset label with a check or a cross, and the time of the last update">
+</p>
+
+The worklist shows each study's patient, the model's cancer probability against the 50% threshold, its status, and, for the samples, whether the flag agrees with the dataset label. It filters by status and searches by patient, record, or file (<kbd>/</kbd>); <kbd>J</kbd>, <kbd>K</kbd>, and <kbd>Enter</kbd> move through it. A patients page and a page per patient group the studies, and the model page shows how the classifier was measured. The app comes in a dark reading-room theme and a light one (<kbd>T</kbd>), and fits a phone's screen.
+
+## In your browser
+
+The live demo is the same Next.js app, exported as a static site, with the backend replaced by one that runs in the page:
+
+- Studies, patients, notes, and images live in **IndexedDB**. The first visit seeds the sample studies with the reads the server computed for them.
+- The model runs in a **worker** ([`inference-worker.js`](frontend/public/inference-worker.js)) with ONNX Runtime Web 1.31: on **WebGPU** when the browser has an adapter, on **WebAssembly** otherwise, loading only the build it uses (the WebAssembly one is 3.9 MB gzipped). GitHub Pages cannot send the headers WebAssembly threads need, so that path uses one thread.
+- The model file is downloaded once with progress, checked against the SHA-256 in its manifest, and kept in Cache Storage.
+
+On an Apple M4, a read takes 20 to 35 ms on WebGPU and about 200 ms on WebAssembly. The server takes about 20 ms on the CPU.
+
+## One model, two runtimes
+
+```mermaid
+flowchart LR
+    weights[("dorsar/lung-cancer-detection<br/>ResNet-50 weights, pinned")] --> export["tools/export_model.py<br/>ONNX with in-graph Grad-CAM,<br/>checked against PyTorch"]
+    export --> onnx[("lungscan.onnx, 96 MB")]
+    onnx --> server["FastAPI<br/>ONNX Runtime on the CPU"]
+    onnx --> pages["GitHub Pages"]
+    pages --> worker["Browser worker<br/>ONNX Runtime Web<br/>WebGPU or WebAssembly"]
+    app["Next.js reading room"] -- "server build" --> server
+    app -- "static build" --> worker
+    server --> files[("JSON files and uploads")]
+    worker --> idb[("IndexedDB")]
+```
+
+The app talks to one interface, `LungScanApi`, with two implementations: [the FastAPI client](frontend/src/lib/api/server.ts) and [the in-browser backend](frontend/src/lib/api/browser.ts). Both run the same file, and the browser reproduces every step around it:
+
+- **Preprocessing.** The model's training code resized slices to 250×250, then to 256×256, and cropped the central 224×224. The server does this with Pillow. The browser ports [Pillow 13's bilinear resize](frontend/src/lib/inference/resample.ts): its fixed-point weights, the rounding between passes, and the order of the passes, which Pillow 13 picks by the image's shape. A PNG slice reaches the network as exactly the same tensor on both sides.
+- **Interpretation and reports.** [`interpret.ts`](frontend/src/lib/inference/interpret.ts) and [`report.ts`](frontend/src/lib/report.ts) port the server's code, rounding half up throughout.
+- **Checks.** Jest holds the ports to fixtures that [`tools/make_fixtures.py`](backend/tools/make_fixtures.py) writes from the server's own code: six resize shapes byte for byte, every sample's read, and the report character for character. In headless Chrome, the browser's reads of the seven samples agree with the server's to within 10⁻⁵ (exactly, for five of them on WebAssembly); the runtimes' kernels add in different orders.
+
+A read goes like this:
+
+```mermaid
+flowchart LR
+    slice["CT slice<br/>PNG or JPEG"] --> pre["Resize to 250², then 256²,<br/>crop 224², normalize"]
+    pre --> net["ResNet-50"]
+    net --> logits["Four logits"]
+    net --> cam["7×7 Grad-CAM<br/>of the log-odds of cancer"]
+    logits --> read["Cancer probability,<br/>flag at 50%, subtype guess"]
+    cam --> heat["Heat map, scaled by the probability;<br/>regions where it is at least half its peak"]
+```
+
+The cancer probability is the sum of the three cancer classes. The heat map is scaled by it, so a confidently normal slice shows none. Regions are the 8-connected groups of grid cells with at least half the peak evidence, at most three, mapped back onto the original slice. They show where the model's evidence concentrates, and are not detected nodules.
+
+## Grad-CAM in one forward pass
+
+Grad-CAM needs the gradient of a score with respect to the last feature maps, and ONNX Runtime Web has no autograd. Here the gradient is computed inside the graph. The score is the log-odds of cancer, `s = logsumexp(z_adeno, z_large, z_squamous) − z_normal`, and the head is `z = W₂ · relu(W₁ · p + b₁) + b₂` on the pooled features `p`:
+
+- `∂s/∂z` is the softmax over the three cancer logits, and −1 for normal;
+- `∂s/∂p = W₁ᵀ (relu′(h) ⊙ W₂ᵀ ∂s/∂z)`: two matrix products;
+- global average pooling gives every location the same gradient, `∂s/∂p / 49`, which are Grad-CAM's channel weights.
+
+[`ExplainedNet`](backend/tools/network.py) adds these steps to the network before export. The exporter refuses to write the file unless ONNX Runtime matches PyTorch's logits (largest difference 2.4×10⁻⁶) and the map matches autograd's Grad-CAM (5.2×10⁻⁷), and a unit test checks the identity on random weights. The model card, [docs/MODEL.md](docs/MODEL.md), has the details.
+
+## What the model can and cannot do
+
+The classifier is [dorsar/lung-cancer-detection](https://huggingface.co/dorsar/lung-cancer-detection) (MIT), a ResNet-50 fine-tuned on 2D slices in four classes. [`tools/evaluate.py`](backend/tools/evaluate.py) runs the app's own pipeline on the test split published with it, and writes [model/evaluation.json](model/evaluation.json).
+
+**The test split is mostly duplicates for normal slices.** It has 295 images, not the 315 its dataset card lists, and 48 of its 54 normal slices are copies of training images or of each other: 42 identical, 5 re-encoded or resized, found with a perceptual hash, and 1 repeated. Two cancer slices repeat as well. On the 245 unique slices:
+
+| Measure | Result |
+| --- | --- |
+| Cancers flagged | 237 of 239 (99.2%; 95% CI 97.0 to 99.8%) |
+| Normal slices cleared | 6 of 6 (95% CI 61 to 100%: too few to measure) |
+| Subtype, on cancer slices | 53.1%, where chance is 33.3% |
+| Four classes | 53.5% |
+
+**The near-perfect separation is most likely a shortcut.** Every cancer slice in this dataset is shown in a soft-tissue window, with grey lungs, and every normal slice in a lung window, with black ones. Some normal slices carry watermarks. A classifier can tell them apart by rendering alone. LungScan says so on its model page, shows subtypes only as guesses, and labels each sample's read against the truth, misses included.
+
+<p align="center">
+  <img src="docs/assets/model.png" width="857" alt="The model page: a warning about the rendering shortcut beside a cancer slice in a soft-tissue window and a normal slice in a lung window, where the model runs, and the measured performance with its confidence intervals and confusion matrix">
+</p>
+
+The preprocessing also changed. The previous backend stretched slices to 224×224, normalized every channel with the red channel's statistics, and classified 224-pixel patches with a sliding window. On the validation split, the training pipeline scores 0.667 four-class accuracy against 0.500 for that pipeline, and on the whole test split the old patch scheme flagged 4 of the 54 normal slices.
+
+## 3D segmentation research
+
+[AI model/](AI%20model/README.md) holds the team's research on CT volumes, summarized in the [SENSERA report](AI%20model/paper/sensera_report.pdf). The web app does not run these models. As reported:
+
+**Segmentation.** VISTA-3D, a foundation model pretrained on about 11,000 CT scans, proposes candidates. A "Shadow Mining" 3D ResNet-18, trained on hard false positives mined by five cross-validated VISTA-3D models, rejects false positives:
+
+| Metric | VISTA-3D alone | VISTA-3D + ResNet-18 |
+| --- | ---: | ---: |
+| Tumor Dice (volumetric) | 0.6260 | **0.7342** |
+| Recall | **0.9447** | 0.9213 |
+| Precision | 0.2745 | **0.6483** |
+| False positives per scan | 2.76 | **0.58** |
+| Lesion-wise Dice (true positives) | 0.7858 | **0.8102** |
+
+**Biomarkers.** A late fusion of DenseNet121 features and PyRadiomics features with XGBoost reaches an AUC of 0.87 for EGFR and 0.86 for KRAS mutations on TCGA-LUAD and NSCLC Radiogenomics, and 0.80 for TTF-1 and 0.76 for CK7 on a private cohort of 92 patients.
+
+The evaluation outputs behind these tables are not in the repository. Neither are the checkpoints, configs, or logs of the earlier architecture comparison in the research notes (SwinUNETR, SegResNet, UNETR++, nnU-Net, with Dice from 0.76 to 0.82), so those figures are reported, not reproducible here.
+
+## Repository layout
+
+```text
+.
+├── .github/workflows/
+│   ├── ci.yml                 # backend, model, and frontend checks
+│   └── pages.yml              # in-browser build, headless-Chrome check, deploy
+├── backend/                   # FastAPI
+│   ├── app/
+│   │   ├── api/routes/        # cases, patients, upload, analyze, images, report, health
+│   │   ├── core/              # settings, schemas, upload checks
+│   │   ├── services/
+│   │   │   ├── model.py       # preprocessing, download, ONNX Runtime
+│   │   │   ├── analysis.py    # from the network's output to a read
+│   │   │   ├── storage.py     # JSON persistence and the sample studies
+│   │   │   └── report.py
+│   │   └── tests/
+│   ├── tools/                 # export_model, evaluate, make_samples, make_fixtures, fetch_model
+│   ├── requirements.txt       # the server: no PyTorch
+│   ├── requirements-dev.txt
+│   └── requirements-model.txt # the tools: PyTorch, ONNX, Hugging Face
+├── frontend/                  # Next.js 14
+│   ├── public/
+│   │   ├── inference-worker.js
+│   │   └── social.png
+│   ├── scripts/               # copy-assets, ui-check, capture, serve
 │   └── src/
-└── AI model/                 # Research & experiments
-    ├── README.md             # Full research documentation
-    ├── docs/                 # Methodology, experiments, setup
-    ├── data/                 # Splits and data organization
-    ├── research/             # Training, evaluation, models
-    ├── paper/                # Publication materials
-    ├── utils/                # Shared utilities
-    └── scripts/              # Research scripts
-```
-
-## 🚀 Quick Start
-
-### 1. Run Production App
-
-```bash
-# Make scripts executable (first time only)
-chmod +x scripts/*.sh
-
-# Setup everything
-./scripts/setup.sh
-
-# Run both servers (in separate terminals)
-./scripts/dev_backend.sh    # Terminal 1: Backend
-./scripts/dev_frontend.sh   # Terminal 2: Frontend
-
-# Or run both together
-./scripts/dev.sh            # Runs both in parallel
-```
-
-The application will be available at:
-- **Frontend**: http://localhost:3000
-- **Backend API**: http://127.0.0.1:8000
-- **API Documentation**: http://127.0.0.1:8000/docs
-
-### 2. Reproduce Research Results
-
-For training, evaluation, and full research setup, see the [AI model README](AI%20model/README.md) and [AI model/docs/](AI%20model/docs/).
-
-```bash
-cd "AI model"
-# See AI model/README.md for conda env, data download, and training commands
-```
-
-## 📊 Results Summary
-
-### Main Performance Metrics
-
-| Metric | UNETR++ | SwinUNETR | SegResNet | nnUNet |
-|--------|---------|-----------|-----------|--------|
-| **Positive Dice** | 0.78 | **0.82** | 0.80 | 0.76 |
-| **Negative Dice** | 0.98 | 0.99 | 0.98 | 0.98 |
-| **Training Time** | 24-36h | **8-12h** | **~8h** | ~48h |
-| **Parameters** | 65M | 62M | 25M | Varies |
-
-*All experiments on 2× NVIDIA H100 GPUs*
-
-## 📋 Manual Setup (Production App)
-
-### Backend Setup
-
-```bash
-cd backend
-
-# Create virtual environment
-python3 -m venv .venv
-
-# Activate virtual environment
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# (Optional) Copy environment variables
-cp .env.example .env
-
-# Run server
-uvicorn app.main:app --reload
-```
-
-### Frontend Setup
-
-```bash
-cd frontend
-
-# Install dependencies
-npm install
-
-# (Optional) Copy environment variables
-cp .env.example .env.local
-
-# Run development server
-npm run dev
-```
-
-## 📁 Project Structure (App)
-
-```
-lungscan-assist/
-├── README.md
-├── scripts/
-│   ├── setup.sh          # One-command setup
-│   ├── dev.sh            # Run both servers together
-│   ├── dev_backend.sh    # Backend only
-│   └── dev_frontend.sh   # Frontend only
-├── backend/
-│   ├── .env.example
-│   ├── requirements.txt
-│   ├── pyproject.toml
-│   └── app/
-│       ├── main.py       # FastAPI app entry point
-│       ├── core/
-│       ├── api/routes/
-│       ├── services/
+│       ├── app/               # worklist, case, patients, patient, model
+│       ├── components/        # viewer, read, studies, dialogs, shell, ui
+│       ├── lib/
+│       │   ├── api/           # LungScanApi: server.ts and browser.ts
+│       │   ├── browser/       # IndexedDB and the sample studies
+│       │   └── inference/     # resample, preprocess, interpret, engine
 │       └── tests/
-└── frontend/
-    ├── package.json
-    ├── next.config.ts
-    └── src/
-        ├── app/
-        ├── components/
-        ├── lib/
-        └── styles/
+├── model/
+│   ├── evaluation.json        # measured by tools/evaluate.py
+│   └── samples/               # seven test slices and their reference reads
+├── docs/
+│   ├── MODEL.md               # the model card
+│   ├── assets/
+│   └── planning/
+├── scripts/                   # setup.sh, dev.sh, dev_backend.sh, dev_frontend.sh
+├── model_demonstration.ipynb
+└── AI model/                  # 3D segmentation and biomarker research
 ```
 
-## 🔌 API Endpoints
+## Run it locally
 
-### Health Check
-- `GET /api/health` - Returns `{status: "ok"}`
+Requirements: Python 3.11+ and Node 22.
 
-### Upload
-- `POST /api/upload` - Upload a CT scan file (multipart/form-data)
-  - Returns: `UploadResult` with `case_id` and metadata
+```bash
+./scripts/setup.sh           # once
+./scripts/dev.sh             # both servers; or dev_backend.sh and dev_frontend.sh
+```
 
-### Analysis
-- `POST /api/analyze/{case_id}` - Run AI analysis on a case
-  - Returns: `AnalyzeResult` with detected nodules and malignancy scores
+The frontend is at http://localhost:3000, the API at http://127.0.0.1:8000, and its documentation at http://127.0.0.1:8000/docs. A new data directory starts with the sample studies. The server downloads the model on its first read if `setup.sh` could not.
 
-### Cases
-- `GET /api/cases` - List all cases
-- `GET /api/cases/{case_id}` - Get case details with analysis results
-- `DELETE /api/cases/{case_id}` - Delete a case
-
-### Reports
-- `POST /api/report/{case_id}` - Generate and download a text report
-  - Body: `{notes: string}`
-  - Returns: Text file download
-
-## 🧪 Testing
-
-### Backend Tests
+By hand:
 
 ```bash
 cd backend
-source .venv/bin/activate
-pytest app/tests/
-```
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
+python -m tools.fetch_model                 # or build it: pip install -r requirements-model.txt
+                                            #              python -m tools.export_model
+uvicorn app.main:app --reload
 
-### Frontend Tests
-
-```bash
 cd frontend
-npm test
+npm install
+npm run dev                                 # against the API
+npm run dev:browser                         # the in-browser app, with the model from ../model/
 ```
 
-## 🔧 Code Quality
+Settings live in [`backend/.env.example`](backend/.env.example) and [`frontend/.env.example`](frontend/.env.example). The static site builds with `NEXT_PUBLIC_BASE_PATH=/LungScan npm run build:browser` into `frontend/out/`.
 
-### Backend Linting/Formatting
+## API
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| `GET` | `/api/health` | Health check |
+| `GET` | `/api/model` | The model, its runtime, and whether its file is present |
+| `POST` | `/api/upload` | Upload a PNG or JPEG slice (`scan`, optional `patient_id`), create a case, and read it |
+| `POST` | `/api/analyze/{case_id}` | Read a case's slice again |
+| `GET` | `/api/cases` | All cases, newest first, with their latest cancer probability |
+| `GET` | `/api/cases/{case_id}` | A case with its patient, read, and notes |
+| `GET` | `/api/cases/{case_id}/image` | The case's slice |
+| `PUT` | `/api/cases/{case_id}/replace-scan` | Replace the slice; the case goes back to pending |
+| `PUT` | `/api/cases/{case_id}/notes` | Save the notes |
+| `DELETE` | `/api/cases/{case_id}` | Delete a case, its image, read, and notes |
+| `POST` | `/api/report/{case_id}` | Save the notes and return the plain-text report |
+| `GET`, `POST` | `/api/patients` | List patients, or create one |
+| `GET`, `DELETE` | `/api/patients/{patient_id}` | A patient with their cases, or delete one who has none |
+| `POST` | `/api/cases/{case_id}/assign/{patient_id}` | Assign a case to a patient |
+
+A read carries the class probabilities, the cancer probability and flag, the subtype, the heat map with the part of the slice it covers, the regions, a summary, the model and runtime, and the time spent in the network.
+
+## Tests and CI
 
 ```bash
-cd backend
-source .venv/bin/activate
-ruff check app/
-black app/
+cd backend && pytest                     # 28 tests; the model's tests run once it is exported
+cd frontend && npm test                  # 38 tests
+cd frontend && node scripts/ui-check.mjs out    # the static site, in headless Chrome
 ```
 
-### Frontend Linting/Formatting
+| Workflow | Job | What it checks |
+| --- | --- | --- |
+| CI | Backend / Python 3.11, 3.12, 3.13 | ruff, black, and the test suite against an isolated store and a stand-in model |
+| CI | Model | Exports the pinned weights, which must match PyTorch and autograd; runs the tests with the real model; re-reads the samples; re-runs the evaluation, which must give the same numbers; and requires the frontend's fixtures to be current |
+| CI | Frontend | Prettier, ESLint, the type check, the Jest suite, and the build against the API |
+| Pages | In-browser build | Exports the model and builds the static site, then drives it in headless Chrome: the worklist, filters, search, and keys; two reads in the page against the server's; an upload read straight away; notes across a reload; the viewer's keys, the theme, and the shortcuts; a phone's screen; no console errors or failed requests. Main is then deployed |
 
-```bash
-cd frontend
-npm run lint
-npm run format
-```
+[`scripts/capture.mjs`](frontend/scripts/capture.mjs) regenerates this README's images and the link preview from the static site.
 
-## 🎯 Features (MVP)
+## Next steps
 
-✅ **File Upload**: Accept CT scan images (JPEG, PNG, DICOM)  
-✅ **AI Analysis**: Real lung cancer detection using ResNet-50 model from Hugging Face  
-✅ **Interactive Viewer**: Visualize scans with nodule overlays  
-✅ **Report Generation**: Export text reports with notes  
-✅ **Case Management**: List, view, and delete cases (in-memory storage)
+- DICOM input, with windows in Hounsfield units instead of 8-bit renders.
+- A classifier trained on volumes with patient-level splits, instead of a 2D model on a dataset with a rendering shortcut; the research's segmentation models are the natural candidates.
+- A smaller download: an int8 or fp16 model for the browser, checked against the full one.
 
-## 📚 Documentation
+## Credits
 
-- 📖 [AI model/docs/SETUP.md](AI%20model/docs/SETUP.md) - Installation and environment setup (research)
-- 🔬 [AI model/docs/METHODOLOGY.md](AI%20model/docs/METHODOLOGY.md) - Theoretical background
-- 📊 [AI model/docs/EXPERIMENTS.md](AI%20model/docs/EXPERIMENTS.md) - Detailed experimental results
-- 💾 [AI model/docs/DATASET.md](AI%20model/docs/DATASET.md) - LIDC-IDRI dataset information
-- 🔁 [AI model/docs/REPRODUCTION.md](AI%20model/docs/REPRODUCTION.md) - Reproduce all results
+- The classifier is [dorsar/lung-cancer-detection](https://huggingface.co/dorsar/lung-cancer-detection) (LungAI, MIT), and the sample slices come from its test split.
+- The 3D segmentation and biomarker research, and the SENSERA report, are by Roberto Hordoan, Razvan Bocra, Marius Boroica, and Mihai Deaconu.
+- Built with [ONNX Runtime](https://onnxruntime.ai), [PyTorch](https://pytorch.org), [MONAI](https://monai.io), [FastAPI](https://fastapi.tiangolo.com), and [Next.js](https://nextjs.org).
 
-## 📝 Environment Variables
-
-### Backend (.env)
-
-```env
-BACKEND_HOST=127.0.0.1
-BACKEND_PORT=8000
-CORS_ORIGINS=http://localhost:3000
-```
-
-### Frontend (.env.local)
-
-```env
-NEXT_PUBLIC_API_URL=http://localhost:8000
-```
-
-## 🙏 Acknowledgments
-
-- **LIDC-IDRI Dataset**: [Armato et al., 2011](https://aapm.onlinelibrary.wiley.com/doi/full/10.1118/1.3528204)
-- **MONAI Framework**: Medical Open Network for AI
-- **PyTorch**: Deep learning framework
-- **H100 GPU Access**: High-performance computing resources
-
-## 🔗 Links
-
-- **Dataset**: [LIDC-IDRI on TCIA](https://wiki.cancerimagingarchive.net/display/Public/LIDC-IDRI)
-- **AI model README**: [AI model/README.md](AI%20model/README.md) - Full research documentation
-- **Paper Materials**: [AI model/paper/](AI%20model/paper/)
-
-## 📄 License
-
-This project is part of a medical imaging research initiative. MIT License.
-
-## 🤝 Contributing
-
-This is an MVP prototype. For production deployment:
-1. Implement persistent database storage
-2. Add authentication/authorization
-3. Set up proper error handling and logging
-4. Configure production-ready deployment (Docker, cloud, etc.)
-
----
-
-**Status**: 🚧 Active Development | ✅ Ready for Publication
-
-**Note**: This MVP uses a real AI model (ResNet-50 based lung cancer detection model from Hugging Face) for nodule detection. The [AI model/](AI%20model/) directory contains the full research code (SwinUNETR, SegResNet, etc.) and reproduction instructions.
-
-Last Updated: February 2026
+Released under the [MIT License](LICENSE).

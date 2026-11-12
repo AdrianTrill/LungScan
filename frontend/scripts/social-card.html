@@ -1,0 +1,244 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        width: 1200px;
+        height: 630px;
+        overflow: hidden;
+        background:
+          radial-gradient(700px 420px at 8% -10%, rgba(45, 212, 191, 0.16), transparent 70%),
+          radial-gradient(600px 420px at 100% 110%, rgba(251, 113, 133, 0.12), transparent 70%),
+          #070a0e;
+        color: #e7edf3;
+        font-family:
+          -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Inter, Roboto, sans-serif;
+        -webkit-font-smoothing: antialiased;
+        position: relative;
+      }
+      .grid {
+        position: absolute;
+        inset: 0;
+        background-image:
+          linear-gradient(rgba(148, 163, 184, 0.045) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(148, 163, 184, 0.045) 1px, transparent 1px);
+        background-size: 32px 32px;
+        mask-image: radial-gradient(800px 500px at 30% 50%, black, transparent 80%);
+      }
+      .text {
+        position: absolute;
+        left: 68px;
+        top: 64px;
+        width: 520px;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        font-size: 25px;
+        font-weight: 650;
+        letter-spacing: -0.01em;
+      }
+      .brand small {
+        display: block;
+        font-size: 14px;
+        font-weight: 450;
+        color: #7a899b;
+        letter-spacing: 0;
+        margin-top: 2px;
+      }
+      h1 {
+        margin: 46px 0 0;
+        font-size: 54px;
+        line-height: 1.04;
+        font-weight: 760;
+        letter-spacing: -0.035em;
+      }
+      h1 span {
+        background: linear-gradient(90deg, #5eead4, #22d3ee 55%, #a5f3fc);
+        -webkit-background-clip: text;
+        color: transparent;
+      }
+      p {
+        margin: 24px 0 0;
+        font-size: 20px;
+        line-height: 1.45;
+        color: #b0bdcb;
+      }
+      .chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 9px;
+        margin-top: 28px;
+      }
+      .chips span {
+        padding: 7px 13px;
+        border-radius: 999px;
+        border: 1px solid rgba(148, 163, 184, 0.22);
+        background: rgba(21, 27, 35, 0.8);
+        font-size: 15px;
+        color: #d4dde7;
+      }
+      .url {
+        position: absolute;
+        left: 68px;
+        bottom: 52px;
+        font-family: "SF Mono", ui-monospace, Menlo, monospace;
+        font-size: 17px;
+        color: #8bd9cf;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      .url i {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: #2dd4bf;
+        box-shadow: 0 0 12px #2dd4bf;
+      }
+      .gantry {
+        position: absolute;
+        left: 640px;
+        top: 55px;
+        width: 520px;
+        height: 520px;
+      }
+      .ticks {
+        position: absolute;
+        inset: 0;
+        border-radius: 50%;
+        background: repeating-conic-gradient(
+          rgba(148, 163, 184, 0.35) 0 0.6deg,
+          transparent 0.6deg 6deg
+        );
+        mask: radial-gradient(
+          circle,
+          transparent 247px,
+          black 248px,
+          black 259px,
+          transparent 260px
+        );
+      }
+      .ring {
+        position: absolute;
+        inset: 18px;
+        border-radius: 50%;
+        border: 1px solid rgba(45, 212, 191, 0.35);
+        box-shadow:
+          0 0 0 10px rgba(14, 18, 24, 0.9),
+          0 0 0 11px rgba(148, 163, 184, 0.18),
+          0 40px 80px -30px rgba(0, 0, 0, 0.9);
+      }
+      .slice {
+        position: absolute;
+        inset: 38px;
+        border-radius: 50%;
+        overflow: hidden;
+        background: #020407;
+        box-shadow: inset 0 0 60px rgba(0, 0, 0, 0.9);
+      }
+      .slice img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        transform: scale(1.08);
+      }
+      .sweep {
+        position: absolute;
+        left: 0;
+        right: 0;
+        top: 58%;
+        height: 2px;
+        background: linear-gradient(90deg, transparent, rgba(103, 232, 249, 0.85), transparent);
+        box-shadow: 0 0 18px rgba(103, 232, 249, 0.7);
+      }
+      svg.arc {
+        position: absolute;
+        inset: 0;
+        transform: rotate(-90deg);
+      }
+      .readout {
+        position: absolute;
+        right: 26px;
+        bottom: 30px;
+        padding: 13px 16px;
+        border-radius: 14px;
+        background: rgba(14, 18, 24, 0.92);
+        border: 1px solid rgba(148, 163, 184, 0.2);
+        box-shadow: 0 20px 40px -18px rgba(0, 0, 0, 0.9);
+        font-size: 14px;
+        color: #b0bdcb;
+        min-width: 210px;
+      }
+      .readout b {
+        display: block;
+        font-size: 26px;
+        color: #fb7185;
+        letter-spacing: -0.02em;
+        margin: 2px 0 4px;
+      }
+      .readout em {
+        font-style: normal;
+        color: #5eead4;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="grid"></div>
+    <div class="text">
+      <div class="brand">
+        {{LOGO}}
+        <div>LungScan<small>CT reading room</small></div>
+      </div>
+      <h1>Lung CT reading,<br /><span>on your own device</span></h1>
+      <p>
+        A ResNet-50 with Grad-CAM in a radiology reading room. It runs in the page with ONNX Runtime
+        Web, so scans never leave it.
+      </p>
+      <div class="chips">
+        <span>ONNX Runtime Web</span><span>WebGPU</span><span>Grad-CAM</span><span>FastAPI</span
+        ><span>Next.js</span>
+      </div>
+    </div>
+    <div class="url"><i></i>adriantrill.github.io/LungScan</div>
+    <div class="gantry">
+      <div class="ticks"></div>
+      <div class="ring"></div>
+      <svg class="arc" viewBox="0 0 520 520">
+        <circle
+          cx="260"
+          cy="260"
+          r="242"
+          fill="none"
+          stroke="rgba(148,163,184,0.12)"
+          stroke-width="5"
+        />
+        <circle
+          cx="260"
+          cy="260"
+          r="242"
+          fill="none"
+          stroke="#fb7185"
+          stroke-width="5"
+          stroke-linecap="round"
+          stroke-dasharray="{{ARC}} 2000"
+        />
+      </svg>
+      <div class="slice">
+        <img src="{{SLICE}}" />
+        <div class="sweep"></div>
+      </div>
+      <div class="readout">
+        Cancer probability
+        <b>{{PROBABILITY}}</b>
+        <em>Read in this browser</em> · {{RUNTIME}}
+      </div>
+    </div>
+  </body>
+</html>

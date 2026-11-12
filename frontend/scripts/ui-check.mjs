@@ -5,58 +5,21 @@
 //   node scripts/ui-check.mjs out [--screenshots dir]
 //
 // Chrome comes from CHROME_PATH, or the usual install locations.
-import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
-import { createServer } from "node:http";
-import { extname, join, normalize } from "node:path";
+import { mkdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import puppeteer from "puppeteer-core";
+import { findChrome, serve } from "./serve.mjs";
 
 const args = process.argv.slice(2);
 const site = args[0] ?? "out";
 const shotsAt = args.indexOf("--screenshots");
 const shots = shotsAt >= 0 ? args[shotsAt + 1] : null;
 if (shots) mkdirSync(shots, { recursive: true });
-const BASE = "/LungScan";
 const samples = JSON.parse(readFileSync(join(site, "samples", "samples.json"), "utf8"));
 
-const TYPES = {
-  ".html": "text/html; charset=utf-8",
-  ".js": "text/javascript",
-  ".mjs": "text/javascript",
-  ".json": "application/json",
-  ".wasm": "application/wasm",
-  ".css": "text/css",
-  ".svg": "image/svg+xml",
-  ".png": "image/png",
-  ".txt": "text/plain",
-  ".onnx": "application/octet-stream",
-};
-
-// GitHub Pages, in miniature: the site under /LungScan/, directories served by index.html.
-const server = createServer((request, response) => {
-  const url = new URL(request.url, "http://localhost");
-  if (!url.pathname.startsWith(BASE)) {
-    response.writeHead(404).end();
-    return;
-  }
-  let path = normalize(join(site, decodeURIComponent(url.pathname.slice(BASE.length))));
-  if (existsSync(path) && statSync(path).isDirectory()) path = join(path, "index.html");
-  if (!existsSync(path)) path = join(site, "404.html");
-  response.writeHead(path.endsWith("404.html") ? 404 : 200, {
-    "Content-Type": TYPES[extname(path)] ?? "application/octet-stream",
-  });
-  response.end(readFileSync(path));
-});
-await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-const origin = `http://127.0.0.1:${server.address().port}${BASE}`;
-
-const chrome =
-  process.env.CHROME_PATH ??
-  [
-    "/usr/bin/google-chrome",
-    "/usr/bin/google-chrome-stable",
-    "/usr/bin/chromium",
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-  ].find(existsSync);
+const server = await serve(site);
+const origin = server.origin;
+const chrome = findChrome();
 const browser = await puppeteer.launch({
   executablePath: chrome,
   headless: true,

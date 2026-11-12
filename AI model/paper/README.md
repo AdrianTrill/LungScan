@@ -1,64 +1,24 @@
 # Paper Materials
 
-This directory contains all materials related to the academic publication.
+The publication materials of the LungScan research.
 
 ## 📄 Contents
 
-### Documentation
-- `MIRPR_VISTA_3D_Documentation.pdf` - VISTA 3D model documentation
-- `lab3_MIRPR.pdf` - Lab report and interim findings
+- [`sensera_report.pdf`](sensera_report.pdf): **SENSERA: A Multi-Stage AI Framework for Volumetric Lung Nodule Detection and Radiogenomic Biomarker Prediction**, by Roberto Hordoan, Razvan Bocra, Marius Boroica, and Mihai Deaconu. VISTA-3D with a "Shadow Mining" false-positive classifier for segmentation, and a late fusion of deep and radiomic features for biomarkers.
+- [`manuscript_source/sensera_report.tex`](manuscript_source/sensera_report.tex): the report's LaTeX source.
+- [`MIRPR_VISTA_3D_Documentation.pdf`](MIRPR_VISTA_3D_Documentation.pdf): documentation of the VISTA-3D work.
+- [`lab3_MIRPR.pdf`](lab3_MIRPR.pdf): lab report with interim findings.
 
 ### Literature Reviews
-The `literature_reviews/` directory contains comprehensive reviews of foundational papers:
-- `papers-1-2-summary.tex` - Reviews of papers 1-2
-- `papers-3-4-summary.tex` - Reviews of papers 3-4  
-- `papers-5-6-summary.tex` - Reviews of papers 5-6
-- `papers-7-8-summary.tex` - Reviews of papers 7-8
-- `Lab2/` - Lab 2 materials with experimental results
 
-### Figures (To Be Added)
-High-resolution figures for the manuscript:
-- Architecture diagrams
-- Training curves
-- Comparative results
-- Qualitative examples
+[`literature_reviews/`](literature_reviews/) holds the team's reviews of the foundational papers:
+- `papers-1-2-summary.tex` to `papers-7-8-summary.tex`: two papers each
+- `Lab2/`: Lab 2 materials with experimental results and prediction figures
 
-### Tables (To Be Added)
-Result tables in CSV/LaTeX format:
-- Performance metrics
-- Ablation studies
-- Computational requirements
+## 📊 Results
 
-## 📝 Manuscript (To Be Added)
-
-The main paper manuscript will be placed here:
-- `manuscript.pdf` - Final paper
-- `manuscript_source/` - LaTeX source files
-- `supplementary_materials.pdf` - Appendices
-
-## 🔬 Generating Figures
-
-To regenerate all paper figures:
-
-```bash
-cd ../research/notebooks
-jupyter notebook generate_paper_figures.ipynb
-```
-
-Or use the automated script:
-
-```bash
-python ../scripts/generate_all_figures.py --output figures/
-```
-
-## 📊 Result Tables
-
-Result tables are generated from experiment logs:
-
-```bash
-python ../research/evaluation/generate_tables.py --output tables/
-```
+The report's results tables are reproduced in the [research README](../README.md#-results). The evaluation outputs behind them are not in this repository.
 
 ## 🎯 Citation
 
-See `../CITATION.cff` for citation information.
+See the [research README](../README.md#-citation) for a BibTeX entry.

@@ -1,31 +1,45 @@
-# LungScan Assist: AI-Powered Lung Nodule Detection and Analysis
+# LungScan research: 3D nodule segmentation and biomarkers
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../LICENSE)
+[![Python 3.10](https://img.shields.io/badge/python-3.10-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org/)
+[![MONAI](https://img.shields.io/badge/MONAI-VISTA--3D-0d9488.svg)](https://monai.io/)
 
-A research project for **3D lung nodule segmentation** from CT scans using state-of-the-art deep learning architectures. This repository contains both a **production-ready web application** and **comprehensive research experiments** for academic publication.
+The research behind LungScan: 3D segmentation of lung nodules and tumors in CT volumes, and the prediction of tumor biomarkers from imaging. The web application at the root of the repository reads 2D slices with a separate classifier, and does not run these models.
 
-## 🎯 Project Overview
+## 🎯 Results
 
-This monorepo implements multiple approaches to 3D semantic segmentation of pulmonary nodules from the LIDC-IDRI dataset, achieving up to **0.82 Dice score** with only **8-12 hours of training** on H100 GPUs through advanced optimization techniques.
+The [SENSERA report](paper/sensera_report.pdf) ([LaTeX source](paper/manuscript_source/sensera_report.tex)) summarizes the work. Its results, as reported:
 
-### Key Achievements
+**Segmentation.** VISTA-3D, a foundation model pretrained on about 11,000 CT scans, proposes candidates; a "Shadow Mining" 3D ResNet-18, trained with focal loss and Mixup on hard false positives mined by five cross-validated VISTA-3D models, rejects false positives.
 
-- 🚀 **90% Training Time Reduction**: Via self-supervised pretraining (SwinUNETR)
-- ⚡ **8-Hour Speed Record**: Near-SOTA performance with optimized SegResNet
-- 🎯 **SOTA-Level Accuracy**: 0.82 Dice score on LIDC-IDRI
-- 💪 **Production Ready**: Full web application with FastAPI + Next.js 14
-- 📊 **Reproducible**: Complete configs, splits, and pretrained checkpoints
+| Metric | VISTA-3D alone | VISTA-3D + ResNet-18 |
+|--------|---------------:|---------------------:|
+| Tumor Dice (volumetric) | 0.6260 | **0.7342** |
+| Recall (sensitivity) | **0.9447** | 0.9213 |
+| Precision | 0.2745 | **0.6483** |
+| False positives per scan | 2.76 | **0.58** |
+| Lesion-wise Dice (true positives) | 0.7858 | **0.8102** |
 
-### Methods Implemented
+**Biomarkers.** A late fusion of DenseNet121 features and PyRadiomics features with XGBoost, on TCGA-LUAD and NSCLC Radiogenomics (AUC):
 
-| Model | Dice Score | Training Time (H100×2) | Key Feature |
-|-------|------------|------------------------|-------------|
-| **SwinUNETR** | **0.82** | 8-12h | SSL pretraining (5,050 CT scans) |
-| **SegResNet** | 0.80 | ~8h | Speed-optimized, virtual epochs |
-| **UNETR++** | 0.78 | 24-36h | Transformer baseline |
-| **nnUNet** | 0.76 | ~48h | Auto-configured baseline |
+| Target | Deep learning | Radiomics (XGBoost) | Late fusion |
+|--------|--------------:|--------------------:|------------:|
+| EGFR mutation | 0.73 | 0.82 | **0.87** |
+| KRAS mutation | 0.71 | 0.81 | **0.86** |
+
+On a private cohort of 92 patients with IHC validation, the report gives AUCs of 0.80 for TTF-1 and 0.76 for CK7. The evaluation outputs behind these tables are not in this repository; the HPC logs of the VISTA-3D training runs are in [archive/logs](archive/logs/).
+
+### Earlier experiments (reported, not reproducible from this repository)
+
+The research notes in [docs/](docs/) describe earlier runs of four architectures on LIDC-IDRI. Their checkpoints, configs, and logs are not in this repository, so these figures cannot be checked here:
+
+| Model | Dice (reported) | Training time (2× H100) | Key feature |
+|-------|----------------:|------------------------|-------------|
+| SwinUNETR | 0.82 | 8-12h | SSL pretraining (5,050 CT scans) |
+| SegResNet | 0.80 | ~8h | Speed-optimized, virtual epochs |
+| UNETR++ | 0.78 | 24-36h | Transformer baseline |
+| nnUNet | 0.76 | ~48h | Auto-configured baseline |
 
 ## 🏗️ Repository Structure
 
@@ -114,20 +128,9 @@ Training entry points are in [research/training/](research/training/) and the ev
 
 See [docs/REPRODUCTION.md](docs/REPRODUCTION.md) for full reproduction guide.
 
-## 📊 Results Summary
+## 🔬 Methods
 
-### Main Performance Metrics
-
-| Metric | UNETR++ | SwinUNETR | SegResNet | nnUNet |
-|--------|---------|-----------|-----------|--------|
-| **Positive Dice** | 0.78 | **0.82** | 0.80 | 0.76 |
-| **Negative Dice** | 0.98 | 0.99 | 0.98 | 0.98 |
-| **Training Time** | 24-36h | **8-12h** | **~8h** | ~48h |
-| **Parameters** | 65M | 62M | 25M | Varies |
-
-*All experiments on 2× NVIDIA H100 GPUs*
-
-### Key Innovations
+### Techniques used in the experiments
 
 1. **Extreme Class Imbalance Solution**
    - Weighted Random Sampling
@@ -199,7 +202,5 @@ For questions or collaborations:
 - **Paper Materials**: [paper/](paper/)
 
 ---
-
-**Status**: 🚧 Active Development | ✅ Ready for Publication
 
 Last Updated: January 2026
