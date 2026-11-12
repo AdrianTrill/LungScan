@@ -1,5 +1,5 @@
 <p align="center">
-  <a href="https://adriantrill.github.io/LungScan/"><img src="frontend/public/social.png" width="857" alt="LungScan: lung CT reading on your own device. A CT slice with its Grad-CAM heat map inside a scanner ring, read in the browser on WebGPU, with a cancer probability of 94.4%"></a>
+  <a href="https://adriantrill.github.io/LungScan/"><img src="frontend/public/social.png" width="857" alt="LungScan: lung CT reading on your own device. A CT slice with its Grad-CAM heat map inside a scanner ring, read in the browser on WebGPU, with a cancer probability of 94.5%"></a>
 </p>
 
 <p align="center">
@@ -52,7 +52,7 @@ To run it yourself, with the FastAPI backend:
 ## The reading room
 
 <p align="center">
-  <img src="docs/assets/reading-room.png" width="857" alt="The reading view in the dark theme: a CT slice with the Grad-CAM heat map and one region in the viewer, PACS-style corner annotations, and the model's read beside it: a cancer probability of 94.4%, flagged, read in the browser on WebGPU, the dataset label it agrees with, the class probabilities, and the region">
+  <img src="docs/assets/reading-room.png" width="857" alt="The reading view in the dark theme: a CT slice with the Grad-CAM heat map and one region in the viewer, PACS-style corner annotations, and the model's read beside it: a cancer probability of 94.5%, flagged, read in the browser on WebGPU, the dataset label it agrees with, the class probabilities, and the region">
 </p>
 
 The reading view puts the slice beside the model's read, with the previous and next study a key away (<kbd>[</kbd> <kbd>]</kbd>).
