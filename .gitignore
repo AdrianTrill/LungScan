@@ -113,3 +113,12 @@ model/lungscan.json
 Thumbs.db
 
 
+
+# Copied into the frontend at build time (frontend/scripts/copy-assets.mjs)
+frontend/public/samples/
+frontend/public/ort/
+frontend/public/models/
+frontend/public/evaluation.json
+
+# TypeScript incremental build state
+*.tsbuildinfo

@@ -1,155 +1,180 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import toast from "react-hot-toast";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { useMemo, useState } from "react";
+import toast from "react-hot-toast";
+import PatientDialog from "@/components/dialogs/PatientDialog";
+import PageHeader from "@/components/shell/PageHeader";
+import Button from "@/components/ui/Button";
+import Icon from "@/components/ui/Icon";
+import Spinner from "@/components/ui/Spinner";
+import { Chip, Empty } from "@/components/ui/Status";
 import { api } from "@/lib/api";
-import { Patient } from "@/lib/types";
-import { calculateAge } from "@/lib/utils";
+import { ageFrom, formatDate, probability, relativeTime } from "@/lib/format";
+import { useResource, useShortcuts } from "@/lib/hooks";
+import { routes } from "@/lib/routes";
+import type { Case } from "@/lib/types";
 
 export default function PatientsPage() {
   const router = useRouter();
-  const [patients, setPatients] = useState<Patient[]>([]);
-  const [loading, setLoading] = useState(true);
+  const patients = useResource(() => api.listPatients(), []);
+  const cases = useResource(() => api.listCases(), []);
+  const [creating, setCreating] = useState(false);
 
-  useEffect(() => {
-    loadPatients();
-  }, []);
-
-  const loadPatients = async () => {
-    try {
-      setLoading(true);
-      const data = await api.getPatients();
-      setPatients(data);
-    } catch (error) {
-      console.error("Failed to load patients:", error);
-      toast.error("Failed to load patients");
-    } finally {
-      setLoading(false);
+  const studies = useMemo(() => {
+    const map = new Map<string, Case[]>();
+    for (const c of cases.data ?? []) {
+      if (c.patient_id) map.set(c.patient_id, [...(map.get(c.patient_id) ?? []), c]);
     }
-  };
+    return map;
+  }, [cases.data]);
 
-  const handleDelete = async (patientId: string) => {
+  useShortcuts({ n: () => setCreating(true) });
+
+  const remove = async (id: string, name: string) => {
+    if (!confirm(`Delete ${name}?`)) return;
     try {
-      await api.deletePatient(patientId);
-      await loadPatients();
-      toast.success("Patient deleted successfully");
+      await api.deletePatient(id);
+      toast.success(`${name} deleted`);
+      await patients.reload();
     } catch (error) {
-      console.error("Failed to delete patient:", error);
-      toast.error("Failed to delete patient. They may have associated cases.");
+      toast.error(error instanceof Error ? error.message : "Could not delete the patient");
     }
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50/30 to-slate-50">
-      <div className="container mx-auto px-4 sm:px-6 lg:px-8 py-8 lg:py-12">
-        <div className="mb-8 lg:mb-12">
-          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-6">
-            <div>
-              <h1 className="text-4xl lg:text-5xl font-bold text-slate-900 mb-2">
-                Patients
-              </h1>
-              <p className="text-lg text-slate-600 max-w-2xl">
-                Manage patient records and view associated CT scans
-              </p>
-            </div>
-            <div className="flex gap-3">
-              <button
-                onClick={() => router.push("/")}
-                className="bg-white text-primary-600 px-6 py-3 rounded-xl font-semibold hover:shadow-lg transition-all duration-200 border-2 border-primary-200 hover:border-primary-300 flex items-center gap-2"
-              >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                </svg>
-                Cases
-              </button>
-              <button
-                onClick={() => router.push("/patients/new")}
-                className="gradient-primary text-white px-6 py-3 rounded-xl font-semibold hover:shadow-lg transition-all duration-200 transform hover:-translate-y-0.5 flex items-center gap-2"
-              >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-                </svg>
-                New Patient
-              </button>
-            </div>
-          </div>
-        </div>
+    <div className="mx-auto max-w-[1280px] px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
+      <PageHeader
+        eyebrow="Records"
+        title="Patients"
+        actions={
+          <Button variant="primary" icon="plus" shortcut="N" onClick={() => setCreating(true)}>
+            New patient
+          </Button>
+        }
+      >
+        Each patient&apos;s studies, with the model&apos;s highest cancer probability among them.
+      </PageHeader>
 
-        {loading ? (
-          <div className="text-center py-16">
-            <div className="inline-block animate-spin rounded-full h-12 w-12 border-b-2 border-primary-600 mb-4"></div>
-            <p className="text-slate-500 text-lg">Loading patients...</p>
+      <div className="mt-6">
+        {patients.loading && !patients.data ? (
+          <div className="flex items-center justify-center gap-2 py-20 text-muted">
+            <Spinner /> Loading patients…
           </div>
-        ) : patients.length === 0 ? (
-          <div className="text-center py-16 bg-white/60 backdrop-blur-sm rounded-2xl border border-slate-200">
-            <svg className="w-16 h-16 mx-auto text-slate-400 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
-            </svg>
-            <p className="text-lg font-medium text-slate-600 mb-2">No patients found</p>
-            <p className="text-sm text-slate-500">Create a new patient to get started</p>
-          </div>
+        ) : !patients.data?.length ? (
+          <Empty
+            title="No patients yet"
+            action={
+              <Button variant="primary" icon="plus" onClick={() => setCreating(true)}>
+                New patient
+              </Button>
+            }
+          />
         ) : (
-          <div className="grid gap-4 sm:gap-5">
-            {patients.map((patient) => (
-              <div
-                key={patient.id}
-                className="bg-white rounded-xl card-shadow-lg p-6 hover:shadow-xl transition-all duration-200 border border-slate-100 hover:border-primary-200"
-              >
-                <div className="flex items-start justify-between gap-4">
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-3 mb-3 flex-wrap">
-                      <div className="flex items-center gap-2">
-                        <svg className="w-5 h-5 text-primary-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
-                        </svg>
-                        <h3 className="text-lg font-semibold text-slate-900">
-                          {patient.first_name} {patient.last_name}
-                        </h3>
-                      </div>
-                    </div>
-                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-sm">
-                      <div className="flex items-center gap-2 text-slate-600">
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-                        </svg>
-                        <span>Age: {calculateAge(patient.date_of_birth)}</span>
-                      </div>
-                      <div className="flex items-center gap-2 text-slate-600">
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                        </svg>
-                        <span>MRN: {patient.medical_record_number || "N/A"}</span>
-                      </div>
-                      <div className="flex items-center gap-2 text-slate-600">
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-                        </svg>
-                        <span>DOB: {new Date(patient.date_of_birth).toLocaleDateString()}</span>
-                      </div>
-                    </div>
-                  </div>
-                  <div className="flex gap-2 flex-shrink-0">
-                    <button
-                      onClick={() => router.push(`/patients/${patient.id}`)}
-                      className="gradient-primary text-white px-4 py-2 rounded-lg font-medium hover:shadow-md transition-all text-sm"
+          <div className="panel overflow-x-auto">
+            <table className="w-full min-w-[640px] text-left">
+              <thead>
+                <tr className="border-b border-line text-[11px] uppercase tracking-[0.07em] text-muted">
+                  <th className="py-2.5 pl-4 pr-3 font-semibold">Patient</th>
+                  <th className="px-3 py-2.5 font-semibold">Record</th>
+                  <th className="px-3 py-2.5 font-semibold">Born</th>
+                  <th className="px-3 py-2.5 font-semibold">Studies</th>
+                  <th className="px-3 py-2.5 font-semibold">Highest read</th>
+                  <th className="px-3 py-2.5 font-semibold">Last study</th>
+                  <th className="w-12" />
+                </tr>
+              </thead>
+              <tbody>
+                {patients.data.map((p) => {
+                  const own = studies.get(p.id) ?? [];
+                  const reads = own.filter((c) => c.cancer_probability !== null);
+                  const highest = reads.length
+                    ? Math.max(...reads.map((c) => c.cancer_probability!))
+                    : null;
+                  const last = own.reduce<string | null>(
+                    (a, c) => (!a || c.updated_at > a ? c.updated_at : a),
+                    null
+                  );
+                  const name = `${p.first_name} ${p.last_name}`;
+                  return (
+                    <tr
+                      key={p.id}
+                      onClick={() => router.push(routes.patient(p.id))}
+                      className="cursor-pointer border-b border-line/70 transition last:border-0 hover:bg-line/30"
                     >
-                      View
-                    </button>
-                    <button
-                      onClick={() => handleDelete(patient.id)}
-                      className="bg-red-600 text-white px-4 py-2 rounded-lg font-medium hover:bg-red-700 transition-all text-sm"
-                    >
-                      Delete
-                    </button>
-                  </div>
-                </div>
-              </div>
-            ))}
+                      <td className="py-3 pl-4 pr-3">
+                        <div className="flex items-center gap-3">
+                          <span className="grid h-8 w-8 place-items-center rounded-full bg-accent/15 text-[12px] font-semibold text-accent">
+                            {p.first_name[0]}
+                            {p.last_name[0]}
+                          </span>
+                          <Link
+                            href={routes.patient(p.id)}
+                            onClick={(e) => e.stopPropagation()}
+                            className="text-[13px] font-medium text-ink hover:text-accent"
+                          >
+                            {p.last_name}, {p.first_name}
+                          </Link>
+                        </div>
+                      </td>
+                      <td className="px-3 py-3 font-mono text-[12px] text-ink-2">
+                        {p.medical_record_number || "–"}
+                      </td>
+                      <td className="px-3 py-3 text-[12.5px] text-ink-2">
+                        {formatDate(p.date_of_birth)}{" "}
+                        <span className="text-muted">· {ageFrom(p.date_of_birth)} y</span>
+                      </td>
+                      <td className="tabular px-3 py-3 text-[12.5px] text-ink-2">{own.length}</td>
+                      <td className="px-3 py-3">
+                        {highest === null ? (
+                          <span className="text-[12.5px] text-faint">–</span>
+                        ) : (
+                          <Chip tone={highest >= 0.5 ? "flag" : "clear"} dot>
+                            {probability(highest)}
+                          </Chip>
+                        )}
+                      </td>
+                      <td className="px-3 py-3 text-[12.5px] text-muted">
+                        {last ? relativeTime(last) : "–"}
+                      </td>
+                      <td className="pr-3">
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void remove(p.id, name);
+                          }}
+                          disabled={own.length > 0}
+                          className="rounded-md p-1.5 text-faint hover:bg-flag/10 hover:text-flag disabled:pointer-events-none disabled:opacity-30"
+                          title={
+                            own.length
+                              ? "Patients with studies cannot be deleted"
+                              : `Delete ${name}`
+                          }
+                          aria-label={`Delete ${name}`}
+                        >
+                          <Icon name="trash" />
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
         )}
       </div>
+
+      <PatientDialog
+        open={creating}
+        onClose={() => setCreating(false)}
+        onCreated={(p) => {
+          setCreating(false);
+          toast.success(`${p.first_name} ${p.last_name} added`);
+          router.push(routes.patient(p.id));
+        }}
+      />
     </div>
   );
 }
-

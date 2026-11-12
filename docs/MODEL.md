@@ -34,11 +34,11 @@ Grad-CAM usually needs a backward pass. Here it doesn't. The score explained is 
 - `∂s/∂p = W₁ᵀ · (relu′(h) ⊙ W₂ᵀ · ∂s/∂z)`, the head's Jacobian, which the graph computes with two matrix products;
 - because of the average pooling, every location of `A` gets the same gradient, `∂s/∂p / 49`. Those are Grad-CAM's channel weights, and the map is `relu(Σₖ αₖ Aₖ)`.
 
-The export wraps the network in [`ExplainedNet`](../backend/tools/network.py), which does exactly this, and checks it before writing the file: ONNX Runtime must reproduce PyTorch's logits (largest difference 2.4×10⁻⁶), and the map must match the Grad-CAM autograd computes (5.2×10⁻⁷). A unit test checks the same identity on random weights. The graph uses only basic operators, so any ONNX runtime can run it, ONNX Runtime Web included.
+The export wraps the network in [`ExplainedNet`](../backend/tools/network.py), which does exactly this, and checks it before writing the file: ONNX Runtime must reproduce PyTorch's logits (largest difference 2.4×10⁻⁶), and the map must match the Grad-CAM autograd computes (5.2×10⁻⁷). A unit test checks the same identity on random weights. The graph uses only basic operators, so ONNX Runtime Web runs it unchanged.
 
 ## From output to read
 
-[`app/services/analysis.py`](../backend/app/services/analysis.py) turns the two outputs into a read:
+[`app/services/analysis.py`](../backend/app/services/analysis.py) turns the two outputs into a read, and [`frontend/src/lib/inference/interpret.ts`](../frontend/src/lib/inference/interpret.ts) does the same in the browser:
 
 1. **Probabilities**: the softmax of the logits. The **cancer probability** is the sum of the three cancer classes.
 2. **Flag**: a slice is flagged when its cancer probability is at least 0.5. Its **subtype** is the most probable cancer class, shown as unreliable (see below).
@@ -46,7 +46,7 @@ The export wraps the network in [`ExplainedNet`](../backend/tools/network.py), w
 4. **Regions**: on flagged slices, grid cells with at least half the maximum are grouped into 8-connected regions. Each region's center is the evidence-weighted centroid of its cells, and its radius that of a disc of the same area. The three strongest are kept.
 5. **Summary**: one sentence, built from the values above.
 
-Rounding is half up throughout, so any other implementation can produce the same text. The regions are where the network's evidence is concentrated, not detected nodules: on this dataset they often cover the mediastinum or a whole lung.
+Rounding is half up throughout, so the server and the browser produce the same text. The regions are where the network's evidence is concentrated, not detected nodules: on this dataset they often cover the mediastinum or a whole lung.
 
 ## Measured performance
 
@@ -86,7 +86,12 @@ The [segmentation research](../AI%20model/README.md) in this repository works on
 
 ## Where it runs
 
-The exported file, `lungscan.onnx` (96 MB), runs on the server: [`app/services/model.py`](../backend/app/services/model.py) loads it with ONNX Runtime on the CPU, about 20 ms per slice on an Apple M-series laptop. PyTorch is not needed. If `model/lungscan.onnx` is missing, the server downloads it from the project's GitHub Pages site on first use, with its manifest, and checks its SHA-256.
+The exported file, `lungscan.onnx` (96 MB), runs in two places:
+
+- **The server**: [`app/services/model.py`](../backend/app/services/model.py) loads it with ONNX Runtime on the CPU, about 20 ms per slice on an Apple M-series laptop. PyTorch is not needed. If `model/lungscan.onnx` is missing, the server downloads it from the project's GitHub Pages site on first use, with its manifest, and checks its SHA-256.
+- **The browser**: the in-browser build runs the same file with ONNX Runtime Web, in a worker ([`public/inference-worker.js`](../frontend/public/inference-worker.js)), on WebGPU when the browser has it and on WebAssembly otherwise. The model is downloaded once, checked against the same SHA-256, and kept in Cache Storage.
+
+The browser prepares slices with a port of Pillow 13's bilinear resize ([`resample.ts`](../frontend/src/lib/inference/resample.ts)), down to its fixed-point weights and the order of its two passes, so a PNG slice reaches the network as exactly the same tensor on both sides. Tests hold the ports to the server's own output (fixtures from `tools/make_fixtures.py`), and in headless Chrome the browser's reads of the sample slices match the server's to every stored decimal, on WebAssembly and on WebGPU.
 
 ## Tools
 
@@ -99,3 +104,4 @@ Run them from `backend/`. `fetch_model` needs only `requirements.txt`; the other
 | `python -m tools.evaluate` | Measures the model on the deduplicated test split; writes `model/evaluation.json` |
 | `python -m tools.make_samples` | Rebuilds the sample slices and their reference reads in `model/samples/` |
 | `python -m tools.make_samples --check` | Re-runs the model on the samples and compares with `model/samples/samples.json` |
+| `python -m tools.make_fixtures` | Writes the server's outputs the frontend's tests compare against |

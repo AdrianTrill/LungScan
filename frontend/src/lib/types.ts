@@ -1,20 +1,23 @@
-/** TypeScript interfaces mirroring backend Pydantic schemas. */
+/** Data types, mirroring the backend's Pydantic schemas (backend/app/core/schemas.py). */
 
-export interface Nodule {
-  id: string;
+export type Label =
+  "adenocarcinoma" | "large_cell_carcinoma" | "normal" | "squamous_cell_carcinoma";
+
+export interface Box {
   x: number;
   y: number;
-  radius: number;
-  malignancy_score: number;
-  explanation: string;
+  width: number;
+  height: number;
 }
 
-export interface UploadResult {
-  case_id: string;
-  filename: string;
-  uploaded_at: string;
+/** Grad-CAM evidence for cancer on a size x size grid over `box`, in image pixels. */
+export interface Heatmap {
+  size: number;
+  values: number[];
+  box: Box;
 }
 
+/** A region where the Grad-CAM evidence for cancer peaks. */
 export interface Region {
   id: string;
   x: number;
@@ -25,17 +28,25 @@ export interface Region {
   explanation: string;
 }
 
+export interface ModelInfo {
+  name: string;
+  source: string;
+  runtime: string;
+}
+
 export interface AnalyzeResult {
   case_id: string;
   cancer_probability: number;
   flagged: boolean;
-  predicted_class: string;
-  subtype: string | null;
-  probabilities: Record<string, number>;
+  predicted_class: Label;
+  subtype: Label | null;
+  probabilities: Record<Label, number>;
+  heatmap: Heatmap;
   regions: Region[];
   summary: string;
-  /** The regions, in the shape the scan viewer draws. */
-  nodules: Nodule[];
+  model: ModelInfo;
+  inference_ms: number;
+  analyzed_at: string;
 }
 
 export interface Patient {
@@ -54,11 +65,6 @@ export interface PatientCreate {
   medical_record_number?: string;
 }
 
-export interface PatientDetail {
-  patient: Patient;
-  cases: Case[];
-}
-
 export interface Case {
   id: string;
   filename: string;
@@ -66,6 +72,9 @@ export interface Case {
   status: "pending" | "analyzed";
   created_at: string;
   updated_at: string;
+  cancer_probability: number | null;
+  flagged: boolean | null;
+  dataset_label: Label | null;
 }
 
 export interface CaseDetail {
@@ -75,14 +84,14 @@ export interface CaseDetail {
   notes: string | null;
 }
 
+export interface PatientDetail {
+  patient: Patient;
+  cases: Case[];
+}
+
 export interface UploadResult {
   case_id: string;
   filename: string;
   patient_id: string | null;
   uploaded_at: string;
 }
-
-export interface ReportRequest {
-  notes: string;
-}
-

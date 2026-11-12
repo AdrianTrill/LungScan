@@ -1,0 +1,47 @@
+[
+  {
+    "name": "slice.png",
+    "extension": ".png",
+    "display": "slice.png"
+  },
+  {
+    "name": "My Scan (1).png",
+    "extension": ".png",
+    "display": "My Scan _1.png"
+  },
+  {
+    "name": "  .hidden.jpeg",
+    "extension": ".png",
+    "display": "hidden.png"
+  },
+  {
+    "name": "\u00fcn\u00efcode scan.jpg",
+    "extension": ".png",
+    "display": "n_code scan.png"
+  },
+  {
+    "name": "a.b.c.png",
+    "extension": ".png",
+    "display": "a.b.c.png"
+  },
+  {
+    "name": "....png",
+    "extension": ".png",
+    "display": "scan.png"
+  },
+  {
+    "name": ".png",
+    "extension": ".png",
+    "display": "png.png"
+  },
+  {
+    "name": "trailing.",
+    "extension": ".png",
+    "display": "trailing.png"
+  },
+  {
+    "name": "",
+    "extension": ".png",
+    "display": "scan.png"
+  }
+]

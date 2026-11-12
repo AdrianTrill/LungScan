@@ -31,7 +31,7 @@ class Settings(BaseSettings):
         REPO_DIR / "model" / "lungscan.onnx", validation_alias="LUNGSCAN_MODEL_PATH"
     )
     model_url: str = Field(
-        "https://adriantrill.github.io/LungScan/model/lungscan.onnx",
+        "https://adriantrill.github.io/LungScan/models/lungscan.onnx",
         validation_alias="LUNGSCAN_MODEL_URL",
     )
 

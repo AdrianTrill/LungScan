@@ -1,0 +1,42 @@
+================================================================
+LUNGSCAN REPORT
+================================================================
+
+Case ID:      sample-01
+Study:        slice-000120.png
+Patient:      John Smith, MRN-2024-001, born 1975-03-15
+Report date:  2026-02-03 04:05 UTC
+Status:       ANALYZED
+
+----------------------------------------------------------------
+MODEL READ (research software, not for clinical use)
+----------------------------------------------------------------
+
+Cancer probability 94.4%: the model reads this slice as cancer. Most likely subtype: Adenocarcinoma (92.4% of the cancer probability), though the model's subtype calls are unreliable. Grad-CAM marks 1 region that raised the cancer score.
+
+Cancer probability:  94.4%
+Class probabilities:
+  Adenocarcinoma              87.3%
+  Large cell carcinoma         3.1%
+  Normal                       5.6%
+  Squamous cell carcinoma      4.0%
+
+Regions where the Grad-CAM evidence for cancer peaks:
+  1. center (119, 106), radius 66 px, evidence 94.4%
+     Grad-CAM evidence for cancer peaks here at 100.0% of the slice's maximum, over 6 of 49 grid cells, in the upper left of the image.
+
+Model:     ResNet-50 lung CT classifier, dorsar/lung-cancer-detection@aa7426d
+Runtime:   ONNX Runtime 1.31.1 (precomputed sample)
+Analyzed:  2026-01-01 00:00 UTC
+
+----------------------------------------------------------------
+NOTES
+----------------------------------------------------------------
+
+Compare with the prior study.
+No action needed.
+
+================================================================
+LungScan is research software. It is not a medical device, and its
+output must not be used for diagnosis.
+================================================================
