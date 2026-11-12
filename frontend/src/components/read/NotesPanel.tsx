@@ -66,7 +66,7 @@ export default function NotesPanel({ caseId, initial }: { caseId: string; initia
     <section className="panel p-4" aria-label="Notes and report">
       <div className="flex items-center justify-between">
         <h2 className="eyebrow">Notes</h2>
-        <span className="text-[11.5px] text-muted" aria-live="polite">
+        <span className="text-11.5 text-muted" aria-live="polite">
           {state === "saved" ? "Saved" : state === "saving" ? "Saving…" : "Unsaved"}
         </span>
       </div>
@@ -79,7 +79,7 @@ export default function NotesPanel({ caseId, initial }: { caseId: string; initia
         aria-label="Notes"
       />
       <div className="mt-3 flex items-center justify-between gap-2">
-        <p className="text-[11.5px] text-muted">
+        <p className="text-11.5 text-muted">
           The report includes the read, the regions, and these notes.
         </p>
         <Button size="sm" icon="download" shortcut="E" onClick={() => void exportReport()}>

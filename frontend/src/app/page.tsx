@@ -43,7 +43,7 @@ function Stat({
       >
         {value}
       </p>
-      {hint && <p className="text-[11.5px] text-faint">{hint}</p>}
+      {hint && <p className="text-11.5 text-faint">{hint}</p>}
     </div>
   );
 }
@@ -208,7 +208,7 @@ export default function WorklistPage() {
         )}
       </div>
 
-      <p className="mt-3 hidden text-[11.5px] text-faint sm:block">
+      <p className="mt-3 hidden text-11.5 text-faint sm:block">
         <kbd className="kbd">J</kbd> <kbd className="kbd">K</kbd> move ·{" "}
         <kbd className="kbd">Enter</kbd> opens · <kbd className="kbd">?</kbd> all shortcuts
       </p>

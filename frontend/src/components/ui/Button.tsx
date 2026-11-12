@@ -41,7 +41,7 @@ export default function Button({
       {children}
       {shortcut && (
         <span
-          className={`ml-0.5 hidden rounded px-1 font-mono text-[10.5px] sm:inline ${
+          className={`ml-0.5 hidden rounded px-1 font-mono text-10.5 sm:inline ${
             variant === "primary" ? "bg-black/15" : "bg-line/70 text-muted"
           }`}
         >

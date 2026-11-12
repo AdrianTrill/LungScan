@@ -75,7 +75,7 @@ export default function PatientsPage() {
           <div className="panel overflow-x-auto">
             <table className="w-full min-w-[640px] text-left">
               <thead>
-                <tr className="border-b border-line text-[11px] uppercase tracking-[0.07em] text-muted">
+                <tr className="border-b border-line text-11 uppercase tracking-[0.07em] text-muted">
                   <th className="py-2.5 pl-4 pr-3 font-semibold">Patient</th>
                   <th className="px-3 py-2.5 font-semibold">Record</th>
                   <th className="px-3 py-2.5 font-semibold">Born</th>

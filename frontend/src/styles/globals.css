@@ -3,7 +3,8 @@
 @tailwind utilities;
 
 /* Theme tokens, as "R G B" so Tailwind can add opacity (tailwind.config.ts). The viewer
-   stays dark in both themes, as reading-room displays do. */
+   stays dark in both themes, as reading-room displays do. Text colors keep a contrast of
+   at least 4.5:1 (WCAG AA) on every surface they are used on, tints included. */
 :root,
 :root[data-theme="dark"] {
   color-scheme: dark;
@@ -15,8 +16,8 @@
   --line-strong: 46 57 72;
   --ink: 231 237 243;
   --ink-2: 176 189 203;
-  --muted: 122 137 155;
-  --faint: 74 87 104;
+  --muted: 143 156 172;
+  --faint: 129 140 153;
   --accent: 45 212 191;
   --accent-ink: 3 38 36;
   --flag: 251 113 133;
@@ -38,17 +39,33 @@
   --line-strong: 202 211 223;
   --ink: 15 23 36;
   --ink-2: 51 65 85;
-  --muted: 100 116 139;
-  --faint: 156 169 186;
-  --accent: 13 148 136;
+  --muted: 81 96 116;
+  --faint: 98 109 124;
+  --accent: 9 108 99;
   --accent-ink: 255 255 255;
-  --flag: 225 29 72;
-  --clear: 5 150 105;
-  --caution: 180 83 9;
+  --flag: 184 24 59;
+  --clear: 4 110 77;
+  --caution: 155 71 8;
   --viewer: 2 4 7;
   --glow: 13 148 136;
   --shadow-panel: 0 1px 2px rgb(15 23 42 / 0.05), 0 8px 24px -16px rgb(15 23 42 / 0.2);
   --shadow-pop: 0 24px 60px -20px rgb(15 23 42 / 0.35), 0 0 0 1px rgb(15 23 42 / 0.06);
+}
+
+/* Small print (text-10.5, text-11, text-11.5): 12px on phones, where anything smaller is
+   hard to read, and its own size from the sm breakpoint up. */
+:root {
+  --text-10-5: 12px;
+  --text-11: 12px;
+  --text-11-5: 12px;
+}
+
+@media (min-width: 640px) {
+  :root {
+    --text-10-5: 10.5px;
+    --text-11: 11px;
+    --text-11-5: 11.5px;
+  }
 }
 
 @layer base {
@@ -86,7 +103,7 @@
   }
 
   .eyebrow {
-    @apply text-[11px] font-semibold uppercase tracking-[0.08em] text-muted;
+    @apply text-11 font-semibold uppercase tracking-[0.08em] text-muted;
   }
 
   .tabular {
@@ -94,7 +111,7 @@
   }
 
   .kbd {
-    @apply inline-flex min-w-[1.4rem] items-center justify-center rounded-md border border-line-strong bg-raised px-1.5 font-mono text-[11px] text-ink-2;
+    @apply inline-flex min-w-[1.4rem] items-center justify-center rounded-md border border-line-strong bg-raised px-1.5 font-mono text-11 text-ink-2;
     box-shadow: 0 1px 0 rgb(var(--line-strong));
   }
 

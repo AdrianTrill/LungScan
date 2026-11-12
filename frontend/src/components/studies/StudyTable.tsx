@@ -56,7 +56,7 @@ export default function StudyTable({
       <div className="overflow-x-auto">
         <table className="w-full min-w-[640px] text-left">
           <thead>
-            <tr className="border-b border-line text-[11px] uppercase tracking-[0.07em] text-muted">
+            <tr className="border-b border-line text-11 uppercase tracking-[0.07em] text-muted">
               <th className="py-2.5 pl-4 pr-3 font-semibold">Study</th>
               {patients && <th className="px-3 py-2.5 font-semibold">Patient</th>}
               <th className="px-3 py-2.5 font-semibold">Model read</th>
@@ -99,9 +99,7 @@ export default function StudyTable({
                         >
                           {study.filename}
                         </Link>
-                        <span className="font-mono text-[11px] text-faint">
-                          {shortId(study.id)}
-                        </span>
+                        <span className="font-mono text-11 text-faint">{shortId(study.id)}</span>
                       </div>
                     </div>
                   </td>
@@ -112,7 +110,7 @@ export default function StudyTable({
                           <div className="text-[13px] text-ink">
                             {patient.first_name} {patient.last_name}
                           </div>
-                          <div className="font-mono text-[11px] text-muted">
+                          <div className="font-mono text-11 text-muted">
                             {patient.medical_record_number || "–"}
                           </div>
                         </div>

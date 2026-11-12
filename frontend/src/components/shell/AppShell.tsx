@@ -53,7 +53,7 @@ function RuntimeCard() {
         <button
           type="button"
           onClick={reset}
-          className="mt-2 text-[11.5px] font-medium text-muted underline-offset-2 hover:text-ink hover:underline"
+          className="mt-2 text-11.5 font-medium text-muted underline-offset-2 hover:text-ink hover:underline"
         >
           Reset demo data
         </button>
@@ -66,7 +66,7 @@ function RuntimeCard() {
         <Icon name="server" className="h-4 w-4 text-accent" />
         Server mode
       </div>
-      <p className="mt-1.5 break-all font-mono text-[11px] leading-snug text-muted">{API_URL}</p>
+      <p className="mt-1.5 break-all font-mono text-11 leading-snug text-muted">{API_URL}</p>
     </div>
   );
 }
@@ -120,7 +120,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
             <span className="block text-[15px] font-semibold leading-tight tracking-tight text-ink">
               LungScan
             </span>
-            <span className="block text-[11px] leading-tight text-muted">CT reading room</span>
+            <span className="block text-11 leading-tight text-muted">CT reading room</span>
           </span>
         </Link>
         <nav className="mt-7 space-y-0.5" aria-label="Main">
@@ -147,7 +147,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
         <div className="mt-auto space-y-3">
           <RuntimeCard />
           <div className="flex items-center justify-between px-1">{tools}</div>
-          <p className="px-2 text-[10.5px] leading-snug text-faint">
+          <p className="px-2 text-10.5 leading-snug text-faint">
             Research software. Not a medical device; not for diagnosis.
           </p>
         </div>

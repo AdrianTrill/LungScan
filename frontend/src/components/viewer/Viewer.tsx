@@ -334,13 +334,13 @@ export default function Viewer({
         />
         <span className="mx-1 h-5 w-px bg-white/10" />
         <ToolButton icon="zoomOut" label="Zoom out" shortcut="-" onClick={() => zoomAt(0.8)} />
-        <span className="tabular w-12 text-center font-mono text-[11px] text-slate-400">
+        <span className="tabular w-12 text-center font-mono text-11 text-slate-400">
           {Math.round(view.scale * 100)}%
         </span>
         <ToolButton icon="zoomIn" label="Zoom in" shortcut="+" onClick={() => zoomAt(1.25)} />
         <ToolButton icon="fit" label="Fit to the viewer" shortcut="F" onClick={fit} />
         <ToolButton label="Actual size" shortcut="1" onClick={actualSize}>
-          <span className="font-mono text-[11px]">1:1</span>
+          <span className="font-mono text-11">1:1</span>
         </ToolButton>
         <span className="mx-1 h-5 w-px bg-white/10" />
         <ToolButton
@@ -501,7 +501,7 @@ export default function Viewer({
           </div>
         )}
 
-        <div className="pointer-events-none absolute inset-0 p-3 font-mono text-[11px] leading-[1.5] text-slate-300/90 [text-shadow:0_1px_2px_rgb(0_0_0/0.9)]">
+        <div className="pointer-events-none absolute inset-0 p-3 font-mono text-11 leading-[1.5] text-slate-300/90 [text-shadow:0_1px_2px_rgb(0_0_0/0.9)]">
           <div className="absolute left-3 top-3">
             {topLeft.map((line, i) => (
               <div key={i} className={i === 0 ? "font-semibold text-slate-100" : ""}>

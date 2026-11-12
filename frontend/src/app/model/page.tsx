@@ -29,7 +29,7 @@ function Tile({
     <div className="rounded-xl border border-line bg-sunken p-4">
       <p className="text-[12px] text-muted">{label}</p>
       <p className={`tabular mt-1 text-[24px] font-semibold tracking-tight ${tone}`}>{value}</p>
-      <p className="mt-0.5 text-[11.5px] leading-snug text-muted">{detail}</p>
+      <p className="mt-0.5 text-11.5 leading-snug text-muted">{detail}</p>
     </div>
   );
 }
@@ -274,11 +274,11 @@ export default function ModelPage() {
               <table className="mx-auto text-[12.5px]">
                 <thead>
                   <tr>
-                    <th className="px-2 py-1 text-left text-[11px] font-normal text-muted">
+                    <th className="px-2 py-1 text-left text-11 font-normal text-muted">
                       Truth ↓ · read →
                     </th>
                     {LABELS.map((l) => (
-                      <th key={l} className="px-2 py-1 text-[11.5px] font-medium text-ink-2">
+                      <th key={l} className="px-2 py-1 text-11.5 font-medium text-ink-2">
                         {LABEL_SHORT[l]}
                       </th>
                     ))}
@@ -289,7 +289,7 @@ export default function ModelPage() {
                     const total = row.reduce((a, b) => a + b, 0);
                     return (
                       <tr key={LABELS[i]}>
-                        <th className="px-2 py-1 text-left text-[11.5px] font-medium text-ink-2">
+                        <th className="px-2 py-1 text-left text-11.5 font-medium text-ink-2">
                           {LABEL_SHORT[LABELS[i]]}{" "}
                           <span className="font-normal text-faint">({total})</span>
                         </th>
@@ -300,7 +300,7 @@ export default function ModelPage() {
                                 i === j ? "text-ink" : "text-ink-2"
                               }`}
                               style={{
-                                background: `rgb(var(${i === j ? "--clear" : "--flag"}) / ${total ? (n / total) * 0.55 : 0})`,
+                                background: `rgb(var(${i === j ? "--clear" : "--flag"}) / ${total ? (n / total) * 0.45 : 0})`,
                               }}
                             >
                               {n}
@@ -312,7 +312,7 @@ export default function ModelPage() {
                   })}
                 </tbody>
               </table>
-              <p className="mt-2 text-center text-[11.5px] text-muted">
+              <p className="mt-2 text-center text-11.5 text-muted">
                 Most cancers are called large cell carcinoma, so the app shows subtypes as guesses.
               </p>
             </div>

@@ -24,7 +24,7 @@ export function Chip({
 }) {
   return (
     <span
-      className={`inline-flex h-6 items-center gap-1.5 whitespace-nowrap rounded-full border px-2 text-[11.5px] font-medium ${TONES[tone]} ${className}`}
+      className={`inline-flex h-6 items-center gap-1.5 whitespace-nowrap rounded-full border px-2 text-11.5 font-medium ${TONES[tone]} ${className}`}
     >
       {dot && <span className="h-1.5 w-1.5 rounded-full bg-current" />}
       {children}

@@ -85,7 +85,7 @@ function Agreement({ study, result }: { study: Case; result: AnalyzeResult }) {
         <Icon name={tone === "clear" ? "check" : "alert"} className="mt-[2px] h-3.5 w-3.5" />
         {text}
       </p>
-      <p className="mt-1 text-[11.5px] text-muted">
+      <p className="mt-1 text-11.5 text-muted">
         A held-out slice from the model&apos;s test split.
       </p>
     </div>
@@ -121,7 +121,7 @@ function Progress({ progress }: { progress: AnalyzeProgress | null }) {
               style={{ width: `${(fraction ?? 0) * 100}%` }}
             />
           </div>
-          <p className="tabular mt-1.5 text-[11.5px] text-muted">
+          <p className="tabular mt-1.5 text-11.5 text-muted">
             {megabytes(progress?.loaded ?? 0)}
             {progress?.total ? ` of ${megabytes(progress.total)}` : ""} · kept in this browser for
             next time
@@ -202,7 +202,7 @@ export default function ReadPanel({
           <div className="mt-3 flex items-center gap-4">
             <Gauge value={result.cancer_probability} flagged={result.flagged} />
             <div className="min-w-0">
-              <p className="text-[11.5px] text-muted">Cancer probability</p>
+              <p className="text-11.5 text-muted">Cancer probability</p>
               <p
                 className={`text-[16px] font-semibold leading-snug ${result.flagged ? "text-flag" : "text-clear"}`}
                 data-testid="verdict"
@@ -247,7 +247,7 @@ export default function ReadPanel({
               })}
             </div>
             {subtypeStats && (
-              <p className="mt-2 text-[11.5px] leading-snug text-muted">
+              <p className="mt-2 text-11.5 leading-snug text-muted">
                 Subtype guesses were right {percent(subtypeStats.accuracy)} of the time on{" "}
                 {subtypeStats.n} unique test cancers, where chance is {percent(subtypeStats.chance)}
                 .
@@ -275,7 +275,7 @@ export default function ReadPanel({
                       }`}
                       title="Show this region in the viewer"
                     >
-                      <span className="mt-0.5 grid h-5 w-5 flex-none place-items-center rounded-full bg-cyan-300 text-[11px] font-bold text-cyan-950">
+                      <span className="mt-0.5 grid h-5 w-5 flex-none place-items-center rounded-full bg-cyan-300 text-11 font-bold text-cyan-950">
                         {k + 1}
                       </span>
                       <span className="min-w-0">
@@ -285,7 +285,7 @@ export default function ReadPanel({
                             · {region.cells} of 49 cells · r {region.radius} px
                           </span>
                         </span>
-                        <span className="mt-0.5 block text-[11.5px] leading-snug text-muted">
+                        <span className="mt-0.5 block text-11.5 leading-snug text-muted">
                           {region.explanation}
                         </span>
                       </span>
@@ -293,7 +293,7 @@ export default function ReadPanel({
                   </li>
                 ))}
               </ul>
-              <p className="mt-2 text-[11.5px] leading-snug text-muted">
+              <p className="mt-2 text-11.5 leading-snug text-muted">
                 Where the model&apos;s evidence concentrates, not detected nodules.
               </p>
             </div>
@@ -301,7 +301,7 @@ export default function ReadPanel({
 
           <p className="mt-4 text-[12.5px] leading-relaxed text-ink-2">{result.summary}</p>
 
-          <dl className="mt-4 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 border-t border-line pt-3 text-[11.5px]">
+          <dl className="mt-4 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 border-t border-line pt-3 text-11.5">
             <dt className="text-muted">Model</dt>
             <dd className="truncate font-mono text-ink-2">{result.model.source}</dd>
             <dt className="text-muted">Runtime</dt>

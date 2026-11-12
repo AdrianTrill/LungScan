@@ -233,7 +233,7 @@ function Study({ id }: { id: string }) {
             >
               <Icon name="prev" />
             </button>
-            <span className="tabular px-1 text-[11.5px] text-muted">
+            <span className="tabular px-1 text-11.5 text-muted">
               {position >= 0 ? `${position + 1} / ${order.length}` : "–"}
             </span>
             <button

@@ -26,6 +26,12 @@ const config: Config = {
         caution: token("caution"),
         viewer: token("viewer"),
       },
+      // Small print: this size from the sm breakpoint up, 12px on phones (globals.css).
+      fontSize: {
+        "10.5": "var(--text-10-5)",
+        "11": "var(--text-11)",
+        "11.5": "var(--text-11-5)",
+      },
       fontFamily: {
         sans: [
           "-apple-system",
