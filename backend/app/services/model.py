@@ -110,6 +110,7 @@ def download_model(url: str, path: Path) -> Path:
     if file_sha256(part) != manifest["sha256"]:
         part.unlink(missing_ok=True)
         raise ModelUnavailableError(f"The model downloaded from {url} does not match its manifest")
+    part.chmod(0o644)
     part.replace(path)
     (path.with_suffix(".json")).write_text(json.dumps(manifest, indent=2) + "\n")
     return path
