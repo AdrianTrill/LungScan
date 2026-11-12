@@ -5,6 +5,7 @@
 <p align="center">
   <a href="https://github.com/AdrianTrill/LungScan/actions/workflows/ci.yml"><img src="https://github.com/AdrianTrill/LungScan/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="https://adriantrill.github.io/LungScan/"><img src="https://github.com/AdrianTrill/LungScan/actions/workflows/pages.yml/badge.svg?branch=main" alt="Live demo"></a>
+  <a href="https://colab.research.google.com/github/AdrianTrill/LungScan/blob/main/notebooks/lungscan.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open the notebook in Colab"></a>
   <img src="https://img.shields.io/badge/python-3.11%2B-blue.svg" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/Next.js-14-black.svg" alt="Next.js 14">
   <img src="https://img.shields.io/badge/ONNX%20Runtime-server%20%7C%20web-005CED.svg" alt="ONNX Runtime on the server and in the browser">
@@ -38,6 +39,8 @@ LungScan is a reading room for lung CT: a worklist, a PACS-style viewer, and a m
 ## Try it
 
 **[Open the live demo](https://adriantrill.github.io/LungScan/).** It starts with seven sample studies from the model's held-out test split, already read. Open one and press <kbd>A</kbd> to read it again in your browser: the model (29 MB) downloads once, its SHA-256 is checked, and from then on a read takes about 20 ms on WebGPU or 200 ms on WebAssembly. Press <kbd>N</kbd> to add a slice of your own, or one of the samples, and <kbd>?</kbd> for every shortcut. Everything you add stays in your browser; **Reset demo data** in the sidebar starts over.
+
+**[Or open the notebook in Colab](https://colab.research.google.com/github/AdrianTrill/LungScan/blob/main/notebooks/lungscan.ipynb).** [`notebooks/lungscan.ipynb`](notebooks/lungscan.ipynb) reads the samples with the server's own code, draws their Grad-CAM maps and regions, and summarizes the evaluation; its last cell reads a slice of your choice.
 
 To run it yourself, with the FastAPI backend:
 
@@ -206,7 +209,8 @@ The evaluation outputs behind these tables are not in the repository. Neither ar
 │   ├── assets/
 │   └── planning/
 ├── scripts/                   # setup.sh, dev.sh, dev_backend.sh, dev_frontend.sh
-├── model_demonstration.ipynb
+├── notebooks/
+│   └── lungscan.ipynb         # the model in Python, with Grad-CAM; opens in Colab
 └── AI model/                  # 3D segmentation and biomarker research
 ```
 
