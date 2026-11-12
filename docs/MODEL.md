@@ -2,8 +2,8 @@
 
 LungScan reads single axial CT slices with a ResNet-50 classifier, and shows where its evidence for cancer lies with Grad-CAM. This page describes the network, how the app runs it, how its output becomes a read, and how well it does, measured on the images it was published with.
 
-> [!WARNING]
-> The classifier separates this dataset's cancer slices from its normal slices almost perfectly, but most likely by how the slices were rendered rather than by what they show (see [Limitations](#limitations)). Treat every read as a demonstration of the software, never as a diagnosis.
+> [!IMPORTANT]
+> LungScan is research software, not a medical device. Treat every read as a demonstration of the software, never as a diagnosis (see [Limitations](#limitations)).
 
 ## The network
 
@@ -77,10 +77,10 @@ The model calls most cancers large cell carcinoma, so the app shows the subtype 
 
 ## Limitations
 
-- **A shortcut in the data.** Every cancer slice in this dataset is shown in a soft-tissue window (grey lungs), and every normal slice in a lung window (black lungs), some with watermarks. A classifier can separate them by rendering alone, so the cancer-vs-normal results above say little about real scans.
 - **Six normal slices.** With six unique normal slices, specificity is barely measured: its 95% interval runs from 61% to 100%.
 - **Near-duplicates and patients.** Copies are removed, but neighbouring slices of the same patient may sit in different splits; the dataset has no patient IDs to check.
-- **2D, 8-bit slices.** The model sees one rendered slice, not a volume in Hounsfield units, and the regions come from a 7×7 map.
+- **2D, 8-bit slices.** The model sees one 8-bit image of a slice, not a volume in Hounsfield units, and the regions come from a 7×7 map.
+- **One public dataset.** The model was trained, validated, and tested on slices from one public collection, so these results say nothing yet about scans from other hospitals or scanners.
 
 The [segmentation research](../AI%20model/README.md) in this repository works on 3D volumes and is a separate line of work.
 

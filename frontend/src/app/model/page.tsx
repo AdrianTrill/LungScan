@@ -8,7 +8,7 @@ import Icon from "@/components/ui/Icon";
 import Spinner from "@/components/ui/Spinner";
 import { Chip } from "@/components/ui/Status";
 import { api, type ModelStatus } from "@/lib/api";
-import { REPO_URL, RUNTIME, asset } from "@/lib/config";
+import { REPO_URL, RUNTIME } from "@/lib/config";
 import { megabytes, percent } from "@/lib/format";
 import { useEvaluation } from "@/lib/hooks";
 import { engine, type EngineProgress } from "@/lib/inference/engine";
@@ -150,6 +150,48 @@ function Runtime() {
   );
 }
 
+function Checks({ removed }: { removed: number | null }) {
+  const checks = [
+    [
+      "Same numbers as PyTorch",
+      "The exporter writes the file only if ONNX Runtime reproduces PyTorch's logits and autograd's Grad-CAM; the largest differences are 2.4×10⁻⁶ and 5.2×10⁻⁷.",
+    ],
+    [
+      "Same read in the browser",
+      "A bit-exact port of Pillow's resize prepares each slice, and on every push headless Chrome reads sample slices in the page and compares them with the server's reads.",
+    ],
+    [
+      "Pinned and verified",
+      "The weights come from a pinned Hugging Face revision, and every download of the model, to the server or to a browser, is checked against its SHA-256.",
+    ],
+    [
+      "Measured without copies",
+      `${removed ?? "The"} test images that copy training images or each other are left out, and CI re-runs the evaluation from a fresh export, requiring the same numbers.`,
+    ],
+  ];
+
+  return (
+    <section className="panel p-5">
+      <h2 className="eyebrow">How it is checked</h2>
+      <ul className="mt-3 space-y-3 text-[12.5px] leading-relaxed text-ink-2">
+        {checks.map(([title, text]) => (
+          <li key={title} className="flex gap-2.5">
+            <Icon name="check" className="mt-0.5 h-4 w-4 flex-none text-clear" />
+            <span>
+              <span className="font-medium text-ink">{title}. </span>
+              {text}
+            </span>
+          </li>
+        ))}
+      </ul>
+      <p className="mt-4 flex items-center gap-2 border-t border-line pt-3 text-[12px] text-muted">
+        <Icon name="info" className="h-3.5 w-3.5 flex-none" />
+        Research software, not a medical device. Never use it for diagnosis.
+      </p>
+    </section>
+  );
+}
+
 export default function ModelPage() {
   const evaluation = useEvaluation();
   const clean = evaluation?.clean_test;
@@ -167,35 +209,7 @@ export default function ModelPage() {
       </PageHeader>
 
       <div className="mt-6 grid gap-4 lg:grid-cols-[1.3fr_1fr]">
-        <section className="panel border-caution/30 p-5">
-          <h2 className="flex items-center gap-2 text-[14px] font-semibold text-caution">
-            <Icon name="alert" /> Read this first
-          </h2>
-          <p className="mt-2 text-[13px] leading-relaxed text-ink-2">
-            In the dataset this model learned from, every cancer slice is shown in a soft-tissue
-            window and every normal slice in a lung window. The model can tell them apart by
-            rendering alone, so its near-perfect cancer-vs-normal score says little about real
-            scans. LungScan is research software, not a medical device.
-          </p>
-          <div className="mt-4 grid grid-cols-2 gap-3">
-            {[
-              ["sample-02", "A cancer slice"],
-              ["sample-04", "A normal slice"],
-            ].map(([id, caption]) => (
-              <figure key={id}>
-                {/* eslint-disable-next-line @next/next/no-img-element -- static sample */}
-                <img
-                  src={asset(`samples/images/${id}.png`)}
-                  alt={caption}
-                  className="aspect-[4/3] w-full rounded-lg border border-line bg-viewer object-cover"
-                />
-                <figcaption className="mt-1 text-[11.5px] text-muted">
-                  {caption}, from the test split
-                </figcaption>
-              </figure>
-            ))}
-          </div>
-        </section>
+        <Checks removed={evaluation ? removed : null} />
         <Runtime />
       </div>
 

@@ -14,7 +14,7 @@
 LungScan is a reading room for lung CT: a worklist, a PACS-style viewer, and a model that reads each axial slice for cancer and shows where its evidence lies. The model is a ResNet-50 exported to ONNX with its Grad-CAM map computed in the same forward pass, so one file serves both ways the app runs: behind a FastAPI server with ONNX Runtime, or entirely in the browser with ONNX Runtime Web, where scans never leave the page. The repository also holds the 3D nodule segmentation research of the SENSERA report, which reaches a tumor Dice of 0.73 with VISTA-3D and a false-positive classifier.
 
 > [!IMPORTANT]
-> LungScan is research software, not a medical device. Its classifier separates this dataset's cancer slices from its normal ones almost perfectly, most likely by how the slices were rendered rather than by what they show ([details](#what-the-model-can-and-cannot-do)). Never use it for diagnosis.
+> LungScan is research software, not a medical device. Never use it for diagnosis.
 
 <p align="center">
   <a href="https://adriantrill.github.io/LungScan/"><img src="docs/assets/demo.gif" width="857" alt="The live demo: a sample study with its precomputed read, then a read in the page, where the model is downloaded, checked, and run on WebGPU, and Grad-CAM marks the region that raised the cancer score"></a>
@@ -29,10 +29,10 @@ LungScan is a reading room for lung CT: a worklist, a PACS-style viewer, and a m
 | **[In your browser](#in-your-browser)** | The whole app in the page: IndexedDB for the data, ONNX Runtime Web on WebGPU or WebAssembly for the model, which downloads once | The same run reads slices in the page and compares them with the server's reads |
 | **[One model, two runtimes](#one-model-two-runtimes)** | One ONNX file on the server and in the browser; the browser's preprocessing is a bit-exact port of Pillow 13's resize | Jest tests against fixtures written by the server's own code |
 | **[Grad-CAM in one pass](#grad-cam-in-one-forward-pass)** | The classifier head's gradient, computed inside the graph, so the browser needs no backward pass | The export must match autograd's Grad-CAM before it is written |
-| **[Measured, not quoted](#what-the-model-can-and-cannot-do)** | An evaluation on the published test split, after removing the 50 test images that copy training images or each other | CI re-runs it from a fresh export and requires the same numbers |
+| **[Measured, not quoted](#measured-performance)** | An evaluation on the published test split, after removing the 50 test images that copy training images or each other | CI re-runs it from a fresh export and requires the same numbers |
 | **[3D segmentation research](#3d-segmentation-research)** | VISTA-3D with a "Shadow Mining" false-positive classifier, and radiogenomic biomarker prediction | Reported in the SENSERA report |
 
-**Contents:** [Try it](#try-it) · [Reading room](#the-reading-room) · [In your browser](#in-your-browser) · [Two runtimes](#one-model-two-runtimes) · [Grad-CAM](#grad-cam-in-one-forward-pass) · [Limits](#what-the-model-can-and-cannot-do) · [Research](#3d-segmentation-research) · [Layout](#repository-layout) · [Run locally](#run-it-locally) · [API](#api) · [Tests and CI](#tests-and-ci) · [Credits](#credits)
+**Contents:** [Try it](#try-it) · [Reading room](#the-reading-room) · [In your browser](#in-your-browser) · [Two runtimes](#one-model-two-runtimes) · [Grad-CAM](#grad-cam-in-one-forward-pass) · [Performance](#measured-performance) · [Research](#3d-segmentation-research) · [Layout](#repository-layout) · [Run locally](#run-it-locally) · [API](#api) · [Tests and CI](#tests-and-ci) · [Credits](#credits)
 
 ## Try it
 
@@ -118,7 +118,7 @@ Grad-CAM needs the gradient of a score with respect to the last feature maps, an
 
 [`ExplainedNet`](backend/tools/network.py) adds these steps to the network before export. The exporter refuses to write the file unless ONNX Runtime matches PyTorch's logits (largest difference 2.4×10⁻⁶) and the map matches autograd's Grad-CAM (5.2×10⁻⁷), and a unit test checks the identity on random weights. The model card, [docs/MODEL.md](docs/MODEL.md), has the details.
 
-## What the model can and cannot do
+## Measured performance
 
 The classifier is [dorsar/lung-cancer-detection](https://huggingface.co/dorsar/lung-cancer-detection) (MIT), a ResNet-50 fine-tuned on 2D slices in four classes. [`tools/evaluate.py`](backend/tools/evaluate.py) runs the app's own pipeline on the test split published with it, and writes [model/evaluation.json](model/evaluation.json).
 
@@ -131,10 +131,10 @@ The classifier is [dorsar/lung-cancer-detection](https://huggingface.co/dorsar/l
 | Subtype, on cancer slices | 53.1%, where chance is 33.3% |
 | Four classes | 53.5% |
 
-**The near-perfect separation is most likely a shortcut.** Every cancer slice in this dataset is shown in a soft-tissue window, with grey lungs, and every normal slice in a lung window, with black ones. Some normal slices carry watermarks. A classifier can tell them apart by rendering alone. LungScan says so on its model page, shows subtypes only as guesses, and labels each sample's read against the truth, misses included.
+**What the numbers leave open.** Every image comes from this one public dataset of 2D, 8-bit slices, so these results say nothing yet about scans from other hospitals or scanners, and six unique normal slices are too few to measure specificity. The subtype is right about half the time; LungScan shows it as a guess beside its measured accuracy, and labels each sample's read against the truth, misses included.
 
 <p align="center">
-  <img src="docs/assets/model.png" width="857" alt="The model page: a warning about the rendering shortcut beside a cancer slice in a soft-tissue window and a normal slice in a lung window, where the model runs, and the measured performance with its confidence intervals and confusion matrix">
+  <img src="docs/assets/model.png" width="857" alt="The model page: how the model is checked, where it runs, and the measured performance with its confidence intervals and confusion matrix">
 </p>
 
 The preprocessing also changed. The previous backend stretched slices to 224×224, normalized every channel with the red channel's statistics, and classified 224-pixel patches with a sliding window. On the validation split, the training pipeline scores 0.667 four-class accuracy against 0.500 for that pipeline, and on the whole test split the old patch scheme flagged 4 of the 54 normal slices.
@@ -273,7 +273,7 @@ cd frontend && node scripts/ui-check.mjs out    # the static site, in headless C
 ## Next steps
 
 - DICOM input, with windows in Hounsfield units instead of 8-bit renders.
-- A classifier trained on volumes with patient-level splits, instead of a 2D model on a dataset with a rendering shortcut; the research's segmentation models are the natural candidates.
+- A classifier trained on volumes with patient-level splits and tested on scans from other sources, instead of a 2D model on one public dataset; the research's segmentation models are the natural candidates.
 - A smaller download: an int8 or fp16 model for the browser, checked against the full one.
 
 ## Credits
