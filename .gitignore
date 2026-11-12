@@ -103,10 +103,11 @@ uploads/
 backend/data/
 data/
 
-# Model cache
+# Model cache, and the exported model (backend/tools/export_model.py or fetch_model.py)
 .cache/
 *.pth
 *.onnx
+model/lungscan.json
 
 # Misc
 Thumbs.db

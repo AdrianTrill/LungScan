@@ -1,338 +1,194 @@
-"""Real AI analysis service using the lung cancer detection model."""
+"""Turns the network's raw output into a read: probabilities, heat map, regions, summary.
 
-import logging
-from pathlib import Path
-from typing import Optional
+frontend/src/lib/inference/interpret.ts implements the same steps, and a test checks
+that both give the same result on every sample slice. Keep the two in step: same
+thresholds, same rounding (half up), same order of operations.
+"""
 
-import torch
-import torch.nn.functional as F
+from __future__ import annotations
 
-from app.core.schemas import AnalyzeResult, Nodule
-from app.core.utils import generate_nodule_id
-from app.services.image_processor import (
-    load_image_from_bytes,
-    load_image_from_path,
-    preprocess_image,
-    extract_patches,
-    get_image_dimensions,
+import math
+from datetime import datetime, timezone
+
+import numpy as np
+
+from app.core.schemas import AnalyzeResult, Box, Heatmap, ModelInfo, Region
+from app.services.model import (
+    CANCER,
+    CROP_OFFSET,
+    CROP_SIZE,
+    GRID,
+    LABEL_NAMES,
+    LABELS,
+    MODEL_NAME,
+    RESIZED_SIZE,
+    RawOutput,
 )
-from app.services.model_loader import (
-    get_model_loader,
-    CLASS_LABELS,
-    IMAGE_SIZE,
-    MEAN,
-    STD,
-)
 
-logger = logging.getLogger(__name__)
+FLAG_THRESHOLD = 0.5
+REGION_THRESHOLD = 0.5
+MAX_REGIONS = 3
+CELL = CROP_SIZE / GRID
 
 
-def analyze_image(
-    image_path: Optional[Path] = None,
-    image_bytes: Optional[bytes] = None,
-    case_id: str = "unknown",
-    use_sliding_window: bool = True,
-) -> AnalyzeResult:
-    """Run AI analysis on a CT scan image.
-    
-    Args:
-        image_path: Path to image file (if available)
-        image_bytes: Image as bytes (if available)
-        case_id: Case identifier
-        use_sliding_window: If True, use sliding window for nodule detection
-        
-    Returns:
-        AnalyzeResult with detected nodules and summary
-    """
-    try:
-        # Load image
-        if image_path and Path(image_path).exists():
-            image = load_image_from_path(Path(image_path))
-        elif image_bytes:
-            image = load_image_from_bytes(image_bytes)
-        else:
-            raise ValueError("Either image_path or image_bytes must be provided")
-        
-        img_width, img_height = get_image_dimensions(image)
-        logger.info(f"Analyzing image: {img_width}x{img_height} pixels")
-        
-        # Load model
-        model_loader = get_model_loader()
-        model = model_loader.load_model()
-        device = model_loader.get_device()
-        
-        nodules = []
-        
-        if use_sliding_window and (img_width > IMAGE_SIZE or img_height > IMAGE_SIZE):
-            # Use sliding window approach for large images
-            logger.info("Using sliding window approach for nodule detection")
-            nodules = _analyze_with_sliding_window(
-                image, model, device, img_width, img_height
+def round_half_up(value: float, digits: int = 0) -> float:
+    scale = 10**digits
+    return math.floor(value * scale + 0.5) / scale
+
+
+def percent(value: float) -> str:
+    return f"{round_half_up(value * 100, 1):.1f}%"
+
+
+def probability(value: float) -> str:
+    """A probability as a percentage that never rounds up to certainty."""
+    if value >= 0.9995:
+        return ">99.9%"
+    if 0 < value < 0.0005:
+        return "<0.1%"
+    return percent(value)
+
+
+def softmax(logits) -> list[float]:
+    z = [float(v) for v in logits]
+    top = max(z)
+    e = [math.exp(v - top) for v in z]
+    total = sum(e)
+    return [v / total for v in e]
+
+
+def position(gx: float, gy: float) -> str:
+    rows = ("upper", "middle", "lower")
+    cols = ("left", "center", "right")
+    row = rows[min(2, math.floor(gy * 3 / GRID))]
+    col = cols[min(2, math.floor(gx * 3 / GRID))]
+    return "center" if (row, col) == ("middle", "center") else f"{row} {col}"
+
+
+def find_regions(rel: list[list[float]], cancer: float, width: int, height: int) -> list[Region]:
+    """Group grid cells with at least half the peak evidence into 8-connected regions."""
+    seen = [[False] * GRID for _ in range(GRID)]
+    components = []
+    for i in range(GRID):
+        for j in range(GRID):
+            if seen[i][j] or rel[i][j] < REGION_THRESHOLD:
+                continue
+            seen[i][j] = True
+            stack, cells = [(i, j)], []
+            while stack:
+                a, b = stack.pop()
+                cells.append((a, b))
+                for da in (-1, 0, 1):
+                    for db in (-1, 0, 1):
+                        na, nb = a + da, b + db
+                        if 0 <= na < GRID and 0 <= nb < GRID and not seen[na][nb]:
+                            if rel[na][nb] >= REGION_THRESHOLD:
+                                seen[na][nb] = True
+                                stack.append((na, nb))
+            components.append(sorted(cells))
+
+    found = []
+    for cells in components:
+        weight = 0.0
+        sx = 0.0
+        sy = 0.0
+        peak = 0.0
+        for a, b in cells:
+            w = rel[a][b]
+            weight += w
+            sx += w * (b + 0.5)
+            sy += w * (a + 0.5)
+            peak = max(peak, w)
+        gx, gy = sx / weight, sy / weight
+        found.append((peak, len(cells), gx, gy))
+    found.sort(key=lambda r: (-r[0], -r[1], r[3], r[2]))
+
+    sx_scale = width / RESIZED_SIZE
+    sy_scale = height / RESIZED_SIZE
+    regions = []
+    for k, (peak, count, gx, gy) in enumerate(found[:MAX_REGIONS], start=1):
+        radius_cells = math.sqrt(count / math.pi)
+        regions.append(
+            Region(
+                id=f"r{k}",
+                x=int(round_half_up((CROP_OFFSET + gx * CELL) * sx_scale)),
+                y=int(round_half_up((CROP_OFFSET + gy * CELL) * sy_scale)),
+                radius=int(round_half_up(radius_cells * CELL * math.sqrt(sx_scale * sy_scale))),
+                evidence=round_half_up(peak * cancer, 4),
+                cells=count,
+                explanation=(
+                    f"Grad-CAM evidence for cancer peaks here at {percent(peak)} of the slice's "
+                    f"maximum, over {count} of {GRID * GRID} grid cells, in the "
+                    f"{position(gx, gy)} of the image."
+                ),
             )
-        else:
-            # Analyze entire image
-            logger.info("Analyzing entire image")
-            nodules = _analyze_full_image(
-                image, model, device, img_width, img_height
-            )
-        
-        # Generate summary
-        if nodules:
-            avg_score = sum(n.malignancy_score for n in nodules) / len(nodules)
-            high_risk_count = sum(1 for n in nodules if n.malignancy_score >= 0.6)
-            cancer_count = sum(1 for n in nodules if n.malignancy_score >= 0.5)
-            
-            summary = (
-                f"Analysis complete: {len(nodules)} suspicious region(s) detected. "
-                f"Average malignancy score: {avg_score:.3f}. "
-                f"{high_risk_count} region(s) with high suspicion (≥0.6). "
-                f"{cancer_count} region(s) showing potential cancer indicators (≥0.5). "
-                "Review recommended for all detected regions."
-            )
-        else:
-            summary = (
-                "Analysis complete: No suspicious regions detected. "
-                "Image appears normal. Regular follow-up recommended."
-            )
-        
-        return AnalyzeResult(case_id=case_id, nodules=nodules, summary=summary)
-        
-    except Exception as e:
-        logger.error(f"Analysis failed: {str(e)}", exc_info=True)
-        # Return a safe result indicating analysis failure
-        return AnalyzeResult(
-            case_id=case_id,
-            nodules=[],
-            summary=f"Analysis encountered an error: {str(e)}. Please try again or contact support.",
         )
+    return regions
 
 
-def _analyze_full_image(
-    image,
-    model: torch.nn.Module,
-    device: torch.device,
-    img_width: int,
-    img_height: int,
-) -> list[Nodule]:
-    """Analyze the entire image as a single patch.
-    
-    Args:
-        image: PIL Image object
-        model: Loaded PyTorch model
-        device: Device to run inference on
-        img_width: Original image width
-        img_height: Original image height
-        
-    Returns:
-        List of detected nodules
-    """
-    # Preprocess image
-    tensor = preprocess_image(image, size=(IMAGE_SIZE, IMAGE_SIZE), mean=MEAN, std=STD)
-    tensor = tensor.to(device)
-    
-    # Run inference
-    with torch.no_grad():
-        outputs = model(tensor)
-        probabilities = F.softmax(outputs, dim=1)
-        probs = probabilities[0].cpu().numpy()
-    
-    # Get predictions
-    predicted_class = int(torch.argmax(probabilities, dim=1).item())
-    confidence = float(probs[predicted_class])
-    class_name = CLASS_LABELS[predicted_class]
-    
-    logger.info(f"Prediction: {class_name} (confidence: {confidence:.3f})")
-    
-    nodules = []
-    
-    # Convert classification result to nodule detection
-    # If the model predicts cancer (not "Normal"), create a nodule
-    if class_name != "Normal" and confidence > 0.3:
-        # Calculate malignancy score based on class and confidence
-        malignancy_score = _calculate_malignancy_score(class_name, confidence)
-        
-        # Place nodule in center of image
-        x = img_width // 2
-        y = img_height // 2
-        radius = min(img_width, img_height) // 10  # Adaptive radius
-        
-        explanation = (
-            f"AI detected {class_name.lower()} with {confidence:.1%} confidence. "
-            f"Region shows characteristics consistent with {class_name.lower()}. "
-            f"Clinical correlation recommended."
-        )
-        
-        nodule = Nodule(
-            id=generate_nodule_id(),
-            x=x,
-            y=y,
-            radius=radius,
-            malignancy_score=malignancy_score,
-            explanation=explanation,
-        )
-        nodules.append(nodule)
-    
-    return nodules
-
-
-def _analyze_with_sliding_window(
-    image,
-    model: torch.nn.Module,
-    device: torch.device,
-    img_width: int,
-    img_height: int,
-) -> list[Nodule]:
-    """Analyze image using sliding window approach.
-    
-    Args:
-        image: PIL Image object
-        model: Loaded PyTorch model
-        device: Device to run inference on
-        img_width: Original image width
-        img_height: Original image height
-        
-    Returns:
-        List of detected nodules
-    """
-    # Extract patches with less overlap for more precise detection
-    patches = extract_patches(
-        image,
-        patch_size=(IMAGE_SIZE, IMAGE_SIZE),
-        stride=IMAGE_SIZE * 3 // 4,  # 25% overlap (reduced from 50%)
+def summarize(cancer: float, flagged: bool, subtype: str | None, share: float, regions: int) -> str:
+    if not flagged:
+        return f"Cancer probability {probability(cancer)}: the model reads this slice as normal."
+    plural = "" if regions == 1 else "s"
+    return (
+        f"Cancer probability {probability(cancer)}: the model reads this slice as cancer. "
+        f"Most likely subtype: {LABEL_NAMES[subtype]} ({probability(share)} of the cancer "
+        "probability), though the model's subtype calls are unreliable. "
+        f"Grad-CAM marks {regions} region{plural} that raised the cancer score."
     )
-    
-    logger.info(f"Analyzing {len(patches)} patches")
-    
-    nodules = []
-    threshold = 0.5  # Higher threshold to reduce false positives
-    
-    # Process patches in batches for efficiency
-    batch_size = 8
-    for i in range(0, len(patches), batch_size):
-        batch_patches = patches[i : i + batch_size]
-        batch_tensors = []
-        patch_positions = []
-        
-        for patch, (x, y) in batch_patches:
-            tensor = preprocess_image(
-                patch, size=(IMAGE_SIZE, IMAGE_SIZE), mean=MEAN, std=STD
-            )
-            batch_tensors.append(tensor)
-            patch_positions.append((x, y))
-        
-        # Stack into batch
-        batch = torch.cat(batch_tensors, dim=0).to(device)
-        
-        # Run inference
-        with torch.no_grad():
-            outputs = model(batch)
-            probabilities = F.softmax(outputs, dim=1)
-        
-        # Process results
-        for j, (x, y) in enumerate(patch_positions):
-            probs = probabilities[j].cpu().numpy()
-            predicted_class = int(torch.argmax(probabilities[j]).item())
-            confidence = float(probs[predicted_class])
-            class_name = CLASS_LABELS[predicted_class]
-            
-            # Only create nodule if not "Normal" and confidence is above threshold
-            if class_name != "Normal" and confidence > threshold:
-                malignancy_score = _calculate_malignancy_score(class_name, confidence)
-                
-                # Center of patch in original image coordinates
-                center_x = x + IMAGE_SIZE // 2
-                center_y = y + IMAGE_SIZE // 2
-                radius = IMAGE_SIZE // 4  # Radius based on patch size
-                
-                explanation = (
-                    f"AI detected {class_name.lower()} in this region "
-                    f"with {confidence:.1%} confidence. "
-                    f"Clinical correlation recommended."
-                )
-                
-                nodule = Nodule(
-                    id=generate_nodule_id(),
-                    x=center_x,
-                    y=center_y,
-                    radius=radius,
-                    malignancy_score=malignancy_score,
-                    explanation=explanation,
-                )
-                nodules.append(nodule)
-    
-    # Remove overlapping nodules (keep the one with highest score)
-    nodules = _remove_overlapping_nodules(nodules)
-    
-    logger.info(f"Detected {len(nodules)} suspicious regions")
-    return nodules
 
 
-def _calculate_malignancy_score(class_name: str, confidence: float) -> float:
-    """Calculate malignancy score based on class and confidence.
-    
-    Args:
-        class_name: Predicted class name
-        confidence: Model confidence (0-1)
-        
-    Returns:
-        Malignancy score (0-1)
-    """
-    # Base scores for different cancer types
-    base_scores = {
-        "Normal": 0.0,
-        "Adenocarcinoma": 0.7,
-        "Large Cell Carcinoma": 0.75,
-        "Squamous Cell Carcinoma": 0.8,
-    }
-    
-    base_score = base_scores.get(class_name, 0.5)
-    
-    # Adjust based on confidence
-    # Higher confidence -> higher malignancy score
-    score = base_score * (0.5 + 0.5 * confidence)
-    
-    # Clamp to [0, 1]
-    return min(1.0, max(0.0, score))
+def interpret(
+    raw: RawOutput,
+    case_id: str,
+    source: str,
+    runtime: str,
+    analyzed_at: datetime | None = None,
+) -> AnalyzeResult:
+    p = softmax(raw.logits)
+    cancer = p[CANCER[0]] + p[CANCER[1]] + p[CANCER[2]]
+    flagged = cancer >= FLAG_THRESHOLD
+    predicted = LABELS[max(range(len(p)), key=lambda i: (p[i], -i))]
+    best = max(CANCER, key=lambda i: (p[i], -i))
+    subtype = LABELS[best] if flagged else None
+    share = p[best] / cancer if cancer > 0 else 0.0
+
+    cam = [
+        [float(v) for v in row] for row in np.asarray(raw.cam, dtype=np.float32).reshape(GRID, GRID)
+    ]
+    peak = max(max(row) for row in cam)
+    rel = [[(v / peak if peak > 0 else 0.0) for v in row] for row in cam]
+    regions = find_regions(rel, cancer, raw.width, raw.height) if flagged and peak > 0 else []
+
+    sx = raw.width / RESIZED_SIZE
+    sy = raw.height / RESIZED_SIZE
+    heatmap = Heatmap(
+        size=GRID,
+        values=[round_half_up(v * cancer, 4) for row in rel for v in row],
+        box=Box(
+            x=round_half_up(CROP_OFFSET * sx, 2),
+            y=round_half_up(CROP_OFFSET * sy, 2),
+            width=round_half_up(CROP_SIZE * sx, 2),
+            height=round_half_up(CROP_SIZE * sy, 2),
+        ),
+    )
+    return AnalyzeResult(
+        case_id=case_id,
+        cancer_probability=round_half_up(cancer, 6),
+        flagged=flagged,
+        predicted_class=predicted,
+        subtype=subtype,
+        probabilities={label: round_half_up(p[i], 6) for i, label in enumerate(LABELS)},
+        heatmap=heatmap,
+        regions=regions,
+        summary=summarize(cancer, flagged, subtype, share, len(regions)),
+        model=ModelInfo(name=MODEL_NAME, source=source, runtime=runtime),
+        inference_ms=round_half_up(raw.inference_ms, 1),
+        analyzed_at=analyzed_at or datetime.now(timezone.utc),
+    )
 
 
-def _remove_overlapping_nodules(nodules: list[Nodule], overlap_threshold: float = 0.3) -> list[Nodule]:
-    """Remove overlapping nodules, keeping the one with highest score.
-    
-    Args:
-        nodules: List of detected nodules
-        overlap_threshold: Minimum overlap ratio to consider as duplicate (lower = more aggressive)
-        
-    Returns:
-        Filtered list of nodules
-    """
-    if not nodules:
-        return []
-    
-    # Sort by malignancy score (highest first) to keep best detections
-    sorted_nodules = sorted(nodules, key=lambda n: n.malignancy_score, reverse=True)
-    
-    filtered = []
-    for nodule in sorted_nodules:
-        # Check overlap with existing nodules using circle intersection
-        overlaps = False
-        for existing in filtered:
-            # Calculate distance between centers
-            distance = (
-                (nodule.x - existing.x) ** 2 + (nodule.y - existing.y) ** 2
-            ) ** 0.5
-            
-            # Calculate sum of radii
-            sum_radii = nodule.radius + existing.radius
-            
-            # Circles overlap if distance < sum of radii
-            # Use overlap_threshold to control how much overlap is allowed
-            # Lower threshold = more aggressive removal (0.3 means 30% overlap allowed)
-            if distance < sum_radii * (1 - overlap_threshold):
-                overlaps = True
-                break
-        
-        if not overlaps:
-            filtered.append(nodule)
-    
-    return filtered
-
+def analyze_image(classifier, image, case_id: str) -> AnalyzeResult:
+    """Run the classifier on an RGB image and interpret its output."""
+    raw = classifier.run(image)
+    return interpret(raw, case_id, source=classifier.source, runtime=classifier.runtime)

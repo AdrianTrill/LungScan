@@ -1,0 +1,7 @@
+# For tools/export_model.py, tools/evaluate.py, and tools/make_samples.py.
+-r requirements.txt
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.2
+torchvision>=0.17
+onnx>=1.16
+huggingface-hub>=0.23

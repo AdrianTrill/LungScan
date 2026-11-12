@@ -1,73 +1,95 @@
-"""Report generation service for creating downloadable reports."""
+"""Plain-text case reports.
 
-from datetime import datetime
+frontend/src/lib/report.ts writes the same report in the browser.
+"""
 
-from app.core.schemas import AnalyzeResult, Case
-from app.services.storage import storage
+from datetime import datetime, timezone
+
+from app.core.schemas import CaseDetail
+from app.services.analysis import probability
+from app.services.model import LABEL_NAMES
+
+RULE = "=" * 64
+THIN = "-" * 64
 
 
-def generate_text_report(case_id: str, notes: str) -> str:
-    """Generate a plain text report combining case info, analysis, and notes.
+def _when(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    Args:
-        case_id: Case identifier
-        notes: Doctor's notes to include
 
-    Returns:
-        Formatted text report as a string
-    """
-    case_detail = storage.get_case_detail(case_id)
-    if not case_detail:
-        raise ValueError(f"Case {case_id} not found")
+def generate_text_report(
+    detail: CaseDetail, notes: str, generated_at: datetime | None = None
+) -> str:
+    """A plain-text report of a case: the study, the model's read, and the notes."""
+    case = detail.case
+    patient = detail.patient
+    result = detail.analysis_result
+    generated_at = generated_at or datetime.now(timezone.utc)
 
-    case = case_detail.case
-    analysis = case_detail.analysis_result
+    if patient:
+        parts = [f"{patient.first_name} {patient.last_name}"]
+        if patient.medical_record_number:
+            parts.append(patient.medical_record_number)
+        parts.append(f"born {patient.date_of_birth}")
+        who = ", ".join(parts)
+    else:
+        who = "Unassigned"
 
-    # Build report header
-    report_lines = [
-        "=" * 60,
-        "LUNGSCAN ASSIST - MEDICAL REPORT",
-        "=" * 60,
+    lines = [
+        RULE,
+        "LUNGSCAN REPORT",
+        RULE,
         "",
-        f"Case ID: {case.id}",
-        f"Patient Scan: {case.filename}",
-        f"Report Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}",
-        f"Case Status: {case.status.upper()}",
+        f"Case ID:      {case.id}",
+        f"Study:        {case.filename}",
+        f"Patient:      {who}",
+        f"Report date:  {_when(generated_at)}",
+        f"Status:       {case.status.upper()}",
         "",
-        "-" * 60,
-        "ANALYSIS RESULTS",
-        "-" * 60,
+        THIN,
+        "MODEL READ (research software, not for clinical use)",
+        THIN,
         "",
     ]
-
-    if analysis:
-        report_lines.append(analysis.summary)
-        report_lines.append("")
-        report_lines.append(f"Detected Nodules: {len(analysis.nodules)}")
-        report_lines.append("")
-
-        for i, nodule in enumerate(analysis.nodules, 1):
-            report_lines.append(f"Nodule {i}:")
-            report_lines.append(f"  Position: ({nodule.x}, {nodule.y})")
-            report_lines.append(f"  Size: {nodule.radius}px radius")
-            report_lines.append(f"  Malignancy Score: {nodule.malignancy_score:.3f}")
-            report_lines.append(f"  Notes: {nodule.explanation}")
-            report_lines.append("")
+    if result:
+        lines += [
+            result.summary,
+            "",
+            f"Cancer probability:  {probability(result.cancer_probability)}",
+        ]
+        lines.append("Class probabilities:")
+        for label, value in result.probabilities.items():
+            lines.append(f"  {LABEL_NAMES[label]:<26}{probability(value):>7}")
+        lines.append("")
+        if result.regions:
+            lines.append("Regions where the Grad-CAM evidence for cancer peaks:")
+            for k, region in enumerate(result.regions, start=1):
+                lines.append(
+                    f"  {k}. center ({region.x}, {region.y}), radius {region.radius} px, "
+                    f"evidence {probability(region.evidence)}"
+                )
+                lines.append(f"     {region.explanation}")
+            lines.append("")
+        lines += [
+            f"Model:     {result.model.name}, {result.model.source}",
+            f"Runtime:   {result.model.runtime}",
+            f"Analyzed:  {_when(result.analyzed_at)}",
+            "",
+        ]
     else:
-        report_lines.append("No analysis results available.")
-        report_lines.append("")
+        lines += ["The slice has not been analyzed.", ""]
 
-    report_lines.extend([
-        "-" * 60,
-        "CLINICAL NOTES",
-        "-" * 60,
+    lines += [
+        THIN,
+        "NOTES",
+        THIN,
         "",
-        notes if notes.strip() else "(No notes provided)",
+        notes.strip() or "(No notes provided)",
         "",
-        "=" * 60,
-        "End of Report",
-        "=" * 60,
-    ])
-
-    return "\n".join(report_lines)
-
+        RULE,
+        "LungScan is research software. It is not a medical device, and its",
+        "output must not be used for diagnosis.",
+        RULE,
+        "",
+    ]
+    return "\n".join(lines)

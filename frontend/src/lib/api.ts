@@ -13,6 +13,22 @@ import {
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
+/** Draw the Grad-CAM regions with the viewer's nodule markers. */
+function withNodules(result: AnalyzeResult | null): AnalyzeResult | null {
+  if (!result) return result;
+  return {
+    ...result,
+    nodules: result.regions.map((r) => ({
+      id: r.id,
+      x: r.x,
+      y: r.y,
+      radius: r.radius,
+      malignancy_score: r.evidence,
+      explanation: r.explanation,
+    })),
+  };
+}
+
 async function fetchAPI<T>(
   endpoint: string,
   options?: RequestInit
@@ -86,15 +102,17 @@ export const api = {
     uploadFile(file, patientId),
 
   /** Run analysis on a case. */
-  analyzeCase: (caseId: string): Promise<AnalyzeResult> =>
-    fetchAPI<AnalyzeResult>(`/api/analyze/${caseId}`, { method: "POST" }),
+  analyzeCase: async (caseId: string): Promise<AnalyzeResult> =>
+    withNodules(await fetchAPI<AnalyzeResult>(`/api/analyze/${caseId}`, { method: "POST" }))!,
 
   /** Get all cases. */
   getCases: (): Promise<Case[]> => fetchAPI<Case[]>("/api/cases"),
 
   /** Get a single case with details. */
-  getCase: (caseId: string): Promise<CaseDetail> =>
-    fetchAPI<CaseDetail>(`/api/cases/${caseId}`),
+  getCase: async (caseId: string): Promise<CaseDetail> => {
+    const detail = await fetchAPI<CaseDetail>(`/api/cases/${caseId}`);
+    return { ...detail, analysis_result: withNodules(detail.analysis_result) };
+  },
 
   /** Delete a case. */
   deleteCase: (caseId: string): Promise<void> =>

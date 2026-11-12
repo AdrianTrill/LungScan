@@ -24,6 +24,9 @@ source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 
+echo "Downloading the model (96 MB, once)..."
+python -m tools.fetch_model || echo "⚠️  Could not download the model now; the server will retry on first analysis."
+
 echo "✅ Backend setup complete!"
 
 # Frontend setup

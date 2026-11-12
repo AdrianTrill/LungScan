@@ -1,0 +1,331 @@
+{
+  "model": {
+    "source": "dorsar/lung-cancer-detection@aa7426d",
+    "sha256": "c07339232b81a23cfac8c5b1e8e1a2fb63d68388fed856d2ddf0cbfd960a2754",
+    "pipeline": "the app's: resize to 250x250, then 256x256, center crop 224, ImageNet normalization"
+  },
+  "data": {
+    "repo": "dorsar/lung-cancer-detection",
+    "revision": "aa7426d75fbc0567fc6f0b36d47776fefae103f1",
+    "images": {
+      "train": 400,
+      "valid": 72,
+      "test": 295
+    },
+    "duplicate_rule": "perceptual hash (16x16 dHash) within 10 bits",
+    "test_removed": {
+      "exact_copies_of_train_or_valid": 42,
+      "from_normal": 48,
+      "from_squamous_cell_carcinoma": 2,
+      "near_copies_of_train_or_valid": 5,
+      "repeats_within_test": 3
+    },
+    "clean_test_per_class": {
+      "adenocarcinoma": 100,
+      "large_cell_carcinoma": 51,
+      "normal": 6,
+      "squamous_cell_carcinoma": 88
+    }
+  },
+  "clean_test": {
+    "images": 245,
+    "cancer_vs_normal": {
+      "threshold": 0.5,
+      "accuracy": 0.9918,
+      "sensitivity": {
+        "k": 237,
+        "n": 239,
+        "ci95": [
+          0.97,
+          0.9977
+        ]
+      },
+      "specificity": {
+        "k": 6,
+        "n": 6,
+        "ci95": [
+          0.6097,
+          1.0
+        ]
+      },
+      "auc": 1.0
+    },
+    "four_class": {
+      "accuracy": 0.5347,
+      "confusion": [
+        [
+          31,
+          50,
+          3,
+          16
+        ],
+        [
+          0,
+          50,
+          0,
+          1
+        ],
+        [
+          0,
+          0,
+          6,
+          0
+        ],
+        [
+          3,
+          41,
+          0,
+          44
+        ]
+      ],
+      "per_class": {
+        "adenocarcinoma": {
+          "precision": 0.9118,
+          "recall": 0.31,
+          "f1": 0.4627,
+          "support": 100
+        },
+        "large_cell_carcinoma": {
+          "precision": 0.3546,
+          "recall": 0.9804,
+          "f1": 0.5208,
+          "support": 51
+        },
+        "normal": {
+          "precision": 0.6667,
+          "recall": 1.0,
+          "f1": 0.8,
+          "support": 6
+        },
+        "squamous_cell_carcinoma": {
+          "precision": 0.7213,
+          "recall": 0.5,
+          "f1": 0.5906,
+          "support": 88
+        }
+      }
+    },
+    "subtype_on_cancers": {
+      "k": 127,
+      "n": 239,
+      "accuracy": 0.5314,
+      "chance": 0.3333
+    }
+  },
+  "full_test": {
+    "images": 295,
+    "cancer_vs_normal": {
+      "threshold": 0.5,
+      "accuracy": 0.9932,
+      "sensitivity": {
+        "k": 239,
+        "n": 241,
+        "ci95": [
+          0.9703,
+          0.9977
+        ]
+      },
+      "specificity": {
+        "k": 54,
+        "n": 54,
+        "ci95": [
+          0.9336,
+          1.0
+        ]
+      },
+      "auc": 1.0
+    },
+    "four_class": {
+      "accuracy": 0.6102,
+      "confusion": [
+        [
+          31,
+          50,
+          3,
+          16
+        ],
+        [
+          0,
+          50,
+          0,
+          1
+        ],
+        [
+          0,
+          0,
+          54,
+          0
+        ],
+        [
+          3,
+          42,
+          0,
+          45
+        ]
+      ],
+      "per_class": {
+        "adenocarcinoma": {
+          "precision": 0.9118,
+          "recall": 0.31,
+          "f1": 0.4627,
+          "support": 100
+        },
+        "large_cell_carcinoma": {
+          "precision": 0.3521,
+          "recall": 0.9804,
+          "f1": 0.5181,
+          "support": 51
+        },
+        "normal": {
+          "precision": 0.9474,
+          "recall": 1.0,
+          "f1": 0.973,
+          "support": 54
+        },
+        "squamous_cell_carcinoma": {
+          "precision": 0.7258,
+          "recall": 0.5,
+          "f1": 0.5921,
+          "support": 90
+        }
+      }
+    },
+    "subtype_on_cancers": {
+      "k": 128,
+      "n": 241,
+      "accuracy": 0.5311,
+      "chance": 0.3333
+    }
+  },
+  "validation": {
+    "images": 72,
+    "cancer_vs_normal": {
+      "threshold": 0.5,
+      "accuracy": 0.9722,
+      "sensitivity": {
+        "k": 58,
+        "n": 59,
+        "ci95": [
+          0.91,
+          0.997
+        ]
+      },
+      "specificity": {
+        "k": 12,
+        "n": 13,
+        "ci95": [
+          0.6669,
+          0.9863
+        ]
+      },
+      "auc": 0.9974
+    },
+    "four_class": {
+      "accuracy": 0.6667,
+      "confusion": [
+        [
+          6,
+          12,
+          1,
+          4
+        ],
+        [
+          0,
+          18,
+          0,
+          3
+        ],
+        [
+          0,
+          0,
+          13,
+          0
+        ],
+        [
+          1,
+          3,
+          0,
+          11
+        ]
+      ],
+      "per_class": {
+        "adenocarcinoma": {
+          "precision": 0.8571,
+          "recall": 0.2609,
+          "f1": 0.4,
+          "support": 23
+        },
+        "large_cell_carcinoma": {
+          "precision": 0.5455,
+          "recall": 0.8571,
+          "f1": 0.6667,
+          "support": 21
+        },
+        "normal": {
+          "precision": 0.9286,
+          "recall": 1.0,
+          "f1": 0.963,
+          "support": 13
+        },
+        "squamous_cell_carcinoma": {
+          "precision": 0.6111,
+          "recall": 0.7333,
+          "f1": 0.6667,
+          "support": 15
+        }
+      }
+    },
+    "subtype_on_cancers": {
+      "k": 35,
+      "n": 59,
+      "accuracy": 0.5932,
+      "chance": 0.3333
+    }
+  },
+  "pipelines": {
+    "validation": {
+      "training (250x250, 256, crop 224)": {
+        "four_class": 0.6667,
+        "cancer_vs_normal": 0.9722,
+        "subtype_on_cancers": 0.5932
+      },
+      "run.py (shorter side 256, crop 224)": {
+        "four_class": 0.5556,
+        "cancer_vs_normal": 1.0,
+        "subtype_on_cancers": 0.4576
+      },
+      "stretch to 224x224": {
+        "four_class": 0.625,
+        "cancer_vs_normal": 0.9722,
+        "subtype_on_cancers": 0.5763
+      },
+      "previous backend (stretch, red-channel statistics)": {
+        "four_class": 0.5,
+        "cancer_vs_normal": 0.9861,
+        "subtype_on_cancers": 0.4068
+      }
+    },
+    "clean_test": {
+      "training (250x250, 256, crop 224)": {
+        "four_class": 0.5347,
+        "cancer_vs_normal": 0.9918,
+        "subtype_on_cancers": 0.5314
+      },
+      "run.py (shorter side 256, crop 224)": {
+        "four_class": 0.3714,
+        "cancer_vs_normal": 0.9918,
+        "subtype_on_cancers": 0.3598
+      },
+      "stretch to 224x224": {
+        "four_class": 0.5347,
+        "cancer_vs_normal": 0.9469,
+        "subtype_on_cancers": 0.5565
+      },
+      "previous backend (stretch, red-channel statistics)": {
+        "four_class": 0.3959,
+        "cancer_vs_normal": 0.9918,
+        "subtype_on_cancers": 0.3849
+      }
+    }
+  }
+}

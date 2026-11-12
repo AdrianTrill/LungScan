@@ -15,10 +15,27 @@ export interface UploadResult {
   uploaded_at: string;
 }
 
+export interface Region {
+  id: string;
+  x: number;
+  y: number;
+  radius: number;
+  evidence: number;
+  cells: number;
+  explanation: string;
+}
+
 export interface AnalyzeResult {
   case_id: string;
-  nodules: Nodule[];
+  cancer_probability: number;
+  flagged: boolean;
+  predicted_class: string;
+  subtype: string | null;
+  probabilities: Record<string, number>;
+  regions: Region[];
   summary: string;
+  /** The regions, in the shape the scan viewer draws. */
+  nodules: Nodule[];
 }
 
 export interface Patient {
