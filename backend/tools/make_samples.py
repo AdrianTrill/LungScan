@@ -113,9 +113,6 @@ def build(classifier: Classifier, out: Path) -> dict:
             "license": "MIT",
             "url": f"https://huggingface.co/{HF_REPO}/tree/{HF_REVISION}/Data/test",
         },
-        "model_sha256": json.loads(classifier.model_path.with_suffix(".json").read_text())[
-            "sha256"
-        ],
         "patients": [
             {
                 "id": pid,

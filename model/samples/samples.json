@@ -6,7 +6,6 @@
     "license": "MIT",
     "url": "https://huggingface.co/dorsar/lung-cancer-detection/tree/aa7426d75fbc0567fc6f0b36d47776fefae103f1/Data/test"
   },
-  "model_sha256": "c07339232b81a23cfac8c5b1e8e1a2fb63d68388fed856d2ddf0cbfd960a2754",
   "patients": [
     {
       "id": "patient-001",
@@ -192,7 +191,7 @@
           "source": "dorsar/lung-cancer-detection@aa7426d",
           "runtime": "ONNX Runtime 1.31.1 (precomputed sample)"
         },
-        "inference_ms": 15.4,
+        "inference_ms": 24.8,
         "analyzed_at": "2026-01-01T00:00:00Z"
       }
     },
@@ -343,7 +342,7 @@
           "source": "dorsar/lung-cancer-detection@aa7426d",
           "runtime": "ONNX Runtime 1.31.1 (precomputed sample)"
         },
-        "inference_ms": 14.8,
+        "inference_ms": 22.7,
         "analyzed_at": "2026-01-01T00:00:00Z"
       }
     },
@@ -504,7 +503,7 @@
           "source": "dorsar/lung-cancer-detection@aa7426d",
           "runtime": "ONNX Runtime 1.31.1 (precomputed sample)"
         },
-        "inference_ms": 17.1,
+        "inference_ms": 20.4,
         "analyzed_at": "2026-01-01T00:00:00Z"
       }
     },
@@ -655,7 +654,7 @@
           "source": "dorsar/lung-cancer-detection@aa7426d",
           "runtime": "ONNX Runtime 1.31.1 (precomputed sample)"
         },
-        "inference_ms": 13.9,
+        "inference_ms": 20.4,
         "analyzed_at": "2026-01-01T00:00:00Z"
       }
     },
@@ -816,7 +815,7 @@
           "source": "dorsar/lung-cancer-detection@aa7426d",
           "runtime": "ONNX Runtime 1.31.1 (precomputed sample)"
         },
-        "inference_ms": 14.8,
+        "inference_ms": 17.6,
         "analyzed_at": "2026-01-01T00:00:00Z"
       }
     },
@@ -977,7 +976,7 @@
           "source": "dorsar/lung-cancer-detection@aa7426d",
           "runtime": "ONNX Runtime 1.31.1 (precomputed sample)"
         },
-        "inference_ms": 14.7,
+        "inference_ms": 20.7,
         "analyzed_at": "2026-01-01T00:00:00Z"
       }
     },
@@ -1138,7 +1137,7 @@
           "source": "dorsar/lung-cancer-detection@aa7426d",
           "runtime": "ONNX Runtime 1.31.1 (precomputed sample)"
         },
-        "inference_ms": 14.4,
+        "inference_ms": 23.5,
         "analyzed_at": "2026-01-01T00:00:00Z"
       }
     }

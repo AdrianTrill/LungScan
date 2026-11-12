@@ -1,0 +1,93 @@
+name: Pages
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: In-browser build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+
+      - name: Cache the Hugging Face downloads
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/huggingface
+          key: huggingface-${{ hashFiles('backend/tools/export_model.py') }}
+
+      # The site serves the same ONNX file the server runs, exported from the pinned weights.
+      - name: Export the model
+        working-directory: backend
+        run: |
+          pip install -r requirements-model.txt
+          python -m tools.export_model
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build the site
+        working-directory: frontend
+        env:
+          NEXT_PUBLIC_BASE_PATH: /LungScan
+          NEXT_PUBLIC_SITE_URL: https://adriantrill.github.io/LungScan
+        run: |
+          npm ci
+          npm run build:browser
+
+      # The site itself, in the runner's Chrome: it must read slices in the page exactly as the
+      # server does, take an upload, keep notes, respond to its keys, and fit a phone's screen.
+      - name: Check the site in headless Chrome
+        working-directory: frontend
+        run: node scripts/ui-check.mjs out --screenshots ../site-screenshots
+
+      - name: Upload the site's screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: site-screenshots
+          path: site-screenshots/
+          if-no-files-found: ignore
+
+      - name: Upload the site
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: frontend/out
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v5

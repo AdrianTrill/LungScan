@@ -228,8 +228,7 @@ def main() -> None:
 
     report = {
         "model": {
-            "source": classifier.source,
-            "sha256": json.loads(args.model.with_suffix(".json").read_text())["sha256"],
+            "source": f"{HF_REPO}@{HF_REVISION}",
             "pipeline": "the app's: resize to 250x250, then 256x256, center crop 224, ImageNet normalization",
         },
         "data": {

@@ -1,7 +1,6 @@
 {
   "model": {
-    "source": "dorsar/lung-cancer-detection@aa7426d",
-    "sha256": "c07339232b81a23cfac8c5b1e8e1a2fb63d68388fed856d2ddf0cbfd960a2754",
+    "source": "dorsar/lung-cancer-detection@aa7426d75fbc0567fc6f0b36d47776fefae103f1",
     "pipeline": "the app's: resize to 250x250, then 256x256, center crop 224, ImageNet normalization"
   },
   "data": {
