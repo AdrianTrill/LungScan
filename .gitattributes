@@ -1,0 +1,3 @@
+# GitHub's language bar: notebooks and the report's LaTeX sources are documentation.
+*.ipynb linguist-documentation
+*.tex linguist-documentation
