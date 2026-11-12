@@ -10,7 +10,7 @@ import { Chip } from "@/components/ui/Status";
 import { api, type ModelStatus } from "@/lib/api";
 import { REPO_URL, RUNTIME } from "@/lib/config";
 import { megabytes, percent } from "@/lib/format";
-import { useEvaluation } from "@/lib/hooks";
+import { useEvaluation, type Int8Agreement } from "@/lib/hooks";
 import { engine, type EngineProgress } from "@/lib/inference/engine";
 import { LABEL_SHORT, LABELS } from "@/lib/labels";
 
@@ -150,11 +150,20 @@ function Runtime() {
   );
 }
 
-function Checks({ removed }: { removed: number | null }) {
+function Checks({ removed, int8 }: { removed: number | null; int8: Int8Agreement | null }) {
+  const sameReads = !int8
+    ? "They are compared with the published float32 weights on the validation and test slices."
+    : int8.same_flag === int8.images && int8.same_class === int8.images
+      ? `On all ${int8.images} validation and test slices, every flag and every class matches the published float32 weights.`
+      : `On the ${int8.images} validation and test slices, ${int8.same_flag} flags and ${int8.same_class} classes match the published float32 weights.`;
   const checks = [
     [
       "Same numbers as PyTorch",
-      "The exporter writes the file only if ONNX Runtime reproduces PyTorch's logits and autograd's Grad-CAM; the largest differences are 2.4×10⁻⁶ and 5.2×10⁻⁷.",
+      "The exporter writes the file only if ONNX Runtime reproduces PyTorch's logits and autograd's Grad-CAM; the largest differences are 3.3×10⁻⁶ and 5.1×10⁻⁷.",
+    ],
+    [
+      "A third of the size, the same reads",
+      `The convolutions are stored as int8 blocks, so the file is 29 MB instead of 96. ${sameReads}`,
     ],
     [
       "Same read in the browser",
@@ -200,6 +209,13 @@ export default function ModelPage() {
         .filter(([k]) => !k.startsWith("from_"))
         .reduce((sum, [, v]) => sum + v, 0)
     : 0;
+  const int8 = evaluation?.int8_weights
+    ? [evaluation.int8_weights.validation, evaluation.int8_weights.full_test].reduce((a, b) => ({
+        images: a.images + b.images,
+        same_flag: a.same_flag + b.same_flag,
+        same_class: a.same_class + b.same_class,
+      }))
+    : null;
 
   return (
     <div className="mx-auto max-w-[1100px] px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
@@ -209,7 +225,7 @@ export default function ModelPage() {
       </PageHeader>
 
       <div className="mt-6 grid gap-4 lg:grid-cols-[1.3fr_1fr]">
-        <Checks removed={evaluation ? removed : null} />
+        <Checks removed={evaluation ? removed : null} int8={int8} />
         <Runtime />
       </div>
 

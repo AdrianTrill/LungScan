@@ -116,6 +116,10 @@ async function loadModel(url, cacheKey, sha256, totalBytes) {
   if (sha256 && hex !== sha256) throw new Error("The downloaded model does not match its manifest");
   if (cache) {
     try {
+      // Earlier versions of the model are dead weight once this one is verified.
+      for (const request of await cache.keys()) {
+        if (request.url !== cacheKey) await cache.delete(request);
+      }
       await cache.put(cacheKey, new Response(bytes));
     } catch {
       // Over quota: keep going without the cache.

@@ -80,6 +80,12 @@ export function useTheme(): [Theme, () => void] {
   return [theme, toggle];
 }
 
+export interface Int8Agreement {
+  images: number;
+  same_flag: number;
+  same_class: number;
+}
+
 export interface Evaluation {
   clean_test: {
     images: number;
@@ -100,6 +106,8 @@ export interface Evaluation {
     test_removed: Record<string, number>;
     clean_test_per_class: Record<string, number>;
   };
+  /** How often the app's int8 weights read a slice as the published float32 weights do. */
+  int8_weights: { validation: Int8Agreement; full_test: Int8Agreement };
 }
 
 let evaluation: Promise<Evaluation | null> | null = null;

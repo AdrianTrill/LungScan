@@ -8,7 +8,8 @@ Many of its normal slices are copies of training or validation images (some re-e
 or resized), or of each other. A test image is dropped when its perceptual hash is within
 DUPLICATE_BITS of a training or validation image, or of a test image already kept; the
 counts are recorded in the output. Inference goes through the app's own Classifier, so
-the numbers describe exactly what the app runs.
+the numbers describe exactly what the app runs. The app's int8 weights are also compared
+with the published float32 weights, read for read.
 """
 
 import argparse
@@ -20,13 +21,14 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
+import torch
 from huggingface_hub import hf_hub_download, list_repo_files
 from PIL import Image
 
 from app.core.config import REPO_DIR
 from app.services.analysis import softmax
 from app.services.model import CANCER, LABELS, MEAN, NORMAL, STD, Classifier, load_rgb, preprocess
-from tools.export_model import HF_REPO, HF_REVISION
+from tools.export_model import HF_REPO, HF_REVISION, load_net
 
 # Folder names in the repository's Data/ splits, in the model's class order.
 FOLDERS = {
@@ -209,6 +211,31 @@ def main() -> None:
     def predict(items):
         return np.array([softmax(classifier.run(load_rgb(p)).logits) for _, p, _ in items])
 
+    probs = {"clean": predict(clean), "test": predict(splits["test"])}
+    probs["valid"] = predict(splits["valid"])
+    full = load_net()
+    largest_change = 0.0
+
+    def against_float32(split: str) -> dict:
+        nonlocal largest_change
+        with torch.no_grad():
+            want = np.array(
+                [
+                    softmax(full(torch.from_numpy(preprocess(load_rgb(p)))).numpy()[0])
+                    for _, p, _ in splits[split]
+                ]
+            )
+        got = probs["valid" if split == "valid" else "test"]
+        want_cancer, got_cancer = want[:, list(CANCER)].sum(axis=1), got[:, list(CANCER)].sum(
+            axis=1
+        )
+        largest_change = max(largest_change, float(np.abs(want_cancer - got_cancer).max()))
+        return {
+            "images": len(got),
+            "same_flag": int(((want_cancer >= 0.5) == (got_cancer >= 0.5)).sum()),
+            "same_class": int((want.argmax(axis=1) == got.argmax(axis=1)).sum()),
+        }
+
     session = classifier.session()
 
     def compare(items):
@@ -239,9 +266,14 @@ def main() -> None:
             "test_removed": dict(sorted(removed.items())),
             "clean_test_per_class": dict(Counter(label for _, _, label in clean)),
         },
-        "clean_test": measure(predict(clean), [label for _, _, label in clean]),
-        "full_test": measure(predict(splits["test"]), [label for _, _, label in splits["test"]]),
-        "validation": measure(predict(splits["valid"]), [label for _, _, label in splits["valid"]]),
+        "clean_test": measure(probs["clean"], [label for _, _, label in clean]),
+        "full_test": measure(probs["test"], [label for _, _, label in splits["test"]]),
+        "validation": measure(probs["valid"], [label for _, _, label in splits["valid"]]),
+        "int8_weights": {
+            "compared_with": "the published float32 weights, in PyTorch",
+            "validation": against_float32("valid"),
+            "full_test": against_float32("test"),
+        },
         "pipelines": {"validation": compare(splits["valid"]), "clean_test": compare(clean)},
     }
     args.out.write_text(json.dumps(report, indent=2) + "\n")
@@ -257,6 +289,13 @@ def main() -> None:
         f"  four classes: {c['four_class']['accuracy']:.3f}; subtype on cancers: "
         f"{c['subtype_on_cancers']['accuracy']:.3f} (chance {c['subtype_on_cancers']['chance']:.3f})"
     )
+    for split, row in report["int8_weights"].items():
+        if isinstance(row, dict):
+            print(
+                f"Int8 against float32 weights, {split}: {row['same_flag']}/{row['images']} "
+                f"flags and {row['same_class']}/{row['images']} classes the same"
+            )
+    print(f"  largest change in a cancer probability: {largest_change:.4f}")
     print("Preprocessing pipelines (four-class / cancer vs normal / subtype accuracy):")
     for split, rows in report["pipelines"].items():
         for name, row in rows.items():

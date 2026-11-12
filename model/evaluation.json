@@ -281,6 +281,19 @@
       "chance": 0.3333
     }
   },
+  "int8_weights": {
+    "compared_with": "the published float32 weights, in PyTorch",
+    "validation": {
+      "images": 72,
+      "same_flag": 72,
+      "same_class": 72
+    },
+    "full_test": {
+      "images": 295,
+      "same_flag": 295,
+      "same_class": 295
+    }
+  },
   "pipelines": {
     "validation": {
       "training (250x250, 256, crop 224)": {
@@ -295,7 +308,7 @@
       },
       "stretch to 224x224": {
         "four_class": 0.625,
-        "cancer_vs_normal": 0.9722,
+        "cancer_vs_normal": 0.9861,
         "subtype_on_cancers": 0.5763
       },
       "previous backend (stretch, red-channel statistics)": {
@@ -316,9 +329,9 @@
         "subtype_on_cancers": 0.3598
       },
       "stretch to 224x224": {
-        "four_class": 0.5347,
+        "four_class": 0.5388,
         "cancer_vs_normal": 0.9469,
-        "subtype_on_cancers": 0.5565
+        "subtype_on_cancers": 0.5649
       },
       "previous backend (stretch, red-channel statistics)": {
         "four_class": 0.3959,

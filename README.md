@@ -26,17 +26,18 @@ LungScan is a reading room for lung CT: a worklist, a PACS-style viewer, and a m
 | Part | What it does | How it is checked |
 | --- | --- | --- |
 | **[Reading room](#the-reading-room)** | Worklist, viewer with window and level, Grad-CAM overlay and regions, the model's read, notes, and reports, all on the keyboard | A headless-Chrome run of the real site on every push |
-| **[In your browser](#in-your-browser)** | The whole app in the page: IndexedDB for the data, ONNX Runtime Web on WebGPU or WebAssembly for the model, which downloads once | The same run reads slices in the page and compares them with the server's reads |
+| **[In your browser](#in-your-browser)** | The whole app in the page: IndexedDB for the data, ONNX Runtime Web on WebGPU or WebAssembly for the model, a 29 MB download kept for next time | The same run reads slices in the page and compares them with the server's reads |
 | **[One model, two runtimes](#one-model-two-runtimes)** | One ONNX file on the server and in the browser; the browser's preprocessing is a bit-exact port of Pillow 13's resize | Jest tests against fixtures written by the server's own code |
 | **[Grad-CAM in one pass](#grad-cam-in-one-forward-pass)** | The classifier head's gradient, computed inside the graph, so the browser needs no backward pass | The export must match autograd's Grad-CAM before it is written |
+| **[Int8 weights](#int8-weights-a-third-of-the-download)** | Convolutions stored as int8 blocks with their own scales: 29 MB instead of 96 | On all 367 validation and test slices, every flag and class matches the published float32 weights |
 | **[Measured, not quoted](#measured-performance)** | An evaluation on the published test split, after removing the 50 test images that copy training images or each other | CI re-runs it from a fresh export and requires the same numbers |
 | **[3D segmentation research](#3d-segmentation-research)** | VISTA-3D with a "Shadow Mining" false-positive classifier, and radiogenomic biomarker prediction | Reported in the SENSERA report |
 
-**Contents:** [Try it](#try-it) · [Reading room](#the-reading-room) · [In your browser](#in-your-browser) · [Two runtimes](#one-model-two-runtimes) · [Grad-CAM](#grad-cam-in-one-forward-pass) · [Performance](#measured-performance) · [Research](#3d-segmentation-research) · [Layout](#repository-layout) · [Run locally](#run-it-locally) · [API](#api) · [Tests and CI](#tests-and-ci) · [Credits](#credits)
+**Contents:** [Try it](#try-it) · [Reading room](#the-reading-room) · [In your browser](#in-your-browser) · [Two runtimes](#one-model-two-runtimes) · [Grad-CAM](#grad-cam-in-one-forward-pass) · [Int8](#int8-weights-a-third-of-the-download) · [Performance](#measured-performance) · [Research](#3d-segmentation-research) · [Layout](#repository-layout) · [Run locally](#run-it-locally) · [API](#api) · [Tests and CI](#tests-and-ci) · [Credits](#credits)
 
 ## Try it
 
-**[Open the live demo](https://adriantrill.github.io/LungScan/).** It starts with seven sample studies from the model's held-out test split, already read. Open one and press <kbd>A</kbd> to read it again in your browser: the model (96 MB) downloads once, its SHA-256 is checked, and from then on a read takes about 25 ms on WebGPU or 200 ms on WebAssembly. Press <kbd>N</kbd> to add a slice of your own, or one of the samples, and <kbd>?</kbd> for every shortcut. Everything you add stays in your browser; **Reset demo data** in the sidebar starts over.
+**[Open the live demo](https://adriantrill.github.io/LungScan/).** It starts with seven sample studies from the model's held-out test split, already read. Open one and press <kbd>A</kbd> to read it again in your browser: the model (29 MB) downloads once, its SHA-256 is checked, and from then on a read takes about 20 ms on WebGPU or 200 ms on WebAssembly. Press <kbd>N</kbd> to add a slice of your own, or one of the samples, and <kbd>?</kbd> for every shortcut. Everything you add stays in your browser; **Reset demo data** in the sidebar starts over.
 
 To run it yourself, with the FastAPI backend:
 
@@ -69,16 +70,16 @@ The live demo is the same Next.js app, exported as a static site, with the backe
 
 - Studies, patients, notes, and images live in **IndexedDB**. The first visit seeds the sample studies with the reads the server computed for them.
 - The model runs in a **worker** ([`inference-worker.js`](frontend/public/inference-worker.js)) with ONNX Runtime Web 1.31: on **WebGPU** when the browser has an adapter, on **WebAssembly** otherwise, loading only the build it uses (the WebAssembly one is 3.9 MB gzipped). GitHub Pages cannot send the headers WebAssembly threads need, so that path uses one thread.
-- The model file is downloaded once with progress, checked against the SHA-256 in its manifest, and kept in Cache Storage.
+- The model file, 29 MB, is downloaded once with progress, checked against the SHA-256 in its manifest, and kept in Cache Storage, where a new version replaces the old one.
 
-On an Apple M4, a read takes 20 to 35 ms on WebGPU and about 200 ms on WebAssembly. The server takes about 20 ms on the CPU.
+On an Apple M4, a read takes about 20 ms on WebGPU and under 200 ms on WebAssembly. The server takes about 20 ms on the CPU.
 
 ## One model, two runtimes
 
 ```mermaid
 flowchart LR
-    weights[("dorsar/lung-cancer-detection<br/>ResNet-50 weights, pinned")] --> export["tools/export_model.py<br/>ONNX with in-graph Grad-CAM,<br/>checked against PyTorch"]
-    export --> onnx[("lungscan.onnx, 96 MB")]
+    weights[("dorsar/lung-cancer-detection<br/>ResNet-50 weights, pinned")] --> export["tools/export_model.py<br/>int8 weights, in-graph Grad-CAM,<br/>checked against PyTorch"]
+    export --> onnx[("lungscan.onnx, 29 MB")]
     onnx --> server["FastAPI<br/>ONNX Runtime on the CPU"]
     onnx --> pages["GitHub Pages"]
     pages --> worker["Browser worker<br/>ONNX Runtime Web<br/>WebGPU or WebAssembly"]
@@ -116,7 +117,13 @@ Grad-CAM needs the gradient of a score with respect to the last feature maps, an
 - `∂s/∂p = W₁ᵀ (relu′(h) ⊙ W₂ᵀ ∂s/∂z)`: two matrix products;
 - global average pooling gives every location the same gradient, `∂s/∂p / 49`, which are Grad-CAM's channel weights.
 
-[`ExplainedNet`](backend/tools/network.py) adds these steps to the network before export. The exporter refuses to write the file unless ONNX Runtime matches PyTorch's logits (largest difference 2.4×10⁻⁶) and the map matches autograd's Grad-CAM (5.2×10⁻⁷), and a unit test checks the identity on random weights. The model card, [docs/MODEL.md](docs/MODEL.md), has the details.
+[`ExplainedNet`](backend/tools/network.py) adds these steps to the network before export. The exporter refuses to write the file unless ONNX Runtime matches PyTorch's logits with the same weights (largest difference 3.3×10⁻⁶) and the map matches autograd's Grad-CAM (5.1×10⁻⁷), and a unit test checks the identity on random weights. The model card, [docs/MODEL.md](docs/MODEL.md), has the details.
+
+## Int8 weights: a third of the download
+
+Convolution weights are nearly all of the file. [`tools/quantize.py`](backend/tools/quantize.py) folds each BatchNorm into its convolution, then stores the convolutions of layers 2 to 4 as int8, in blocks of 32 weights that each have a float32 scale, as the weights of large language models often are. The stem and layer 1 stay in float32: they hold under 1% of the weights, but rounding them causes most of the error. In the file, each of those weights is `Reshape(Cast(int8) × scale)`. Every input is a constant, so ONNX Runtime folds them back into float32 weights when it loads the file, on the server and in the browser: a read costs what it did, and PyTorch reproduces it exactly.
+
+The file shrinks from 96.1 MB to 29.3 MB. On all 367 validation and test slices, every flag and every class matches the published float32 weights, and no cancer probability moves by more than 1.5 points. The exporter refuses a file whose int8 weights change a sample slice's read, and CI requires the agreement to stay as measured. [docs/MODEL.md](docs/MODEL.md#int8-weights) compares the schemes that were tried.
 
 ## Measured performance
 
@@ -174,7 +181,7 @@ The evaluation outputs behind these tables are not in the repository. Neither ar
 │   │   │   ├── storage.py     # JSON persistence and the sample studies
 │   │   │   └── report.py
 │   │   └── tests/
-│   ├── tools/                 # export_model, evaluate, make_samples, make_fixtures, fetch_model
+│   ├── tools/                 # export_model, quantize, evaluate, make_samples, make_fixtures, fetch_model
 │   ├── requirements.txt       # the server: no PyTorch
 │   ├── requirements-dev.txt
 │   └── requirements-model.txt # the tools: PyTorch, ONNX, Hugging Face
@@ -256,7 +263,7 @@ A read carries the class probabilities, the cancer probability and flag, the sub
 ## Tests and CI
 
 ```bash
-cd backend && pytest                     # 28 tests; the model's tests run once it is exported
+cd backend && pytest                     # 30 tests; the model's tests run once it is exported
 cd frontend && npm test                  # 38 tests
 cd frontend && node scripts/ui-check.mjs out    # the static site, in headless Chrome
 ```
@@ -264,7 +271,7 @@ cd frontend && node scripts/ui-check.mjs out    # the static site, in headless C
 | Workflow | Job | What it checks |
 | --- | --- | --- |
 | CI | Backend / Python 3.11, 3.12, 3.13 | ruff, black, and the test suite against an isolated store and a stand-in model |
-| CI | Model | Exports the pinned weights, which must match PyTorch and autograd; runs the tests with the real model; re-reads the samples; re-runs the evaluation, which must give the same numbers; and requires the frontend's fixtures to be current |
+| CI | Model | Exports the pinned weights, which must match PyTorch and autograd, and whose int8 form must read every sample slice as the float32 weights do; runs the tests with the real model; re-reads the samples; re-runs the evaluation, which must give the same numbers, int8 agreement included; and requires the frontend's fixtures to be current |
 | CI | Frontend | Prettier, ESLint, the type check, the Jest suite, and the build against the API |
 | Pages | In-browser build | Exports the model and builds the static site, then drives it in headless Chrome: the worklist, filters, search, and keys; two reads in the page against the server's; an upload read straight away; notes across a reload; the viewer's keys, the theme, and the shortcuts; a phone's screen; no console errors or failed requests. Main is then deployed |
 
@@ -274,7 +281,6 @@ cd frontend && node scripts/ui-check.mjs out    # the static site, in headless C
 
 - DICOM input, with windows in Hounsfield units instead of 8-bit renders.
 - A classifier trained on volumes with patient-level splits and tested on scans from other sources, instead of a 2D model on one public dataset; the research's segmentation models are the natural candidates.
-- A smaller download: an int8 or fp16 model for the browser, checked against the full one.
 
 ## Credits
 

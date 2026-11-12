@@ -188,7 +188,7 @@ export default function ReadPanel({
           <p className="text-[13px] font-medium text-ink">Not read yet</p>
           <p className="mx-auto mt-1 max-w-[270px] text-[12px] text-muted">
             {RUNTIME === "browser"
-              ? "The model runs in this browser. The first read downloads it (96 MB) and keeps it for next time."
+              ? "The model runs in this browser. The first read downloads it (29 MB) and keeps it for next time."
               : "The server runs the model on this slice."}
           </p>
           <Button variant="primary" icon="scan" shortcut="A" className="mt-3" onClick={onAnalyze}>

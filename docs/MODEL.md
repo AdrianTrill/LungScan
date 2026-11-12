@@ -1,6 +1,6 @@
 # The model
 
-LungScan reads single axial CT slices with a ResNet-50 classifier, and shows where its evidence for cancer lies with Grad-CAM. This page describes the network, how the app runs it, how its output becomes a read, and how well it does, measured on the images it was published with.
+LungScan reads single axial CT slices with a ResNet-50 classifier, and shows where its evidence for cancer lies with Grad-CAM. This page describes the network, how it is exported and stored, how the app runs it, how its output becomes a read, and how well it does, measured on the images it was published with.
 
 > [!IMPORTANT]
 > LungScan is research software, not a medical device. Treat every read as a demonstration of the software, never as a diagnosis (see [Limitations](#limitations)).
@@ -19,7 +19,7 @@ The pipeline was chosen on the validation split, using the criterion the trainin
 | --- | ---: | ---: |
 | **Training: 250×250, then 256, crop 224** (used) | **0.667** | 0.972 |
 | The model repository's `run.py`: shorter side 256, crop 224 | 0.556 | 1.000 |
-| Stretch to 224×224 | 0.625 | 0.972 |
+| Stretch to 224×224 | 0.625 | 0.986 |
 | LungScan's previous pipeline: stretch, red-channel statistics for every channel | 0.500 | 0.986 |
 
 `run.py` keeps only the middle of wide slices (a 1.4:1 slice loses 19% of its width on each side), and LungScan's previous pipeline normalized the green and blue channels with the red channel's statistics.
@@ -34,7 +34,26 @@ Grad-CAM usually needs a backward pass. Here it doesn't. The score explained is 
 - `∂s/∂p = W₁ᵀ · (relu′(h) ⊙ W₂ᵀ · ∂s/∂z)`, the head's Jacobian, which the graph computes with two matrix products;
 - because of the average pooling, every location of `A` gets the same gradient, `∂s/∂p / 49`. Those are Grad-CAM's channel weights, and the map is `relu(Σₖ αₖ Aₖ)`.
 
-The export wraps the network in [`ExplainedNet`](../backend/tools/network.py), which does exactly this, and checks it before writing the file: ONNX Runtime must reproduce PyTorch's logits (largest difference 2.4×10⁻⁶), and the map must match the Grad-CAM autograd computes (5.2×10⁻⁷). A unit test checks the same identity on random weights. The graph uses only basic operators, so ONNX Runtime Web runs it unchanged.
+The export wraps the network in [`ExplainedNet`](../backend/tools/network.py), which does exactly this, and checks it before writing the file: with the same weights, ONNX Runtime must reproduce PyTorch's logits (largest difference 3.3×10⁻⁶), and the map must match the Grad-CAM autograd computes (5.1×10⁻⁷). A unit test checks the same identity on random weights. The graph uses only basic operators, so ONNX Runtime Web runs it unchanged.
+
+## Int8 weights
+
+Convolution weights are nearly all of the 96.1 MB float32 file. [`tools/quantize.py`](../backend/tools/quantize.py) folds each BatchNorm into the convolution before it, then rounds the weights of the convolutions in layers 2 to 4 to int8: each output channel's weights are split into blocks of 32, and each block gets a float32 scale that maps its largest magnitude to 127. The stem and layer 1 stay in float32, as do the biases and the head. The file is 29.3 MB, of which the int8 values take 23.2 MB and their scales 2.9 MB.
+
+In the graph, each rounded weight is `Reshape(Cast(int8 blocks) × scales)`. All its inputs are constants, so ONNX Runtime folds it back into a float32 weight when it loads the file (in 0.2 s on the server), and the network runs as a float32 network with the rounded weights. That network is what the exporter compares with PyTorch, and the file's outputs are bit for bit those of the same weights stored in float32.
+
+The scheme was chosen on the 72 validation and 295 test slices, against the published float32 weights:
+
+| Int8 weights | Same flag (of 367) | Same class (of 367) | Largest change in a cancer probability |
+| --- | ---: | ---: | ---: |
+| One scale per output channel, all but the stem | 367 | 362 | 16.7 points |
+| One scale per output channel, stem and layer 1 in float32 | 367 | 365 | 4.4 points |
+| Blocks of 32, all but the stem | 367 | 362 | 6.0 points |
+| **Blocks of 32, stem and layer 1 in float32** (used) | **367** | **367** | **1.5 points** |
+
+With one scale per output channel, rounding layer 1 alone moves cancer probabilities by up to 14.8 points, although it holds 0.2 of the 23.5 million convolution weights; rounding layer 2, 3, or 4 alone moves them by 3.1 points at most. With the scheme used, the median change is 0.009 points. Blocks of 32 cost 2.9 MB of scales over one scale per channel, and are what removes the class changes.
+
+Two checks keep it that way. The exporter reads the seven sample slices with the file and with the float32 weights in PyTorch, and refuses to write the file if a flag or a class differs, or if a cancer probability moves by more than 2 points; the largest change is 0.5 points. [`tools/evaluate.py`](../backend/tools/evaluate.py) records the agreement on the validation and test splits in `model/evaluation.json`, and CI requires it to stay the same.
 
 ## From output to read
 
@@ -86,7 +105,7 @@ The [segmentation research](../AI%20model/README.md) in this repository works on
 
 ## Where it runs
 
-The exported file, `lungscan.onnx` (96 MB), runs in two places:
+The exported file, `lungscan.onnx` (29 MB), runs in two places:
 
 - **The server**: [`app/services/model.py`](../backend/app/services/model.py) loads it with ONNX Runtime on the CPU, about 20 ms per slice on an Apple M-series laptop. PyTorch is not needed. If `model/lungscan.onnx` is missing, the server downloads it from the project's GitHub Pages site on first use, with its manifest, and checks its SHA-256.
 - **The browser**: the in-browser build runs the same file with ONNX Runtime Web, in a worker ([`public/inference-worker.js`](../frontend/public/inference-worker.js)), on WebGPU when the browser has it and on WebAssembly otherwise. The model is downloaded once, checked against the same SHA-256, and kept in Cache Storage.
@@ -100,8 +119,8 @@ Run them from `backend/`. `fetch_model` needs only `requirements.txt`; the other
 | Command | What it does |
 | --- | --- |
 | `python -m tools.fetch_model` | Downloads `model/lungscan.onnx` from GitHub Pages and checks it |
-| `python -m tools.export_model` | Builds `model/lungscan.onnx` from the pinned weights, and checks it against PyTorch and autograd |
-| `python -m tools.evaluate` | Measures the model on the deduplicated test split; writes `model/evaluation.json` |
+| `python -m tools.export_model` | Builds `model/lungscan.onnx` from the pinned weights, with int8 convolution weights, and checks it against PyTorch, autograd, and the float32 weights |
+| `python -m tools.evaluate` | Measures the model on the deduplicated test split, and how often its int8 weights agree with the float32 ones; writes `model/evaluation.json` |
 | `python -m tools.make_samples` | Rebuilds the sample slices and their reference reads in `model/samples/` |
 | `python -m tools.make_samples --check` | Re-runs the model on the samples and compares with `model/samples/samples.json` |
 | `python -m tools.make_fixtures` | Writes the server's outputs the frontend's tests compare against |
